@@ -650,7 +650,7 @@ cross-session heuristics as the new design. Known failures are listed in
 
 ### 24.3 MemCan reference
 
-The neighboring `memcan` repository was `github.com/lklimek/memcan`. Its live
+The neighboring `../memcan` repository was `github.com/lklimek/memcan`. Its live
 workspace demonstrated Tokio, Axum 0.8, rmcp 1.1, Maud 0.27, Reqwest 0.13,
 `tracing`, and `subtle` in a Rust server behind Traefik, including constant-time
 Basic Auth, CSP/no-store headers, and component health patterns.

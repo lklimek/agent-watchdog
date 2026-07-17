@@ -18,9 +18,23 @@ compacted and the new session has re-read these five planning documents.
 
 ## 2. Working rules
 
-- Work only on feature branches/worktrees; never push directly to `main`.
+- Work only on feature branches/worktrees; never push directly to `main` or any
+  protected/base branch.
+- The product owner authorizes ordinary non-destructive pushes and GitHub actions
+  through the repository collaborator credentials. Do not use `ghsudo`. Force
+  pushes, branch deletion, history replacement, releases, merges, and other
+  destructive or externally consequential actions still require explicit
+  handling under the active environment instructions.
+- After context compaction and planning approval, execute the plan unattended and
+  continue through safe in-scope work. Pause only for a material product choice,
+  required new authority, destructive action, or failed architecture assumption
+  that changes documented behavior.
 - Use TDD for domain, persistence, authorization, correlation, timer, and safety
   behavior: failing test, minimal implementation, refactor, self-review.
+- Load and continuously apply the environment's `coding-best-practices`,
+  `rust-best-practices`, `frontend-best-practices`, and
+  `security-best-practices` guidance whenever the corresponding work is in
+  scope; treat these as working constraints rather than a one-time review step.
 - Stage specific files and keep commits conventional and reviewable.
 - Run formatter, relevant tests, Clippy with warnings denied, and applicable
   dependency/security checks before implementation commits.
@@ -31,6 +45,8 @@ compacted and the new session has re-read these five planning documents.
   disabled or explicitly degraded.
 - Record decisions that materially depart from the architecture before coding
   the departure.
+- Record non-trivial implementation decisions and spike results in the repository
+  so a later unattended session does not depend on conversational memory.
 
 ## 3. Dependency order
 
@@ -478,3 +494,34 @@ The fresh implementation context should begin by reading, in this order:
 It must confirm no material decision is missing, update the working plan to Phase
 0, and avoid importing assumptions from the pre-compaction conversation that are
 not present in these documents.
+
+## 20. Clean-context execution contract
+
+The implementation agent must assume the planning conversation is unavailable.
+Before editing code it must:
+
+1. verify the five documents exist and their status/precedence matches
+   `REQUIREMENTS.md` §14;
+2. inspect live Git status, remote, default branch, open PRs, and repository
+   instructions instead of trusting any recorded ephemeral branch state;
+3. search project memory and live neighboring repositories as leads, then verify
+   every relevant finding against files and current primary documentation;
+4. confirm the approved wireframe remains the v1 UX target;
+5. begin with Phase 0 spikes and write their results into `docs/spikes/`;
+6. update architecture/test/development documents before code if a spike changes
+   an assumption;
+7. keep implementation decisions within documented outcomes; request product
+   input when alternatives would change scope, safety, user experience, or
+   runtime support;
+8. run unattended through reversible, non-destructive, in-scope work, reporting
+   decisions and verification at phase boundaries;
+9. never infer OpenCode implementation, token accounting, cost, metrics,
+   automatic pruning, supported macOS operation, or writable human controls into
+   v1;
+10. never weaken main-session exclusion, waiting-user protection, identity/PID
+    verification, source-conflict suspension, or the one-hour-plus-grace
+    termination policy to make an integration easier.
+
+The clean-context agent should be able to derive every product and architectural
+choice from the five documents. Conversation history is neither required nor
+authoritative once these documents are committed.
