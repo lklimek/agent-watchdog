@@ -7,6 +7,17 @@ use watchdog_domain::{
     ObservationSource, ProcessIdentity, SessionIdentity, WallTimeMs,
 };
 
+/// Stable native identity and tree placement for one stored session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSessionRecord {
+    /// Role-preserving Watchdog identity.
+    pub session: SessionIdentity,
+    /// Owning main-session tree.
+    pub root: MainSessionId,
+    /// Runtime-qualified native identity.
+    pub native: watchdog_domain::NativeSessionKey,
+}
+
 /// Selected or candidate session hierarchy relation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RelationRecord {

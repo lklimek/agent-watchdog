@@ -499,6 +499,24 @@ async fn restart_repositories_round_trip_typed_bounded_records() {
         .await
         .expect("child should commit");
 
+    let main_record = store
+        .session(SessionIdentity::Main(root))
+        .await
+        .expect("session lookup should succeed")
+        .expect("main session should exist");
+    assert_eq!(main_record.root, root);
+    assert_eq!(main_record.native.native_id(), "session-1");
+    let sessions = store
+        .sessions_for_root(root, 10)
+        .await
+        .expect("tree sessions should load");
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .any(|record| record.session == SessionIdentity::Child(child))
+    );
+
     assert_primary_ledger_reads(&store, root).await;
     assert_relation_and_activity(&store, root, child).await;
     assert_cursor_and_deadline(&store, child).await;

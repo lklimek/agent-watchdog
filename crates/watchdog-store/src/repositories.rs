@@ -1,16 +1,60 @@
 use sqlx::Row;
 use watchdog_domain::{
-    BoundedText, DomainEvent, EventId, ObservationEnvelope, ObservationId, RuntimeKind,
-    SessionIdentity,
+    BoundedText, ChildSessionId, DomainEvent, EventId, MainSessionId, NativeSessionKey,
+    ObservationEnvelope, ObservationId, RuntimeKind, SessionId, SessionIdentity,
 };
 
 use crate::{
     ActivitySampleRecord, AdapterHealthRecord, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
-    NotificationAttemptRecord, RelationRecord, SnapshotUpdate, StoreError, TerminationSagaRecord,
-    WatchdogStore, bounded_json, sqlite_integer,
+    NotificationAttemptRecord, RelationRecord, SnapshotUpdate, StoreError, StoredSessionRecord,
+    TerminationSagaRecord, WatchdogStore, bounded_json, sqlite_integer,
 };
 
 impl WatchdogStore {
+    /// Load stable native identity and tree placement for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt stored identities or `SQLite` failure.
+    pub async fn session(
+        &self,
+        session: SessionIdentity,
+    ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT session_id, kind, root_session_id, runtime, native_id FROM sessions WHERE session_id = ?",
+        )
+        .bind(session.session_id().to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| decode_session_row(&row, Some(session)))
+            .transpose()
+    }
+
+    /// Load a bounded stable session list for one main-session tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for invalid limits, corrupt stored identities, or
+    /// `SQLite` failure.
+    pub async fn sessions_for_root(
+        &self,
+        root: MainSessionId,
+        limit: u32,
+    ) -> Result<Vec<StoredSessionRecord>, StoreError> {
+        validate_limit(limit)?;
+        let rows = sqlx::query(
+            "SELECT session_id, kind, root_session_id, runtime, native_id FROM sessions \
+             WHERE root_session_id = ? ORDER BY created_at_ms, session_id LIMIT ?",
+        )
+        .bind(root.session_id().to_string())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| decode_session_row(row, None))
+            .collect()
+    }
+
     /// Load one idempotent observation envelope.
     ///
     /// # Errors
@@ -477,6 +521,46 @@ fn validate_limit(limit: u32) -> Result<(), StoreError> {
         return Err(crate::StoreInputError::ZeroLimit.into());
     }
     Ok(())
+}
+
+fn decode_session_row(
+    row: &sqlx::sqlite::SqliteRow,
+    expected: Option<SessionIdentity>,
+) -> Result<StoredSessionRecord, StoreError> {
+    let runtime = match row.try_get::<String, _>("runtime")?.as_str() {
+        "claude_code" => RuntimeKind::ClaudeCode,
+        "codex_cli" => RuntimeKind::CodexCli,
+        "codex_companion" => RuntimeKind::CodexCompanion,
+        "opencode" => RuntimeKind::OpenCode,
+        _ => return Err(StoreError::CorruptValue("unknown session runtime")),
+    };
+    let native = NativeSessionKey::new(runtime, row.try_get::<String, _>("native_id")?)
+        .map_err(|_| StoreError::CorruptValue("invalid native session identity"))?;
+    let derived = SessionId::from_native(&native);
+    let stored_id: SessionId = serde_json::from_value(serde_json::Value::String(
+        row.try_get::<String, _>("session_id")?,
+    ))?;
+    if stored_id != derived {
+        return Err(StoreError::CorruptValue(
+            "stored and derived session identities differ",
+        ));
+    }
+    let session = match row.try_get::<String, _>("kind")?.as_str() {
+        "main" => SessionIdentity::Main(MainSessionId::from(derived)),
+        "child" => SessionIdentity::Child(ChildSessionId::from(derived)),
+        _ => return Err(StoreError::CorruptValue("unknown session kind")),
+    };
+    if expected.is_some_and(|value| value != session) {
+        return Err(StoreError::CorruptValue("stored session role differs"));
+    }
+    let root_id: SessionId = serde_json::from_value(serde_json::Value::String(
+        row.try_get::<String, _>("root_session_id")?,
+    ))?;
+    Ok(StoredSessionRecord {
+        session,
+        root: MainSessionId::from(root_id),
+        native,
+    })
 }
 
 fn load_json_rows<T: serde::de::DeserializeOwned>(

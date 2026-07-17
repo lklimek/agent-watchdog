@@ -6,8 +6,9 @@ mod repositories;
 pub use records::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
     DeadlineRecord, FileCursorRecord, InboxOffsetRecord, NotificationAttemptRecord,
-    NotificationChannel, NotificationOutcome, RecordInputError, RelationRecord, TerminationGate,
-    TerminationSafetyRecord, TerminationSagaRecord, TerminationStage,
+    NotificationChannel, NotificationOutcome, RecordInputError, RelationRecord,
+    StoredSessionRecord, TerminationGate, TerminationSafetyRecord, TerminationSagaRecord,
+    TerminationStage,
 };
 
 use std::{path::Path, str::FromStr, time::Duration};
