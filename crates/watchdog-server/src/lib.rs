@@ -4,6 +4,7 @@ mod agent_api;
 mod auth;
 mod dashboard;
 mod mcp;
+mod notifications;
 #[cfg(target_os = "linux")]
 mod termination;
 
@@ -21,6 +22,10 @@ pub use dashboard::{
     dashboard_router,
 };
 pub use mcp::{WatchdogMcpService, WatchdogSessionManager, mcp_router};
+pub use notifications::{
+    HumanNotification, HumanNotifier, NotificationConfigError, NotificationDelivery,
+    NotificationDeliveryError, NotificationEndpoints, WebhookEndpoint,
+};
 #[cfg(target_os = "linux")]
 pub use termination::{
     GracefulCancelError, GracefulCancelSupport, GracefulCanceller, NoGracefulCanceller,
