@@ -35,13 +35,13 @@ pub fn dashboard_router(service: DashboardService, authenticator: BasicAuthentic
         .route("/api/v1/sessions", get(sessions))
         .route("/api/v1/events", get(events))
         .with_state(service)
-        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {
                 let authenticator = authenticator.clone();
                 async move { basic_auth(request, next, &authenticator).await }
             },
         ))
+        .layer(middleware::from_fn(security_headers))
 }
 
 async fn ui(
