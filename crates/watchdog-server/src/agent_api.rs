@@ -15,8 +15,8 @@ use watchdog_domain::{
 };
 use watchdog_runtime::{CoordinatorError, EventSequence, SessionCoordinator};
 use watchdog_store::{
-    ApplyResult, InboxOffsetRecord, OutboxDestination, RelationRecord, StoreError,
-    StoredSessionRecord, WatchdogStore,
+    AdapterHealthRecord, ApplyResult, InboxOffsetRecord, OutboxDestination, RelationRecord,
+    StoreError, StoredSessionRecord, WatchdogStore,
 };
 
 const MAX_TREE_SESSIONS: u32 = 1_000;
@@ -98,6 +98,15 @@ pub struct SessionView {
     pub snapshot: SessionSnapshot,
 }
 
+/// Durable transition paired with current detailed diagnostics for its subject.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentEventView {
+    /// Ordered durable transition metadata.
+    pub event: DomainEvent,
+    /// Current full session evidence, including PID, CPU, conflicts, and warning.
+    pub session: SessionView,
+}
+
 /// Durable parent event page independent from MCP transport replay.
 #[derive(Clone, Debug, Serialize)]
 pub struct EventPage {
@@ -106,7 +115,31 @@ pub struct EventPage {
     /// Highest returned durable event ID, or `after` for an empty page.
     pub next_cursor: u64,
     /// Ordered durable events.
-    pub events: Vec<DomainEvent>,
+    pub events: Vec<AgentEventView>,
+}
+
+/// Agent-facing hierarchy with current sessions and retained relation evidence.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionTreeView {
+    /// Bound main-session tree.
+    pub root: MainSessionId,
+    /// Current session projections.
+    pub sessions: Vec<SessionView>,
+    /// Current and superseded bounded relation evidence.
+    pub relations: Vec<RelationRecord>,
+}
+
+/// Agent-facing health needed to diagnose monitoring coverage.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentHealthView {
+    /// Whether the database uses WAL journaling.
+    pub store_wal: bool,
+    /// Whether foreign-key enforcement is active.
+    pub store_foreign_keys: bool,
+    /// Applied schema version.
+    pub schema_version: i64,
+    /// Per-runtime persisted health, including actionable warning messages.
+    pub adapters: Vec<AdapterHealthRecord>,
 }
 
 #[derive(Debug, Default)]
@@ -466,6 +499,56 @@ impl AgentApi {
         Ok(views)
     }
 
+    /// Read the bound hierarchy and retained correlation evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] for unbound transports, missing snapshots, or
+    /// persistence failure.
+    pub async fn session_tree(
+        &self,
+        transport: &TransportKey,
+    ) -> Result<SessionTreeView, AgentApiError> {
+        let root = self.inner.scopes.root(transport)?;
+        let sessions = self.list_sessions(transport).await?;
+        let relations = self
+            .inner
+            .store
+            .relations_for_root(root, MAX_TREE_SESSIONS)
+            .await?;
+        Ok(SessionTreeView {
+            root,
+            sessions,
+            relations,
+        })
+    }
+
+    /// Read database and adapter health relevant to agent diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] for unbound transports or persistence failure.
+    pub async fn health(&self, transport: &TransportKey) -> Result<AgentHealthView, AgentApiError> {
+        self.inner.scopes.root(transport)?;
+        let store = self.inner.store.health().await?;
+        let mut adapters = Vec::new();
+        for runtime in [
+            RuntimeKind::ClaudeCode,
+            RuntimeKind::CodexCli,
+            RuntimeKind::CodexCompanion,
+        ] {
+            if let Some(health) = self.inner.store.adapter_health(runtime).await? {
+                adapters.push(health);
+            }
+        }
+        Ok(AgentHealthView {
+            store_wal: store.journal_mode == "wal",
+            store_foreign_keys: store.foreign_keys,
+            schema_version: store.schema_version,
+            adapters,
+        })
+    }
+
     /// Read durable events after a caller-confirmed cursor.
     ///
     /// Passing `after` also advances the stored acknowledgement monotonically;
@@ -498,12 +581,27 @@ impl AgentApi {
                 })
                 .await?;
         }
-        let events = self
+        let domain_events = self
             .inner
             .store
             .events_after(root, watchdog_domain::EventId::new(cursor), limit)
             .await?;
-        let next_cursor = events.last().map_or(cursor, |event| event.id().value());
+        let next_cursor = domain_events
+            .last()
+            .map_or(cursor, |event| event.id().value());
+        let mut events = Vec::with_capacity(domain_events.len());
+        for event in domain_events {
+            let record = self
+                .inner
+                .store
+                .session_by_id(event.subject().session_id())
+                .await?
+                .ok_or(AgentApiError::SessionNotFound)?;
+            events.push(AgentEventView {
+                session: self.view_for_record(&record).await?,
+                event,
+            });
+        }
         Ok(EventPage {
             after: cursor,
             next_cursor,
