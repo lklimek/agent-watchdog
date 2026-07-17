@@ -39,7 +39,13 @@ impl EventSequence {
         Ok(Self::new(store.first_unallocated_event_id().await?))
     }
 
-    fn next(&self) -> Result<EventId, CoordinatorError> {
+    /// Allocate one process-unique durable event identity for a transactional
+    /// coordinator outside the normal observation reducer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::EventSequenceExhausted`] at integer exhaustion.
+    pub fn allocate(&self) -> Result<EventId, CoordinatorError> {
         self.next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -145,7 +151,7 @@ impl SessionCoordinator {
             .cloned()
             .map(|kind| {
                 Ok(DomainEvent::new(
-                    self.event_sequence.next()?,
+                    self.event_sequence.allocate()?,
                     output.snapshot().root(),
                     output.snapshot().session(),
                     observation.observed_at().wall_time(),

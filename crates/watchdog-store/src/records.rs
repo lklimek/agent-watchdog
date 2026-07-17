@@ -4,7 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, ChildSessionId, EventId, MainSessionId, ObservationId,
-    ObservationSource, ProcessIdentity, SessionIdentity, WallTimeMs,
+    ObservationSource, ProcessIdentity, SessionIdentity, TerminationActionOutcome,
+    TerminationBlocker, TerminationGate, TerminationStage, WallTimeMs,
 };
 
 /// Stable native identity and tree placement for one stored session.
@@ -226,58 +227,14 @@ pub struct DeadlineRecord {
     pub provenance: ObservationSource,
 }
 
-/// Persisted child-only termination stage.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminationStage {
-    /// Parent warning and grace period.
-    WarningGrace,
-    /// Runtime-native cancellation requested.
-    GracefulCancel,
-    /// Verified `SIGTERM` sent.
-    Sigterm,
-    /// Verified `SIGKILL` sent.
-    Sigkill,
-    /// Child exited and no further action is allowed.
-    Completed,
-    /// Safety gate failed or recovery cancelled escalation.
-    Aborted,
-}
-
-impl TerminationStage {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::WarningGrace => "warning_grace",
-            Self::GracefulCancel => "graceful_cancel",
-            Self::Sigterm => "sigterm",
-            Self::Sigkill => "sigkill",
-            Self::Completed => "completed",
-            Self::Aborted => "aborted",
-        }
-    }
-}
-
-/// One required child-termination safety gate.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminationGate {
-    /// Session is authoritatively classified as a child.
-    TrustworthyChild,
-    /// No material source conflict exists.
-    NoSourceConflict,
-    /// No active long-running operation exists.
-    NoActiveOperation,
-    /// Session is not waiting for user input.
-    NotWaitingForUser,
-    /// Parent deadline and extensions permit escalation.
-    DeadlineAllows,
-}
-
 /// Safety evidence frozen at a termination-saga decision point.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminationSafetyRecord {
     /// Gates proven at this decision point.
     pub passed_gates: BTreeSet<TerminationGate>,
+    /// Gates that suspended or aborted this decision point.
+    #[serde(default)]
+    pub blockers: BTreeSet<TerminationBlocker>,
     /// Fresh verified process identity when OS signalling may follow.
     pub process: Option<ProcessIdentity>,
 }
@@ -295,6 +252,9 @@ pub struct TerminationSagaRecord {
     pub next_action_at: Option<WallTimeMs>,
     /// Safety evidence for the current stage.
     pub safety: TerminationSafetyRecord,
+    /// Bounded result of the action that produced the current revision.
+    #[serde(default)]
+    pub last_outcome: Option<TerminationActionOutcome>,
 }
 
 /// Parent's durable MCP inbox cursor.

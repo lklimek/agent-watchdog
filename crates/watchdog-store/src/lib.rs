@@ -7,9 +7,9 @@ pub use records::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
     DeadlineRecord, FileCursorRecord, InboxOffsetRecord, NotificationAttemptRecord,
     NotificationChannel, NotificationOutcome, RecordInputError, RelationRecord,
-    StoredSessionRecord, TerminationGate, TerminationSafetyRecord, TerminationSagaRecord,
-    TerminationStage,
+    StoredSessionRecord, TerminationSafetyRecord, TerminationSagaRecord,
 };
+pub use watchdog_domain::{TerminationGate, TerminationStage};
 
 use std::{path::Path, str::FromStr, time::Duration};
 
@@ -198,6 +198,30 @@ pub struct ApplyObservation {
     destinations: Vec<OutboxDestination>,
 }
 
+/// Atomic child-termination saga transition and delivery fan-out.
+#[derive(Clone, Debug)]
+pub struct TerminationAdvance {
+    saga: TerminationSagaRecord,
+    event: DomainEvent,
+    destinations: Vec<OutboxDestination>,
+}
+
+impl TerminationAdvance {
+    /// Construct one atomic saga/event persistence unit.
+    #[must_use]
+    pub fn new(
+        saga: TerminationSagaRecord,
+        event: DomainEvent,
+        destinations: impl IntoIterator<Item = OutboxDestination>,
+    ) -> Self {
+        Self {
+            saga,
+            event,
+            destinations: destinations.into_iter().collect(),
+        }
+    }
+}
+
 impl ApplyObservation {
     /// Construct one atomic reducer/store unit.
     #[must_use]
@@ -360,6 +384,56 @@ impl WatchdogStore {
         insert_events(&mut transaction, &apply.events, &apply.destinations).await?;
         transaction.commit().await?;
         Ok(ApplyResult::Applied)
+    }
+
+    /// Atomically persist one monotonic termination saga revision, its durable
+    /// event, and delivery fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for cross-session identity, stale/invalid
+    /// revisions, oversized records, event conflicts, or `SQLite` failure.
+    pub async fn apply_termination_advance(
+        &self,
+        advance: &TerminationAdvance,
+    ) -> Result<(), StoreError> {
+        if advance.event.subject() != SessionIdentity::Child(advance.saga.child) {
+            return Err(StoreError::IdentityMismatch);
+        }
+        let revision = positive_sqlite_integer("termination saga revision", advance.saga.revision)?;
+        let payload = bounded_json(&advance.saga, "termination saga")?;
+        let mut transaction = self.pool.begin().await?;
+        let result = sqlx::query(
+            "INSERT INTO termination_sagas \
+             (child_session_id, stage, revision, next_action_at_ms, safety_json) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(child_session_id) DO UPDATE SET \
+             stage = excluded.stage, revision = excluded.revision, \
+             next_action_at_ms = excluded.next_action_at_ms, safety_json = excluded.safety_json \
+             WHERE excluded.revision > termination_sagas.revision",
+        )
+        .bind(advance.saga.child.session_id().to_string())
+        .bind(advance.saga.stage.as_str())
+        .bind(revision)
+        .bind(
+            advance
+                .saga
+                .next_action_at
+                .map(watchdog_domain::WallTimeMs::value),
+        )
+        .bind(payload)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::StaleSnapshot);
+        }
+        insert_events(
+            &mut transaction,
+            std::slice::from_ref(&advance.event),
+            &advance.destinations,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Read undelivered entries in stable store order.

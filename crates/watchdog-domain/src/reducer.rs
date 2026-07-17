@@ -211,6 +211,12 @@ impl SessionSnapshot {
     pub const fn reconciliation_required(&self) -> bool {
         self.reconciliation_required
     }
+
+    /// Monotonic instant at which the current continuous stall began.
+    #[must_use]
+    pub const fn stalled_since_monotonic_ms(&self) -> Option<u64> {
+        self.stalled_since_monotonic_ms
+    }
 }
 
 /// One pure input to the session reducer.

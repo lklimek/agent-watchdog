@@ -36,7 +36,11 @@ pub use reducer::{
     ReducerInput, ReducerOutput, ReducerPolicy, ReducerPolicyError, SessionSnapshot,
     aggregate_main_state, reduce,
 };
-pub use safety::TerminationCandidate;
+pub use safety::{
+    TerminationActionOutcome, TerminationAssessment, TerminationBlocker, TerminationCandidate,
+    TerminationComponent, TerminationFacts, TerminationGate, TerminationHealth, TerminationStage,
+    assess_termination, executable_matches_runtime,
+};
 pub use secret::SecretText;
 pub use session::{Capability, CapabilitySet, SessionIdentity, SessionKind};
 pub use state::{CompactState, DetailedState};

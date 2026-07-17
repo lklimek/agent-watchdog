@@ -18,6 +18,9 @@ watchdog-domain.workspace = true
 watchdog-runtime.workspace = true
 watchdog-store.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+watchdog-process = { path = "../watchdog-process", version = "=0.1.0" }
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
