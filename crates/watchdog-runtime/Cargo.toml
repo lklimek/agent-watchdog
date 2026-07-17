@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 thiserror.workspace = true
 watchdog-domain.workspace = true
+watchdog-store.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 notify.workspace = true
@@ -16,6 +17,7 @@ rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

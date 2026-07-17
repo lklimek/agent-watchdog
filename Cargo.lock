@@ -1479,7 +1479,9 @@ dependencies = [
  "rustix",
  "tempfile",
  "thiserror",
+ "tokio",
  "watchdog-domain",
+ "watchdog-store",
 ]
 
 [[package]]
