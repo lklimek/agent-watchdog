@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 secrecy.workspace = true
+subtle.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

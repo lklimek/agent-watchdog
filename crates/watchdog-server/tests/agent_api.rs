@@ -153,6 +153,20 @@ async fn durable_event_cursor_survives_api_and_transport_restart() {
         .await
         .expect("event should be durable");
     assert!(!page.events.is_empty());
+    assert!(
+        page.events
+            .iter()
+            .all(|event| event.session.session.session_id() == main)
+    );
+    assert_eq!(
+        page.events
+            .last()
+            .expect("completion event should exist")
+            .session
+            .snapshot
+            .state(),
+        watchdog_domain::DetailedState::Completed
+    );
     let confirmed = page.next_cursor;
     let acknowledged = api
         .list_events(&first_transport, Some(confirmed), 10)

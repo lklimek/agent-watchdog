@@ -7,6 +7,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+axum.workspace = true
+futures.workspace = true
+rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -17,7 +20,8 @@ watchdog-store.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-watchdog-testkit = { path = "../watchdog-testkit" }
+tower.workspace = true
+watchdog-testkit = { path = "../watchdog-testkit", version = "=0.1.0" }
 
 [lints]
 workspace = true
