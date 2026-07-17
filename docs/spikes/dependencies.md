@@ -61,6 +61,29 @@ cargo audit --file tools/spikes/Cargo.lock
 cargo deny --manifest-path tools/spikes/Cargo.toml --config deny.toml check
 ```
 
+## Phase 3 production review
+
+The production process and watcher crates re-verified `rustix 1.1.4` and
+`notify 8.2.0` before direct use. Current RustSec, OSV, and GitHub Advisory
+queries found no advisory affecting either exact version. The historical
+`rustix` PID ownership advisory affects older 0.x releases, not 1.1.4.
+
+`notify` is used only as an invalidation source. Its default configuration
+follows symlinks and recursive mode performs an internal unbudgeted walk, so the
+production service explicitly disables symlink following, registers only
+capability-checked non-recursive directories from its own bounded scanner, and
+uses a bounded nonblocking callback. Kernel rescan flags, callback saturation,
+backend failure, scan limits, and path races produce uncertainty and bounded
+reconciliation. File access is independently contained by Linux `openat2` with
+`BENEATH | NO_MAGICLINKS`.
+
+The resolved Linux graph currently selects `inotify 0.11.4`, `inotify-sys
+0.1.8`, and `notify-types 2.1.0`. `CC0-1.0` and `ISC` are deliberately allowed
+for this graph alongside the existing permissive policy. Watcher supervision
+and periodic reconciliation remain required because stable `notify` 8.x lacks
+several unreleased 9.x Linux churn fixes; the project does not select a release
+candidate for production.
+
 ## Primary sources
 
 - <https://crates.io/>
