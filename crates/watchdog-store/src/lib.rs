@@ -7,7 +7,7 @@ pub use records::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
     DeadlineRecord, FileCursorRecord, InboxOffsetRecord, NotificationAttemptRecord,
     NotificationChannel, NotificationOutcome, RecordInputError, RelationRecord,
-    StoredSessionRecord, TerminationSafetyRecord, TerminationSagaRecord,
+    SessionMetadataRecord, StoredSessionRecord, TerminationSafetyRecord, TerminationSagaRecord,
 };
 pub use watchdog_domain::{TerminationGate, TerminationStage};
 
@@ -360,6 +360,22 @@ impl WatchdogStore {
             .checked_add(1)
             .ok_or(StoreInputError::IntegerRange { field: "event ID" })?;
         u64::try_from(next).map_err(|_| StoreError::CorruptValue("negative event ID"))
+    }
+
+    /// Load the highest committed durable event ID, or zero for an empty store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt values or `SQLite` failure.
+    pub async fn latest_event_id(&self) -> Result<EventId, StoreError> {
+        let highest: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(event_id) FROM state_transitions")
+                .fetch_one(&self.pool)
+                .await?;
+        let highest = highest.unwrap_or(0);
+        Ok(EventId::new(u64::try_from(highest).map_err(|_| {
+            StoreError::CorruptValue("negative event ID")
+        })?))
     }
 
     /// Atomically persist an observation, snapshot, events, and delivery rows.

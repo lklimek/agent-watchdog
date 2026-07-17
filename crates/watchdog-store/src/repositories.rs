@@ -6,11 +6,85 @@ use watchdog_domain::{
 
 use crate::{
     ActivitySampleRecord, AdapterHealthRecord, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
-    NotificationAttemptRecord, RelationRecord, SnapshotUpdate, StoreError, StoredSessionRecord,
-    TerminationSagaRecord, WatchdogStore, bounded_json, sqlite_integer,
+    NotificationAttemptRecord, RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreError,
+    StoredSessionRecord, TerminationSagaRecord, WatchdogStore, bounded_json, sqlite_integer,
 };
 
 impl WatchdogStore {
+    /// Upsert bounded operator-facing metadata for an existing session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for a missing session, numeric overflow, or
+    /// `SQLite` failure.
+    pub async fn save_session_metadata(
+        &self,
+        record: &SessionMetadataRecord,
+    ) -> Result<(), StoreError> {
+        let pull_request_number = record
+            .pull_request_number()
+            .map(|value| sqlite_integer("pull request number", value))
+            .transpose()?;
+        let result = sqlx::query(
+            "UPDATE sessions SET title = ?, startup_directory = ?, repository_remote = ?, \
+             branch = ?, pull_request_number = ?, pull_request_url = ?, updated_at_ms = ? \
+             WHERE session_id = ?",
+        )
+        .bind(record.title())
+        .bind(record.startup_directory())
+        .bind(record.repository_remote())
+        .bind(record.branch())
+        .bind(pull_request_number)
+        .bind(record.pull_request_url())
+        .bind(record.updated_at().value())
+        .bind(record.session().session_id().to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::CorruptValue("metadata session is missing"));
+        }
+        Ok(())
+    }
+
+    /// Load bounded operator-facing metadata for an existing session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt metadata or `SQLite` failure.
+    pub async fn session_metadata(
+        &self,
+        session: SessionIdentity,
+    ) -> Result<Option<SessionMetadataRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT title, startup_directory, repository_remote, branch, \
+             pull_request_number, pull_request_url, updated_at_ms FROM sessions WHERE session_id = ?",
+        )
+        .bind(session.session_id().to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let pull_request_number: Option<i64> = row.try_get("pull_request_number")?;
+            let pull_request_number = pull_request_number
+                .map(|value| {
+                    u64::try_from(value)
+                        .map_err(|_| StoreError::CorruptValue("invalid pull request number"))
+                })
+                .transpose()?;
+            SessionMetadataRecord::new(
+                session,
+                row.try_get("title")?,
+                row.try_get("startup_directory")?,
+                row.try_get("repository_remote")?,
+                row.try_get("branch")?,
+                pull_request_number,
+                row.try_get("pull_request_url")?,
+                watchdog_domain::WallTimeMs::new(row.try_get("updated_at_ms")?),
+            )
+            .map_err(|_| StoreError::CorruptValue("invalid session metadata"))
+        })
+        .transpose()
+    }
+
     /// Load stable native identity and tree placement for one session.
     ///
     /// # Errors
@@ -65,6 +139,35 @@ impl WatchdogStore {
              WHERE root_session_id = ? ORDER BY created_at_ms, session_id LIMIT ?",
         )
         .bind(root.session_id().to_string())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| decode_session_row(row, None))
+            .collect()
+    }
+
+    /// Load a bounded stable list for one role across all trees.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for invalid limits, corrupt identities, or
+    /// `SQLite` failure.
+    pub async fn sessions_by_kind(
+        &self,
+        kind: watchdog_domain::SessionKind,
+        limit: u32,
+    ) -> Result<Vec<StoredSessionRecord>, StoreError> {
+        validate_limit(limit)?;
+        let kind = match kind {
+            watchdog_domain::SessionKind::Main => "main",
+            watchdog_domain::SessionKind::Child => "child",
+        };
+        let rows = sqlx::query(
+            "SELECT session_id, kind, root_session_id, runtime, native_id FROM sessions \
+             WHERE kind = ? ORDER BY created_at_ms, session_id LIMIT ?",
+        )
+        .bind(kind)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;

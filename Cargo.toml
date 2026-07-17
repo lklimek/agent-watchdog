@@ -20,8 +20,10 @@ license = "MIT"
 repository = "https://github.com/lklimek/agent-watchdog"
 
 [workspace.dependencies]
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 futures = "=0.3.31"
+maud = { version = "=0.27.0", default-features = false, features = ["axum"] }
 notify = { version = "=8.2.0", default-features = false }
 rmcp = { version = "=2.2.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
 rustix = { version = "=1.1.4", default-features = false, features = ["process", "std"] }

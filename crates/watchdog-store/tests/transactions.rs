@@ -17,8 +17,8 @@ use watchdog_store::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
     ApplyObservation, ApplyResult, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
     NotificationAttemptRecord, NotificationChannel, NotificationOutcome, OutboxDestination,
-    RelationRecord, SnapshotUpdate, StoreCounts, TerminationGate, TerminationSafetyRecord,
-    TerminationSagaRecord, TerminationStage, WatchdogStore,
+    RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreCounts, TerminationGate,
+    TerminationSafetyRecord, TerminationSagaRecord, TerminationStage, WatchdogStore,
 };
 
 fn fixture(observation_key: &str, event_id: u64, revision: u64) -> ApplyObservation {
@@ -516,6 +516,28 @@ async fn restart_repositories_round_trip_typed_bounded_records() {
             .iter()
             .any(|record| record.session == SessionIdentity::Child(child))
     );
+
+    let metadata = SessionMetadataRecord::new(
+        SessionIdentity::Main(root),
+        Some("<script>alert('escaped')</script>".to_owned()),
+        Some("/data/git-worktrees/agent-watchdog/feature".to_owned()),
+        Some("git@github.com:lklimek/agent-watchdog.git".to_owned()),
+        Some("feature/dashboard".to_owned()),
+        Some(42),
+        Some("https://github.com/lklimek/agent-watchdog/pull/42".to_owned()),
+        WallTimeMs::new(2_000),
+    )
+    .expect("metadata should be bounded");
+    store
+        .save_session_metadata(&metadata)
+        .await
+        .expect("metadata should persist");
+    let loaded_metadata = store
+        .session_metadata(SessionIdentity::Main(root))
+        .await
+        .expect("metadata should load")
+        .expect("session should exist");
+    assert_eq!(loaded_metadata, metadata);
 
     assert_primary_ledger_reads(&store, root).await;
     assert_relation_and_activity(&store, root, child).await;
