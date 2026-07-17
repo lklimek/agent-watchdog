@@ -7,8 +7,17 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 watchdog-domain.workspace = true
 watchdog-runtime.workspace = true
+watchdog-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+watchdog-testkit = { path = "../watchdog-testkit" }
 
 [lints]
 workspace = true

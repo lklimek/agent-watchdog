@@ -1500,8 +1500,15 @@ dependencies = [
 name = "watchdog-server"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
  "watchdog-domain",
  "watchdog-runtime",
+ "watchdog-store",
+ "watchdog-testkit",
 ]
 
 [[package]]
