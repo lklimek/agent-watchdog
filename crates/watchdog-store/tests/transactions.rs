@@ -366,6 +366,27 @@ async fn outbox_acknowledgement_is_durable_and_idempotent() {
 }
 
 #[tokio::test]
+async fn outbox_delivery_can_read_one_destination_without_head_of_line_blocking() {
+    let database = TestDatabase::new("outbox-destination");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("database should open");
+    store
+        .apply_observation(&fixture("observation-1", 8, 1))
+        .await
+        .expect("transaction should commit");
+
+    let sse = store
+        .pending_outbox_for(OutboxDestination::Sse, 10)
+        .await
+        .expect("destination should load");
+
+    assert_eq!(sse.len(), 1);
+    assert_eq!(sse[0].destination(), "sse");
+    assert_eq!(sse[0].event_id(), EventId::new(8));
+}
+
+#[tokio::test]
 async fn initialization_enables_required_sqlite_pragmas_and_schema() {
     let database = TestDatabase::new("health-pragmas");
     let store = WatchdogStore::open(database.path())

@@ -458,13 +458,38 @@ impl WatchdogStore {
     ///
     /// Returns [`StoreError`] when the limit is invalid or `SQLite` fails.
     pub async fn pending_outbox(&self, limit: u32) -> Result<Vec<PendingOutboxEntry>, StoreError> {
+        self.pending_outbox_matching(None, limit).await
+    }
+
+    /// Read undelivered entries for one fan-out destination in stable order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the limit is invalid or `SQLite` fails.
+    pub async fn pending_outbox_for(
+        &self,
+        destination: OutboxDestination,
+        limit: u32,
+    ) -> Result<Vec<PendingOutboxEntry>, StoreError> {
+        self.pending_outbox_matching(Some(destination), limit).await
+    }
+
+    async fn pending_outbox_matching(
+        &self,
+        destination: Option<OutboxDestination>,
+        limit: u32,
+    ) -> Result<Vec<PendingOutboxEntry>, StoreError> {
         if limit == 0 {
             return Err(StoreInputError::ZeroLimit.into());
         }
+        let destination = destination.map(OutboxDestination::as_str);
         let rows = sqlx::query(
             "SELECT outbox_id, event_id, destination, payload_json FROM outbox \
-             WHERE delivered_at_ms IS NULL ORDER BY outbox_id LIMIT ?",
+             WHERE delivered_at_ms IS NULL AND (? IS NULL OR destination = ?) \
+             ORDER BY outbox_id LIMIT ?",
         )
+        .bind(destination)
+        .bind(destination)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
