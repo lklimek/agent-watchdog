@@ -1,7 +1,18 @@
 //! Transactional `SQLite` persistence for Agent Watchdog.
 
+mod records;
+mod repositories;
+
+pub use records::{
+    ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
+    DeadlineRecord, FileCursorRecord, InboxOffsetRecord, NotificationAttemptRecord,
+    NotificationChannel, NotificationOutcome, RecordInputError, RelationRecord, TerminationGate,
+    TerminationSafetyRecord, TerminationSagaRecord, TerminationStage,
+};
+
 use std::{path::Path, str::FromStr, time::Duration};
 
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::to_vec;
 use sqlx::{
     Row, SqlitePool,
@@ -18,13 +29,39 @@ static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 const MAX_RECORD_BYTES: usize = 16_384;
 
 /// One reducer snapshot update stored with an observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SnapshotUpdate {
     session: SessionIdentity,
     root: MainSessionId,
     revision: u64,
     state: DetailedState,
     updated_at: WallTimeMs,
+}
+
+impl<'de> Deserialize<'de> for SnapshotUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawSnapshotUpdate {
+            session: SessionIdentity,
+            root: MainSessionId,
+            revision: u64,
+            state: DetailedState,
+            updated_at: WallTimeMs,
+        }
+
+        let raw = RawSnapshotUpdate::deserialize(deserializer)?;
+        Self::new(
+            raw.session,
+            raw.root,
+            raw.revision,
+            raw.state,
+            raw.updated_at,
+        )
+        .map_err(de::Error::custom)
+    }
 }
 
 impl SnapshotUpdate {
@@ -48,6 +85,36 @@ impl SnapshotUpdate {
             state,
             updated_at,
         })
+    }
+
+    /// Role-preserving session identity.
+    #[must_use]
+    pub const fn session(&self) -> SessionIdentity {
+        self.session
+    }
+
+    /// Main-session tree containing the snapshot.
+    #[must_use]
+    pub const fn root(&self) -> MainSessionId {
+        self.root
+    }
+
+    /// Monotonically increasing reducer revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Detailed normalized session state.
+    #[must_use]
+    pub const fn state(&self) -> DetailedState {
+        self.state
+    }
+
+    /// Persistable snapshot update time.
+    #[must_use]
+    pub const fn updated_at(&self) -> WallTimeMs {
+        self.updated_at
     }
 }
 
@@ -178,7 +245,7 @@ impl PendingOutboxEntry {
 /// Open migrated Agent Watchdog database.
 #[derive(Clone, Debug)]
 pub struct WatchdogStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl WatchdogStore {
@@ -410,6 +477,9 @@ pub enum StoreError {
     /// A new observation attempted to apply a non-increasing revision.
     #[error("Snapshot revision must increase")]
     StaleSnapshot,
+    /// One idempotency key was reused for materially different content.
+    #[error("Observation identity was reused with different content")]
+    ObservationIdentityConflict,
     /// Cross-record identities do not describe one session tree.
     #[error("Observation, snapshot, and event identities do not agree")]
     IdentityMismatch,
@@ -436,10 +506,21 @@ async fn insert_observation(
         "observation monotonic time",
         observation.observed_at().monotonic_ms(),
     )?)
-    .bind(observation_json)
+    .bind(&observation_json)
     .execute(&mut **transaction)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() == 1 {
+        return Ok(true);
+    }
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT envelope_json FROM observations WHERE observation_id = ?")
+            .bind(observation.observation_id().to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+    if stored != observation_json {
+        return Err(StoreError::ObservationIdentityConflict);
+    }
+    Ok(false)
 }
 
 async fn upsert_session(
@@ -472,16 +553,7 @@ async fn upsert_snapshot(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     snapshot: &SnapshotUpdate,
 ) -> Result<(), StoreError> {
-    let snapshot_json = bounded_json(
-        &serde_json::json!({
-            "session": snapshot.session,
-            "root": snapshot.root,
-            "revision": snapshot.revision,
-            "state": snapshot.state,
-            "updated_at": snapshot.updated_at,
-        }),
-        "snapshot",
-    )?;
+    let snapshot_json = bounded_json(snapshot, "snapshot")?;
     let result = sqlx::query(
         "INSERT INTO session_snapshots \
          (session_id, root_session_id, revision, detailed_state, compact_state, updated_at_ms, snapshot_json) \
