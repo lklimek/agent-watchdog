@@ -1,7 +1,9 @@
 # Agent Watchdog Requirements
 
-Status: draft for UX approval  
-Date: 2026-07-17  
+Status: planning baseline, pending final approval
+
+Date: 2026-07-17
+
 Repository: `github.com/lklimek/agent-watchdog`
 
 ## 1. Problem statement
@@ -45,6 +47,8 @@ A project maintainer adds runtime adapters, validates the latest runtime release
 - OpenCode monitoring implementation. The domain model and adapter boundary must accommodate OpenCode later.
 - Token counting, token-cost calculation, budgets, or token analytics.
 - Native macOS deployment support.
+- Alternate local-process deployment modes, setup scripts, or special behavior
+  for operators who run the binary outside the supported Linux Compose stack.
 - Multi-host monitoring, multiple operators, or multi-tenant isolation.
 - A writable web UI, session detail pages, transcript viewer, or general process manager.
 - Full transcript replication, automatic history backup, or automatic history pruning.
@@ -173,7 +177,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-MCP-006 | Best-effort push is a nice-to-have when a runtime/client supports safe delivery. | Failure or lack of push support never replaces or blocks durable inbox delivery. |
 | FR-MCP-007 | Runtime compatibility drift appears as an `UPGRADE` warning field with an actionable message. | The agent can tell the user which watchdog/runtime compatibility needs attention. |
 
-Candidate v1 tools, subject to architecture review:
+The v1 MCP tool set is:
 
 - `register_session`
 - `register_delegation`
@@ -313,3 +317,35 @@ The Claudius watchdog demonstrates requirements and failure cases, not a correct
 - [Model Context Protocol resource subscriptions](https://modelcontextprotocol.io/specification/draft/server/resources)
 - [OpenCode server API](https://opencode.ai/docs/server/)
 - [OpenCode agents](https://opencode.ai/docs/agents/)
+
+## 13. Approved planning decisions and defaults
+
+This ledger is normative when the conversation that produced the requirements is
+no longer available. Detailed requirements above take precedence if wording ever
+appears to conflict.
+
+| Area | V1 decision |
+|---|---|
+| Product identity | Public MIT project `agent-watchdog` at `github.com/lklimek/agent-watchdog`. |
+| Problem | Monitor subagents in multi-agent orchestration sessions so coordinators investigate missing updates quickly, accepting useful false alarms. |
+| Operator/host | One trusted operator and one Linux host; target 50 main sessions and 500 total agents. |
+| Deployment | Docker Compose with Traefik is the only supported deployment. The Rust workspace should compile on macOS, but operation there is unsupported. No v1 setup script or alternate local-mode features. |
+| Runtimes | Claude Code main/subagents/teams, native Codex CLI main/subagents, and Codex Companion jobs. OpenCode is adapter-ready but not implemented or tested. |
+| Discovery | Automatic discovery is mandatory. MCP registration and official hooks are optional enrichment. Agents may register only paths within configured allowlisted prefixes. |
+| Hierarchy | Main session → repository/worktree contexts → children. Exact native relation, then MCP relation, then logged heuristic evidence. |
+| Human default | Active main-session cards only; no child cards or detail page. Waiting-for-user and stalled first, idle next, others last; optional directory A–Z sort. |
+| Card identity | Native title, falling back to startup-directory basename; show full startup directory, branch/linked PR, last activity, state, and child counts. |
+| Agent diagnostics | Parent receives every meaningful child event and detailed evidence including PID and CPU deltas. Human channels receive only issue, main title, and startup directory. |
+| Push | Nice to have where a client makes it useful; durable MCP inbox/pull is authoritative. |
+| Activity | inotify-driven incremental files, attributable worktree changes, native events, process tree, I/O/output, and four Linux CPU counter classes. Shared-worktree activity is neutral when attribution fails. |
+| Fallback timing | Suspect after 5 minutes, stalled after 15 minutes, unresolved alert every 5 minutes. Runtime-specific policy may override. |
+| Long operations | A silent transcript during `cargo test` or another long command is not a problem while correlated process evidence progresses. |
+| Waiting user | Never stalled or auto-killed; promoted in UI/human notifications. |
+| Termination | Children only after one continuous hour stalled and every safety gate; warn parent, allow 10-minute grace, graceful cancel → `SIGTERM` → `SIGKILL`. `SIGKILL` defaults on with TOML opt-out. Main sessions are impossible targets. |
+| Human events | Main waiting-for-user, stalled, and completed through web/browser, Home Assistant webhook, and generic webhook. Webhooks get one attempt and no retry. |
+| Compatibility | Test latest versions at implementation time. Other versions run optimistically; unexpected formats add actionable `UPGRADE`, continue best effort, and suspend affected destructive automation. |
+| Persistence | SQLite WAL; retain Watchdog history until manual wipe; no automatic pruning, backup, or export requirement. Never alter native runtime state. |
+| Configuration | Secrets/essentials in environment; roots, exclusions, thresholds, and policy in mounted TOML. Atomic TOML reload; environment changes require restart. |
+| Observability | `tracing` operational logs and detailed health only; no Prometheus in v1. Correlation confidence/evidence is logged, not shown in the default UI. |
+| Tokens/cost | No token counts or cost calculation in v1. Token counts per session/model/repository are a future enhancement; cost remains later still. |
+| Toolchain | Current stable Rust at implementation start, with no initial MSRV promise. |
