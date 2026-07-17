@@ -1,0 +1,1 @@
+//! Codex Companion observation adapter.

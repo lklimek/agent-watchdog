@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Show Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets
+
+      - name: Test documentation contracts
+        run: cargo test --workspace --doc
+
+      - name: Lint Phase 0 probes
+        run: cargo clippy --manifest-path tools/spikes/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Phase 0 probes
+        run: cargo test --manifest-path tools/spikes/Cargo.toml --all-targets
+
+      - name: Install supply-chain tools
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Check advisories, licenses, bans, and sources
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file tools/spikes/Cargo.lock
+          cargo deny --config deny.toml check
+          cargo deny --manifest-path tools/spikes/Cargo.toml --config deny.toml check
