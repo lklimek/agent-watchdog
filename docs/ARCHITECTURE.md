@@ -452,6 +452,13 @@ The MCP endpoint uses Streamable HTTP and shared Bearer authentication. At
 initialization/registration, a transport is bound to one main-session scope.
 Every query/mutation resolves the supplied session ID within that root tree.
 
+The rmcp transport ID is surfaced by a Watchdog `SessionManager` wrapper as a
+typed request extension. The application binds that opaque ID exactly once;
+rebinding and cross-tree targets fail server-side. rmcp's SSE replay cursor is
+transport-only. Parent event delivery and acknowledgement use a separate
+durable SQLite inbox cursor, so transport loss or resume failure cannot discard
+agent-visible events. This boundary is executable in the Phase 0 scoping test.
+
 Proposed tools:
 
 | Tool | Purpose |

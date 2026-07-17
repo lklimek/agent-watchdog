@@ -259,8 +259,20 @@ Repeatedly stop/restart during observations, outbox delivery, deadline expiry,
 and every termination-saga stage. Assert database integrity, idempotency, and no
 signal without fresh reconciliation.
 
-Exact CPU/memory/latency budgets are set after the Phase 0 measurement spike;
-they must be recorded in this section before v1 release rather than invented now.
+The Phase 0 baseline establishes these initial release gates:
+
+- 4,096 queued observations and bounded producer admission;
+- synthetic 250,000-observation convergence under 2 seconds wall time and 2
+  CPU-seconds, with p99 queue-to-reducer latency under 10 ms;
+- maximum RSS at 50 mains/500 total agents of 256 MiB;
+- no-change steady-state CPU below 10% of one core over 10 minutes, excluding
+  explicitly configured reconciliation scans;
+- representative burst convergence p99 under 250 ms while health and UI remain
+  responsive.
+
+The measured bare-loop baseline and rebaseline policy are recorded in
+`docs/spikes/capacity.md`. Release evidence must use the production service, not
+substitute the spike binary.
 
 ## 7. Live-runtime compatibility matrix
 

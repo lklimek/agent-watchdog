@@ -1,0 +1,24 @@
+[package]
+name = "agent-watchdog-phase0-probes"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "process", "std"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+futures = "=0.3.31"
+rmcp = { version = "=2.2.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+serde_json = "=1.0.149"
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.0", default-features = false, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

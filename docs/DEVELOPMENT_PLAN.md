@@ -413,6 +413,10 @@ stable. It is feature-flagged off during development despite the final v1 defaul
 6. Exercise a degraded adapter and prove unaffected runtime continuity.
 7. Exercise every termination gate with the helper process.
 8. Review logs/database/UI/webhooks for leaked transcript or credential content.
+9. Only now read
+   `/data/artifacts/claudius/2026-07-17/watchdog-knowledge-transfer.html`,
+   interpret it in the context of `https://github.com/lklimek/claudius`, and
+   record evidence that every applicable pitfall is avoided or resolved.
 
 ### Exit criteria
 
@@ -448,9 +452,9 @@ automation, and deployment in one review.
 
 | Risk | Earliest resolution | Response |
 |---|---|---|
-| Read-only native Codex SQLite cannot reliably see WAL | Phase 0 | Prefer official events/JSONL; mark DB evidence optional/degraded. |
-| Same-UID container still cannot signal host process | Phase 0 | Document required host settings or restrict v1 termination to supported native APIs; do not add privilege casually. |
-| rmcp cannot bind scope as assumed | Phase 0 | Add explicit scoped registration handle while preserving shared server token/trusted-host model. |
+| Read-only native Codex SQLite cannot reliably see WAL | Adapter integration | Prefer official events/JSONL; mark DB evidence optional/degraded. |
+| Same-UID container cannot signal a freshly verified host helper | Resolved in Phase 0 | Container proof passed without added capabilities; production keeps fail-closed health and identity gates. |
+| rmcp cannot bind scope as assumed | Resolved in Phase 0 | Custom manager injected its generated transport ID; production uses exact-once application binding and a separate durable inbox cursor. |
 | Runtime formats drift during development | Phases 0/5 | Version guard, per-adapter live tests, `UPGRADE`, no destructive action. |
 | Inotify watch count exceeds host limits | Phases 0/3 | Deduplicate roots, expose health, document host tuning, bounded reconciliation. |
 | Shared worktree activity cannot be attributed | Phase 3 | Treat it as neutral for every child, per requirement. |
