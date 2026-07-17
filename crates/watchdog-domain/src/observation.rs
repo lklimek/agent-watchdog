@@ -20,8 +20,14 @@ pub enum ObservationPayload {
     Deadline(DeadlineCommand),
     /// Runtime compatibility degradation.
     Compatibility(CompatibilityWarning),
+    /// Fresh adapter validation cleared its compatibility warning.
+    CompatibilityResolved,
     /// Bounded explanation of materially conflicting sources.
     SourceConflict(BoundedText<2_048>),
+    /// Fresh reconciliation proved the prior source conflict is resolved.
+    SourceConflictResolved,
+    /// Durable scheduler invalidation evaluated by the coordinator as a tick.
+    SchedulerTick,
 }
 
 /// Idempotent observation with typed subject, provenance, time, and payload.

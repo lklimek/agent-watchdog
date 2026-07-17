@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ChildSessionId, MainSessionId, SessionId};
 
 /// Role of a session within the monitored hierarchy.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
     /// User-started root that automatic termination can never accept.
@@ -15,7 +15,7 @@ pub enum SessionKind {
 }
 
 /// Role-preserving session identity for generic observations and events.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "id")]
 pub enum SessionIdentity {
     /// Main-session identity.
