@@ -349,3 +349,37 @@ appears to conflict.
 | Observability | `tracing` operational logs and detailed health only; no Prometheus in v1. Correlation confidence/evidence is logged, not shown in the default UI. |
 | Tokens/cost | No token counts or cost calculation in v1. Token counts per session/model/repository are a future enhancement; cost remains later still. |
 | Toolchain | Current stable Rust at implementation start, with no initial MSRV promise. |
+
+## 14. Context-reset completeness map
+
+The project must remain executable after the planning conversation is discarded.
+The five planning documents are the complete implementation input, with this
+precedence:
+
+1. `REQUIREMENTS.md` defines product scope, safety invariants, and normative
+   behavior.
+2. `UX_SPECIFICATION.md` defines the approved human experience.
+3. `ARCHITECTURE.md` defines implementation boundaries and records research
+   leads that must be re-verified.
+4. `TEST_SPECIFICATION.md` defines the evidence required for acceptance.
+5. `DEVELOPMENT_PLAN.md` defines sequencing, working policy, risks, and the fresh
+   session bootstrap.
+
+| Context that must survive | Authoritative location |
+|---|---|
+| Problem, personas, scope, non-goals, statuses, all product defaults | Requirements §§1–8 and §13 |
+| Runtime evidence precedence and predecessor failure cases | Requirements §§9–10; Architecture §§7 and 24 |
+| Approved desktop/mobile dashboard and notification content | UX specification |
+| Crates, components, data flow/model, adapters, CPU/process behavior, persistence, MCP/HTTP, security, Compose | Architecture §§3–20 |
+| Architectural rationale and deferred decisions | Architecture §§21–22 |
+| Exact observed versions, internal-state discovery leads, Claudius/MemCan research, durable pitfalls | Architecture §24 |
+| Test cases, live-runtime policy, load/security gates, commands, release blockers | Test specification |
+| TDD phases, spikes, dependencies, exit criteria, risks, commits, definition of done | Development plan |
+| Post-compaction reading/execution procedure and repository policy | Development plan §§2, 19, and 20 |
+| Approved interactive wireframe | UX introduction and external artifact URL |
+
+If these documents conflict materially or omit a decision needed to choose
+between different product outcomes, implementation stops at that point and the
+documents are reconciled with the product owner. An implementer may make and
+record low-level choices that preserve all documented behavior, safety, scope,
+and architecture acceptance gates.
