@@ -147,7 +147,8 @@ architecture before building application code.
 ### Exit criteria
 
 - `watchdog-domain` has no I/O dependencies.
-- macOS-target compilation reaches platform stubs.
+- macOS-target compilation is deferred to Phase 10; Linux-only operation remains
+  explicit at platform boundaries meanwhile.
 - T-DIS-010, T-STA-001, T-KILL-001, and core input-bound tests pass.
 
 ## 6. Phase 2 — SQLite store and transactional outbox
@@ -394,6 +395,7 @@ stable. It is feature-flagged off during development despite the final v1 defaul
 ### Deliverables
 
 - Exact current supported runtime/version matrix.
+- macOS build-only compilation evidence without operation support claims.
 - Full live-runtime suite in isolated roots.
 - Target 50-main/500-agent load and restart soak.
 - Large-transcript and filesystem-storm evidence.

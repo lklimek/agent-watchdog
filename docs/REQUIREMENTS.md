@@ -93,6 +93,7 @@ The web UI defaults to the compact states:
 
 - `active`
 - `waiting`
+- `idle`
 - `stalled`
 - `finished`
 - `failed`

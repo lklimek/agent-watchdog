@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/watchdog-domain",
+    "crates/watchdog-store",
+    "crates/watchdog-runtime",
+    "crates/watchdog-claude",
+    "crates/watchdog-codex",
+    "crates/watchdog-companion",
+    "crates/watchdog-process",
+    "crates/watchdog-server",
+    "crates/watchdog-testkit",
+]
+exclude = ["tools/spikes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/lklimek/agent-watchdog"
+
+[workspace.dependencies]
+secrecy = { version = "=0.10.3", default-features = false }
+serde = { version = "=1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = "=1.0.149"
+thiserror = "=2.0.18"
+uuid = { version = "=1.24.0", default-features = false, features = ["serde", "v5"] }
+
+watchdog-domain = { path = "crates/watchdog-domain", version = "=0.1.0" }
+watchdog-runtime = { path = "crates/watchdog-runtime", version = "=0.1.0" }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+[profile.release]
+strip = true
+lto = "thin"
