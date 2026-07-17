@@ -662,8 +662,10 @@ async fn assert_saga_and_inbox(store: &WatchdogStore, root: MainSessionId, child
             ]
             .into_iter()
             .collect(),
+            blockers: BTreeSet::default(),
             process: None,
         },
+        last_outcome: Some(watchdog_domain::TerminationActionOutcome::WarningScheduled),
     };
     store
         .save_termination_saga(&saga)
@@ -683,8 +685,10 @@ async fn assert_saga_and_inbox(store: &WatchdogStore, root: MainSessionId, child
         next_action_at: None,
         safety: TerminationSafetyRecord {
             passed_gates: BTreeSet::default(),
+            blockers: BTreeSet::default(),
             process: None,
         },
+        last_outcome: Some(watchdog_domain::TerminationActionOutcome::SignalSent),
     };
     assert!(store.save_termination_saga(&stale_saga).await.is_err());
 

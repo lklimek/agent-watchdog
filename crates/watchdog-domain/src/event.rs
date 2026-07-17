@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{DetailedState, MainSessionId, SessionIdentity, WallTimeMs};
+use crate::{
+    DetailedState, MainSessionId, SessionIdentity, TerminationActionOutcome, TerminationStage,
+    WallTimeMs,
+};
 
 /// Durable monotonically ordered event identifier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -51,6 +54,13 @@ pub enum DomainEventKind {
     },
     /// Restart recovery requires fresh trustworthy evidence.
     ReconciliationRequired,
+    /// Child-only automated termination saga changed stage.
+    TerminationChanged {
+        /// Newly durable conservative saga stage.
+        stage: TerminationStage,
+        /// Bounded result without native error or command content.
+        outcome: TerminationActionOutcome,
+    },
 }
 
 /// Durable event scoped to one main-session tree.

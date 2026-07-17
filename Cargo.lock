@@ -2039,6 +2039,7 @@ dependencies = [
  "tokio",
  "tower",
  "watchdog-domain",
+ "watchdog-process",
  "watchdog-runtime",
  "watchdog-store",
  "watchdog-testkit",
