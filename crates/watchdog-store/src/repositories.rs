@@ -30,6 +30,24 @@ impl WatchdogStore {
             .transpose()
     }
 
+    /// Load stable native identity and role for a runtime-neutral session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt stored identities or `SQLite` failure.
+    pub async fn session_by_id(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT session_id, kind, root_session_id, runtime, native_id FROM sessions WHERE session_id = ?",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| decode_session_row(&row, None)).transpose()
+    }
+
     /// Load a bounded stable session list for one main-session tree.
     ///
     /// # Errors
@@ -143,6 +161,57 @@ impl WatchdogStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Select one hierarchy relation, superseding a prior selected parent in a
+    /// single transaction.
+    ///
+    /// Repeating the same selected relation is idempotent and returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when identities are missing, serialization is
+    /// oversized, or the transaction fails.
+    pub async fn select_relation(&self, record: &RelationRecord) -> Result<bool, StoreError> {
+        let payload = bounded_json(record, "session relation")?;
+        let mut transaction = self.pool.begin().await?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT parent_session_id FROM session_relations \
+             WHERE child_session_id = ? AND selected = 1 AND valid_until_ms IS NULL \
+             ORDER BY valid_from_ms DESC LIMIT 1",
+        )
+        .bind(record.child.session_id().to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let selected_parent = record.parent.session_id().to_string();
+        if current.as_deref() == Some(selected_parent.as_str()) {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE session_relations SET selected = 0, valid_until_ms = ? \
+             WHERE child_session_id = ? AND selected = 1 AND valid_until_ms IS NULL",
+        )
+        .bind(record.valid_from.value())
+        .bind(record.child.session_id().to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO session_relations \
+             (child_session_id, parent_session_id, root_session_id, selected, provenance_json, valid_from_ms, valid_until_ms) \
+             VALUES (?, ?, ?, 1, ?, ?, NULL) \
+             ON CONFLICT(child_session_id, parent_session_id, valid_from_ms) DO UPDATE SET \
+             selected = 1, provenance_json = excluded.provenance_json, valid_until_ms = NULL",
+        )
+        .bind(record.child.session_id().to_string())
+        .bind(record.parent.session_id().to_string())
+        .bind(record.root.session_id().to_string())
+        .bind(payload)
+        .bind(record.valid_from.value())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Load hierarchy candidates for one main-session tree.
