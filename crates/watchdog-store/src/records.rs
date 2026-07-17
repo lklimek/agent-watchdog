@@ -19,6 +19,108 @@ pub struct StoredSessionRecord {
     pub native: watchdog_domain::NativeSessionKey,
 }
 
+/// Bounded operator-facing session metadata retained separately from state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMetadataRecord {
+    session: SessionIdentity,
+    title: Option<BoundedText<512>>,
+    startup_directory: Option<BoundedText<4_096>>,
+    repository_remote: Option<BoundedText<2_048>>,
+    branch: Option<BoundedText<512>>,
+    pull_request_number: Option<u64>,
+    pull_request_url: Option<BoundedText<2_048>>,
+    updated_at: WallTimeMs,
+}
+
+impl SessionMetadataRecord {
+    /// Construct bounded metadata after path capability validation and optional
+    /// GitHub enrichment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`watchdog_domain::DomainInputError`] for an oversized field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: SessionIdentity,
+        title: Option<String>,
+        startup_directory: Option<String>,
+        repository_remote: Option<String>,
+        branch: Option<String>,
+        pull_request_number: Option<u64>,
+        pull_request_url: Option<String>,
+        updated_at: WallTimeMs,
+    ) -> Result<Self, watchdog_domain::DomainInputError> {
+        Ok(Self {
+            session,
+            title: optional_bounded("session_title", title)?,
+            startup_directory: optional_bounded("startup_directory", startup_directory)?,
+            repository_remote: optional_bounded("repository_remote", repository_remote)?,
+            branch: optional_bounded("branch", branch)?,
+            pull_request_number,
+            pull_request_url: optional_bounded("pull_request_url", pull_request_url)?,
+            updated_at,
+        })
+    }
+
+    /// Session receiving this metadata.
+    #[must_use]
+    pub const fn session(&self) -> SessionIdentity {
+        self.session
+    }
+
+    /// Native title, when available.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Directory in which the user started the runtime command.
+    #[must_use]
+    pub fn startup_directory(&self) -> Option<&str> {
+        self.startup_directory.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Git repository remote used for optional PR enrichment.
+    #[must_use]
+    pub fn repository_remote(&self) -> Option<&str> {
+        self.repository_remote.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Current Git branch, when detected.
+    #[must_use]
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Enriched GitHub pull request number.
+    #[must_use]
+    pub const fn pull_request_number(&self) -> Option<u64> {
+        self.pull_request_number
+    }
+
+    /// Validated GitHub pull request URL.
+    #[must_use]
+    pub fn pull_request_url(&self) -> Option<&str> {
+        self.pull_request_url.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Freshest metadata observation time.
+    #[must_use]
+    pub const fn updated_at(&self) -> WallTimeMs {
+        self.updated_at
+    }
+}
+
+fn optional_bounded<const N: usize>(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<Option<BoundedText<N>>, watchdog_domain::DomainInputError> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| BoundedText::new(field, value))
+        .transpose()
+}
+
 /// Selected or candidate session hierarchy relation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RelationRecord {
