@@ -36,6 +36,21 @@ pub enum DomainEventKind {
     CompatibilityChanged,
     /// Session hierarchy changed after better evidence.
     HierarchyChanged,
+    /// Session crossed the internal corroboration threshold.
+    Suspect,
+    /// A fresh-check alert should be persisted and delivered.
+    AlertDue,
+    /// An unresolved alert reached its reminder cadence.
+    ReminderDue,
+    /// A parent changed the expected check-in policy.
+    DeadlineChanged,
+    /// Material source conflict started or resolved.
+    ConflictChanged {
+        /// Whether a conflict is now active.
+        active: bool,
+    },
+    /// Restart recovery requires fresh trustworthy evidence.
+    ReconciliationRequired,
 }
 
 /// Durable event scoped to one main-session tree.

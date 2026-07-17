@@ -4,8 +4,8 @@ use watchdog_domain::{
     AdapterIdentity, BoundedText, Capability, CapabilitySet, ChildSessionId, CompatibilityWarning,
     Confidence, DeadlinePolicy, DetailedState, DomainEvent, DomainEventKind, DurationMs, EventId,
     EvidenceTrust, MainSessionId, NativeSessionKey, ObservationEnvelope, ObservationId,
-    ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, RuntimeKind, SessionId,
-    SessionIdentity, SessionKind, TimePoint, WallTimeMs, WarningKind,
+    ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, ReducerPolicy, RuntimeKind,
+    SessionId, SessionIdentity, SessionKind, TimePoint, WallTimeMs, WarningKind,
 };
 
 fn session_id(value: u128) -> SessionId {
@@ -48,6 +48,26 @@ fn default_deadlines_use_fifteen_minute_stall_and_one_hour_stalled_delay() {
         DurationMs::new(60 * 60_000)
     );
     assert_eq!(policy.graceful_signal_grace(), DurationMs::new(10 * 60_000));
+}
+
+#[test]
+fn reducer_policy_rejects_inverted_thresholds_and_zero_reminders() {
+    assert!(
+        ReducerPolicy::new(
+            DurationMs::new(15 * 60_000),
+            DurationMs::new(5 * 60_000),
+            DurationMs::new(5 * 60_000),
+        )
+        .is_err()
+    );
+    assert!(
+        ReducerPolicy::new(
+            DurationMs::new(5 * 60_000),
+            DurationMs::new(15 * 60_000),
+            DurationMs::new(0),
+        )
+        .is_err()
+    );
 }
 
 #[test]
