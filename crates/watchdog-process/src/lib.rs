@@ -1,5 +1,21 @@
 //! Platform-gated process evidence and verified process control.
 
+#[cfg(target_os = "linux")]
+mod linux;
+mod model;
+mod procfs;
+
+#[cfg(target_os = "linux")]
+pub use linux::{
+    LinuxProcessControl, LinuxProcessSampler, ProcessControl, ProcessControlError,
+    ProcessReadError, ProcessSignal, VerifiedProcessHandle,
+};
+pub use model::{
+    ActivityStrength, CommandFingerprint, CpuCounters, IoCounters, ProcessActivity, ProcessSample,
+    ProcessState, ProcessTreeError, ProcessTreeSnapshot, SampleUncertainty,
+};
+pub use procfs::{IoParseError, ProcStat, ProcStatParseError};
+
 /// Compile-time process-operation support for the current target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformSupport {
