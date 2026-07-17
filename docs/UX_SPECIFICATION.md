@@ -1,8 +1,15 @@
 # Agent Watchdog UX Specification
 
-Status: wireframe approval required  
-Date: 2026-07-17  
+Status: approved for v1
+
+Date: 2026-07-17
+
 Derived from: [REQUIREMENTS.md](REQUIREMENTS.md)
+
+Wireframes approved by the product owner on 2026-07-17. The interactive review
+artifact is intentionally stored outside the repository under
+`/data/artifacts/agent-watchdog/2026-07-17/` and served on the project network at
+`http://agentic/agent-watchdog/2026-07-17/`.
 
 ## 1. Experience objective
 
@@ -289,7 +296,7 @@ The parent may change deadlines or intentional-waiting state through MCP. Push n
 - Token counts and per-model breakdowns.
 - Config editing, history cleanup, health dashboards, and metrics pages.
 
-## 15. Wireframe decisions requiring approval
+## 15. Approved wireframe decisions
 
 1. One non-clickable card per active main session, with no detail page in v1.
 2. State-first cards with startup directory as the identity anchor.
