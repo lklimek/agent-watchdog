@@ -16,8 +16,9 @@ pub use auth::{
     MAX_AUTHORIZATION_BYTES,
 };
 pub use dashboard::{
-    DashboardCard, DashboardError, DashboardQuery, DashboardScope, DashboardService,
-    DashboardSnapshot, DashboardSort, DashboardWarning, dashboard_router,
+    DashboardCard, DashboardError, DashboardOutboxDispatcher, DashboardOutboxError, DashboardQuery,
+    DashboardScope, DashboardService, DashboardSnapshot, DashboardSort, DashboardWarning,
+    dashboard_router,
 };
 pub use mcp::{WatchdogMcpService, WatchdogSessionManager, mcp_router};
 #[cfg(target_os = "linux")]

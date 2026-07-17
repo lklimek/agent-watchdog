@@ -18,8 +18,8 @@ use watchdog_domain::{
     TimePoint, WallTimeMs,
 };
 use watchdog_server::{
-    BasicAuthenticator, DashboardQuery, DashboardScope, DashboardService, DashboardSort,
-    dashboard_router,
+    BasicAuthenticator, DashboardOutboxDispatcher, DashboardQuery, DashboardScope,
+    DashboardService, DashboardSort, dashboard_router,
 };
 use watchdog_store::{
     ApplyObservation, OutboxDestination, SessionMetadataRecord, SnapshotUpdate, WatchdogStore,
@@ -387,4 +387,71 @@ async fn lagging_sse_client_is_told_to_resynchronize() {
         .expect("stream should remain open")
         .expect("lag frame should be readable");
     assert!(String::from_utf8_lossy(&lagged).contains("event: resync_required"));
+}
+
+#[tokio::test]
+async fn durable_sse_outbox_publishes_current_snapshot_and_acknowledges_delivery() {
+    let fixture = DashboardFixture::new().await;
+    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
+    let response = fixture
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let mut stream = response.into_body().into_data_stream();
+    let _initial = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("initial SSE frame should arrive")
+        .expect("stream should remain open")
+        .expect("initial frame should be readable");
+
+    fixture
+        .seed(SessionSeed {
+            native_id: "new-main",
+            kind: SessionKind::Main,
+            root: None,
+            state: DetailedState::WaitingForUser,
+            event_id: 1,
+            directory: Some("/work/new-main"),
+            title: Some("New main"),
+        })
+        .await;
+    let dispatcher = DashboardOutboxDispatcher::new(
+        fixture.store.clone(),
+        fixture.service.clone(),
+        Arc::new(FakeClock::new(TimePoint::new(
+            WallTimeMs::new(61_000),
+            61_000,
+        ))),
+    );
+    assert_eq!(
+        dispatcher
+            .deliver_pending(10)
+            .await
+            .expect("delivery should succeed"),
+        1
+    );
+
+    let update = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("published snapshot should arrive")
+        .expect("stream should remain open")
+        .expect("snapshot frame should be readable");
+    let update = String::from_utf8_lossy(&update);
+    assert!(update.contains("event: snapshot"));
+    assert!(update.contains("New main"));
+    assert!(
+        fixture
+            .store
+            .pending_outbox_for(OutboxDestination::Sse, 10)
+            .await
+            .expect("outbox should load")
+            .is_empty()
+    );
 }
