@@ -33,6 +33,7 @@ uuid = { version = "=1.24.0", default-features = false, features = ["serde", "v5
 
 watchdog-domain = { path = "crates/watchdog-domain", version = "=0.1.0" }
 watchdog-runtime = { path = "crates/watchdog-runtime", version = "=0.1.0" }
+watchdog-store = { path = "crates/watchdog-store", version = "=0.1.0" }
 
 [workspace.lints.rust]
 missing_docs = "deny"

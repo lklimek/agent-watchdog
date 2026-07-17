@@ -22,7 +22,7 @@ use sqlx::{
 use thiserror::Error;
 use watchdog_domain::{
     CompactState, DetailedState, DomainEvent, EventId, MainSessionId, ObservationEnvelope,
-    SessionIdentity, WallTimeMs,
+    SessionIdentity, SessionSnapshot, WallTimeMs,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
@@ -36,6 +36,8 @@ pub struct SnapshotUpdate {
     revision: u64,
     state: DetailedState,
     updated_at: WallTimeMs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reducer_snapshot: Option<SessionSnapshot>,
 }
 
 impl<'de> Deserialize<'de> for SnapshotUpdate {
@@ -50,17 +52,33 @@ impl<'de> Deserialize<'de> for SnapshotUpdate {
             revision: u64,
             state: DetailedState,
             updated_at: WallTimeMs,
+            #[serde(default)]
+            reducer_snapshot: Option<SessionSnapshot>,
         }
 
         let raw = RawSnapshotUpdate::deserialize(deserializer)?;
-        Self::new(
+        let mut snapshot = Self::new(
             raw.session,
             raw.root,
             raw.revision,
             raw.state,
             raw.updated_at,
         )
-        .map_err(de::Error::custom)
+        .map_err(de::Error::custom)?;
+        if let Some(reducer_snapshot) = raw.reducer_snapshot {
+            if reducer_snapshot.session() != snapshot.session
+                || reducer_snapshot.root() != snapshot.root
+                || reducer_snapshot.revision() != snapshot.revision
+                || reducer_snapshot.state() != snapshot.state
+                || reducer_snapshot.updated_at().wall_time() != snapshot.updated_at
+            {
+                return Err(de::Error::custom(
+                    "Reducer snapshot metadata does not match",
+                ));
+            }
+            snapshot.reducer_snapshot = Some(reducer_snapshot);
+        }
+        Ok(snapshot)
     }
 }
 
@@ -84,7 +102,26 @@ impl SnapshotUpdate {
             revision,
             state,
             updated_at,
+            reducer_snapshot: None,
         })
+    }
+
+    /// Construct a store projection that retains the complete reducer state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreInputError`] when the reducer revision is zero or cannot
+    /// fit `SQLite`.
+    pub fn from_reducer(snapshot: &SessionSnapshot) -> Result<Self, StoreInputError> {
+        let mut update = Self::new(
+            snapshot.session(),
+            snapshot.root(),
+            snapshot.revision(),
+            snapshot.state(),
+            snapshot.updated_at().wall_time(),
+        )?;
+        update.reducer_snapshot = Some(snapshot.clone());
+        Ok(update)
     }
 
     /// Role-preserving session identity.
@@ -115,6 +152,12 @@ impl SnapshotUpdate {
     #[must_use]
     pub const fn updated_at(&self) -> WallTimeMs {
         self.updated_at
+    }
+
+    /// Complete pure reducer state, when produced by the coordinator.
+    #[must_use]
+    pub const fn reducer_snapshot(&self) -> Option<&SessionSnapshot> {
+        self.reducer_snapshot.as_ref()
     }
 }
 
@@ -268,6 +311,30 @@ impl WatchdogStore {
             .await?;
         MIGRATOR.run(&pool).await?;
         Ok(Self { pool })
+    }
+
+    /// Load the first unallocated durable event identity for process startup.
+    ///
+    /// This must be called once before session coordinator lanes are exposed;
+    /// all lanes then share one in-process allocator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt values, exhaustion, or `SQLite`
+    /// failure.
+    pub async fn first_unallocated_event_id(&self) -> Result<u64, StoreError> {
+        let highest: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(event_id) FROM state_transitions")
+                .fetch_one(&self.pool)
+                .await?;
+        let highest = highest.unwrap_or(0);
+        if highest < 0 {
+            return Err(StoreError::CorruptValue("negative event ID"));
+        }
+        let next = highest
+            .checked_add(1)
+            .ok_or(StoreInputError::IntegerRange { field: "event ID" })?;
+        u64::try_from(next).map_err(|_| StoreError::CorruptValue("negative event ID"))
     }
 
     /// Atomically persist an observation, snapshot, events, and delivery rows.
