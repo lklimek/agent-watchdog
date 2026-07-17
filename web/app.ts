@@ -63,7 +63,13 @@ function connect(): void {
     setConnection("live");
   });
   source.addEventListener("snapshot", (event: MessageEvent<string>) => {
-    const candidate: unknown = JSON.parse(event.data);
+    let candidate: unknown;
+    try {
+      candidate = JSON.parse(event.data);
+    } catch {
+      scheduleReconnect();
+      return;
+    }
     if (!isSnapshot(candidate)) {
       scheduleReconnect();
       return;
@@ -171,7 +177,7 @@ function notifyImportantChanges(snapshot: Snapshot): void {
     if (prior === card.state) continue;
     if (humanEvent(card.state)) {
       urgentUpdates.textContent = `${card.title}: ${statePresentation(card.state)[1]}`;
-      if (Notification.permission === "granted") {
+      if ("Notification" in window && Notification.permission === "granted") {
         new Notification(`Agent Watchdog: ${statePresentation(card.state)[1].toLowerCase()}`, {
           body: `${card.title}\n${card.startup_directory}`,
           tag: `agent-watchdog-${card.session_id}-${card.state}`,
@@ -221,8 +227,40 @@ function isSnapshot(value: unknown): value is Snapshot {
   const candidate = value as Record<string, unknown>;
   return typeof candidate.revision === "number"
     && typeof candidate.generated_at_ms === "number"
-    && Array.isArray(candidate.sessions);
+    && Array.isArray(candidate.sessions)
+    && candidate.sessions.every(isCard);
 }
+
+function isCard(value: unknown): value is Card {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.session_id === "string"
+    && typeof candidate.title === "string"
+    && typeof candidate.startup_directory === "string"
+    && optionalString(candidate.branch)
+    && optionalNumber(candidate.pull_request_number)
+    && optionalString(candidate.pull_request_url)
+    && detailedStates.has(candidate.state)
+    && compactStates.has(candidate.compact_state)
+    && typeof candidate.last_activity_ms === "number"
+    && isChildCounts(candidate.child_counts)
+    && isWarning(candidate.warning);
+}
+
+function isChildCounts(value: unknown): value is Partial<Record<CompactState, number>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.entries(value).every(([state, count]) => compactStates.has(state) && typeof count === "number" && count >= 0);
+}
+
+function isWarning(value: unknown): value is Warning | null {
+  if (value === null) return true;
+  if (typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.badge === "string" && typeof candidate.message === "string";
+}
+
+function optionalString(value: unknown): boolean { return value === null || typeof value === "string"; }
+function optionalNumber(value: unknown): boolean { return value === null || typeof value === "number"; }
 
 /** Create an element whose content is always assigned through textContent. */
 function element(tag: string, className?: string, text?: string): HTMLElement {
@@ -311,13 +349,26 @@ function safePullRequestUrl(raw: string | null): string | null {
   if (raw === null) return null;
   try {
     const url = new URL(raw);
-    return url.protocol === "https:" && url.hostname === "github.com" ? url.href : null;
+    return url.protocol === "https:"
+      && url.hostname === "github.com"
+      && url.port === ""
+      && url.username === ""
+      && url.password === ""
+      && url.search === ""
+      && url.hash === ""
+      ? url.href
+      : null;
   } catch {
     return null;
   }
 }
 
 const compactStateOrder: readonly CompactState[] = ["active", "waiting", "idle", "stalled", "finished", "failed", "unknown"];
+const compactStates = new Set<unknown>(compactStateOrder);
+const detailedStates = new Set<unknown>([
+  "starting", "running", "waiting_for_agent", "waiting_for_tool", "waiting_for_user", "idle", "stalled",
+  "completed", "failed", "cancelled", "disappeared", "unknown",
+]);
 
 controls?.addEventListener("submit", (event) => {
   event.preventDefault();
