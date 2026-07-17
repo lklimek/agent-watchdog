@@ -3,6 +3,7 @@
 mod agent_api;
 mod auth;
 mod dashboard;
+mod github;
 mod mcp;
 mod notifications;
 #[cfg(target_os = "linux")]
@@ -21,6 +22,7 @@ pub use dashboard::{
     DashboardScope, DashboardService, DashboardSnapshot, DashboardSort, DashboardWarning,
     dashboard_router,
 };
+pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use mcp::{WatchdogMcpService, WatchdogSessionManager, mcp_router};
 pub use notifications::{
     HumanNotification, HumanNotifier, NotificationConfigError, NotificationDelivery,
