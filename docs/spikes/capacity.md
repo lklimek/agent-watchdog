@@ -66,6 +66,29 @@ The production gates deliberately leave headroom for the database, adapters,
 and HTTP stack while remaining tight enough to catch rescans, per-agent task
 explosions, and unbounded queues. Rebaseline only with a recorded rationale.
 
+## Production-service population gate
+
+The ignored `watchdog-server` load test exercises the production SQLite store,
+session coordinator, hierarchy, restart lane reconstruction, and dashboard read
+model with 50 mains and 450 children. It is explicit rather than part of every
+commit's default test run:
+
+```text
+/home/ubuntu/.codex/claudius/scripts/cargo-cached.sh \
+  test -p watchdog-server --test load -- --ignored --nocapture
+```
+
+On the reference Linux host, the debug-profile test ingested and durably
+converged all 500 sessions in 416 ms, built the 50-card dashboard (including all
+child counts) in 33 ms, and reported a test-process high-water RSS of 13.4 MiB.
+It then reconstructed all 500 reducer lanes from the same database and produced
+an identical dashboard. The executable gate permits 30 seconds for ingestion,
+2 seconds for a dashboard snapshot, and 256 MiB high-water RSS to tolerate CI
+variance while still catching catastrophic regressions. These figures cover
+the in-process production path, not container overhead, live adapter parsing,
+the 10-minute steady-state CPU gate, or burst p99; those remain separate release
+measurements.
+
 ## Architectural impact
 
 Keep a bounded observation channel and a single transactional reducer owner.
