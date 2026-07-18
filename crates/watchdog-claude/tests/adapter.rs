@@ -110,6 +110,7 @@ fn team_config_discovers_active_members_without_newest_session_guessing() {
     )
     .expect("current team config should parse");
 
+    assert_eq!(team.name(), Some("watchdog-team"));
     assert_eq!(team.lead().native_id(), "lead-1");
     assert_eq!(team.members().len(), 1);
     assert_eq!(team.members()[0].subject().native_id(), "child-1");
@@ -208,7 +209,16 @@ fn team_task_status_is_bounded_and_runtime_neutral() {
     )
     .expect("current task record should parse");
 
-    assert_eq!(task.owner(), "bilby");
+    assert_eq!(task.owner(), Some("bilby"));
     assert_eq!(task.state(), DetailedState::Running);
     assert_eq!(task.title(), Some("Review implementation"));
+}
+
+#[test]
+fn unassigned_native_task_is_valid_but_has_no_session_owner() {
+    let task = parse_task_record(br#"{"id":"8","subject":"Unclaimed work","status":"pending"}"#)
+        .expect("unassigned task should remain valid");
+
+    assert_eq!(task.owner(), None);
+    assert_eq!(task.state(), DetailedState::Starting);
 }

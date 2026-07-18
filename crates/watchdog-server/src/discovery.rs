@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Read as _,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -298,6 +298,53 @@ impl ClaudeTeamTranscriptAliases {
     }
 }
 
+struct ClaudeTaskAggregate {
+    subject: NativeSessionKey,
+    states: BTreeSet<DetailedState>,
+    latest_terminal: Option<(DetailedState, u128)>,
+    latest_modified_ns: u128,
+    task_count: u32,
+}
+
+impl ClaudeTaskAggregate {
+    fn new(subject: NativeSessionKey) -> Self {
+        Self {
+            subject,
+            states: BTreeSet::new(),
+            latest_terminal: None,
+            latest_modified_ns: 0,
+            task_count: 0,
+        }
+    }
+
+    fn observe(&mut self, state: DetailedState, modified_ns: u128) {
+        self.states.insert(state);
+        if matches!(
+            state,
+            DetailedState::Completed | DetailedState::Failed | DetailedState::Cancelled
+        ) && self
+            .latest_terminal
+            .is_none_or(|(_, current_ns)| modified_ns >= current_ns)
+        {
+            self.latest_terminal = Some((state, modified_ns));
+        }
+        self.latest_modified_ns = self.latest_modified_ns.max(modified_ns);
+        self.task_count = self.task_count.saturating_add(1);
+    }
+
+    fn state(&self) -> DetailedState {
+        if self.states.contains(&DetailedState::Running) {
+            DetailedState::Running
+        } else if self.states.contains(&DetailedState::Starting) {
+            DetailedState::Starting
+        } else if let Some((state, _)) = self.latest_terminal {
+            state
+        } else {
+            DetailedState::Unknown
+        }
+    }
+}
+
 #[derive(Default)]
 struct ClaudeTranscriptBootstrap {
     cwd: Option<PathBuf>,
@@ -391,6 +438,7 @@ impl ClaudeDiscovery {
             scans.push((root, scan));
         }
         let mut aliases = ClaudeTeamTranscriptAliases::default();
+        let mut teams = Vec::new();
         for (root, scan) in &scans {
             let candidates =
                 std::iter::once(root.path().to_owned()).chain(scan.directories().iter().cloned());
@@ -421,8 +469,10 @@ impl ClaudeDiscovery {
                     &mut children,
                 )
                 .await;
+                teams.push(team);
             }
         }
+        self.reconcile_team_tasks(&scans, &teams, &mut report).await;
         for (root, scan) in &scans {
             for file in scan.files() {
                 let Some(candidate) =
@@ -501,6 +551,116 @@ impl ClaudeDiscovery {
                 report.child_sessions = report.child_sessions.saturating_add(1);
             }
         }
+    }
+
+    async fn reconcile_team_tasks(
+        &self,
+        scans: &[(CapabilityRoot, watchdog_runtime::ScanResult)],
+        teams: &[watchdog_claude::ClaudeTeam],
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        let mut aggregates = BTreeMap::<SessionId, ClaudeTaskAggregate>::new();
+        for (root, scan) in scans {
+            for file in scan.files() {
+                let Some((relative, team_name)) = claude_task_candidate(root, file) else {
+                    continue;
+                };
+                let mut matching_teams = teams
+                    .iter()
+                    .filter(|team| team.name() == Some(team_name.as_str()));
+                let Some(team) = matching_teams.next() else {
+                    continue;
+                };
+                if matching_teams.next().is_some() {
+                    report.warn();
+                    continue;
+                }
+                let bytes =
+                    match read_bounded_file(root, &relative, watchdog_claude::MAX_HOOK_BYTES) {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => continue,
+                        Err(()) => {
+                            report.warn();
+                            continue;
+                        }
+                    };
+                let Ok(task) = watchdog_claude::parse_task_record(&bytes) else {
+                    report.warn();
+                    continue;
+                };
+                let Some(owner) = task.owner() else {
+                    continue;
+                };
+                let mut matching_members = team
+                    .members()
+                    .iter()
+                    .filter(|member| member.name() == owner);
+                let Some(member) = matching_members.next() else {
+                    continue;
+                };
+                if matching_members.next().is_some() {
+                    report.warn();
+                    continue;
+                }
+                let Some(modified_ns) = task_modified_ns(root, &relative) else {
+                    report.warn();
+                    continue;
+                };
+                let session_id = SessionId::from_native(member.subject());
+                aggregates
+                    .entry(session_id)
+                    .or_insert_with(|| ClaudeTaskAggregate::new(member.subject().clone()))
+                    .observe(task.state(), modified_ns);
+            }
+        }
+        for (session_id, aggregate) in aggregates {
+            if self
+                .ingest_team_task_aggregate(session_id, &aggregate)
+                .await
+                .is_err()
+            {
+                report.warn();
+            }
+        }
+    }
+
+    async fn ingest_team_task_aggregate(
+        &self,
+        session_id: SessionId,
+        aggregate: &ClaudeTaskAggregate,
+    ) -> Result<(), ()> {
+        let state = aggregate.state();
+        let event_key = format!(
+            "{session_id}:{}:{}:{}",
+            state_key(state),
+            aggregate.latest_modified_ns,
+            aggregate.task_count
+        );
+        let observation_id =
+            ObservationId::from_native(RuntimeKind::ClaudeCode, "team-task", event_key)
+                .map_err(|_| ())?;
+        if self
+            .store
+            .observation(observation_id)
+            .await
+            .map_err(|_| ())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let observation = ObservationEnvelope::new(
+            observation_id,
+            aggregate.subject.clone(),
+            self.clock.now(),
+            claude_team_task_source()?,
+            ObservationPayload::NativeState(state),
+        )
+        .map_err(|_| ())?;
+        self.api
+            .ingest_native_observation(observation)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     #[expect(
@@ -1052,6 +1212,60 @@ fn claude_transcript_source(evidence: &'static str) -> Result<ObservationSource,
         None,
     )
     .map_err(|_| ())
+}
+
+fn claude_team_task_source() -> Result<ObservationSource, ()> {
+    ObservationSource::new(
+        AdapterIdentity::new(
+            RuntimeKind::ClaudeCode,
+            watchdog_claude::TESTED_CLAUDE_VERSION,
+        )
+        .map_err(|_| ())?,
+        "team-task:status",
+        EvidenceTrust::Corroborating,
+        None,
+    )
+    .map_err(|_| ())
+}
+
+fn claude_task_candidate(root: &CapabilityRoot, file: &Path) -> Option<(PathBuf, String)> {
+    let relative = file.strip_prefix(root.path()).ok()?.to_path_buf();
+    if relative.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+        return None;
+    }
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if components.len() != 2 || components.len() != relative.components().count() {
+        return None;
+    }
+    let task_id = relative.file_stem()?.to_str()?;
+    if task_id == "config"
+        || task_id.is_empty()
+        || !task_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let team_name = components[0].to_owned();
+    Some((relative, team_name))
+}
+
+fn task_modified_ns(root: &CapabilityRoot, relative: &Path) -> Option<u128> {
+    root.open_file(relative)
+        .ok()?
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
 }
 
 /// Automatic Codex Companion job discovery from current per-workspace state.

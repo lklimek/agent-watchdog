@@ -218,12 +218,19 @@ impl fmt::Debug for ClaudeHookEvidence {
 
 /// Active Claude team discovered from one exact team configuration.
 pub struct ClaudeTeam {
+    name: Option<BoundedText<256>>,
     lead: NativeSessionKey,
     lead_cwd: Option<PathBuf>,
     members: Vec<ClaudeTeamMember>,
 }
 
 impl ClaudeTeam {
+    /// Native team name used to bind its task directory.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_ref().map(BoundedText::as_str)
+    }
+
     /// Exact lead session.
     #[must_use]
     pub const fn lead(&self) -> &NativeSessionKey {
@@ -247,6 +254,7 @@ impl fmt::Debug for ClaudeTeam {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ClaudeTeam")
+            .field("has_name", &self.name.is_some())
             .field("lead", &self.lead)
             .field("has_lead_cwd", &self.lead_cwd.is_some())
             .field("member_count", &self.members.len())
@@ -313,6 +321,11 @@ pub fn parse_team_config(input: &[u8]) -> Result<ClaudeTeam, ClaudeParseError> {
         });
     }
     let raw: RawTeam = serde_json::from_slice(input).map_err(|_| ClaudeParseError::Malformed)?;
+    let name = raw
+        .name
+        .filter(|value| !value.is_empty())
+        .map(|value| BoundedText::new("team_name", value))
+        .transpose()?;
     let lead = native_key(required(raw.lead_session_id.as_deref(), "leadSessionId")?)?;
     if raw.members.len() > MAX_TEAM_MEMBERS {
         return Err(ClaudeParseError::TooManyMembers {
@@ -346,6 +359,7 @@ pub fn parse_team_config(input: &[u8]) -> Result<ClaudeTeam, ClaudeParseError> {
         });
     }
     Ok(ClaudeTeam {
+        name,
         lead,
         lead_cwd,
         members,
@@ -503,7 +517,7 @@ pub fn parse_subagent_metadata(input: &[u8]) -> Result<ClaudeSubagentMetadata, C
 /// Metadata-only projection of a Claude team task record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeTaskSignal {
-    owner: BoundedText<256>,
+    owner: Option<BoundedText<256>>,
     title: Option<BoundedText<512>>,
     state: DetailedState,
 }
@@ -511,8 +525,8 @@ pub struct ClaudeTaskSignal {
 impl ClaudeTaskSignal {
     /// Team member name owning the task.
     #[must_use]
-    pub fn owner(&self) -> &str {
-        self.owner.as_str()
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_ref().map(BoundedText::as_str)
     }
 
     /// Bounded task subject suitable for display.
@@ -549,7 +563,11 @@ pub fn parse_task_record(input: &[u8]) -> Result<ClaudeTaskSignal, ClaudeParseEr
         "cancelled" => DetailedState::Cancelled,
         _ => return Err(ClaudeParseError::UnsupportedState),
     };
-    let owner = BoundedText::new("owner", required(raw.owner.as_deref(), "owner")?)?;
+    let owner = raw
+        .owner
+        .filter(|value| !value.is_empty())
+        .map(|value| BoundedText::new("owner", value))
+        .transpose()?;
     let title = raw
         .subject
         .filter(|value| !value.is_empty())
@@ -633,6 +651,7 @@ struct RawHook {
 
 #[derive(Deserialize)]
 struct RawTeam {
+    name: Option<String>,
     #[serde(rename = "leadSessionId")]
     lead_session_id: Option<String>,
     #[serde(default)]
