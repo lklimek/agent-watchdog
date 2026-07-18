@@ -22,6 +22,8 @@ use watchdog_testkit::FakeClock;
 async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malformed() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let team_root = fixture.path().join("teams");
+    let task_root = fixture.path().join("tasks");
+    let team_tasks = task_root.join("watchdog-team");
     let worktree_root = fixture.path().join("worktrees");
     let good_team = team_root.join("watchdog-team");
     let bad_team = team_root.join("partial-team");
@@ -30,6 +32,7 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
     let native_worktree_root = std::path::PathBuf::from("/host/repositories");
     for directory in [
         &team_root,
+        &team_tasks,
         &worktree_root,
         &good_team,
         &bad_team,
@@ -53,6 +56,11 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
     .expect("team config should be written");
     fs::write(bad_team.join("config.json"), b"{partial")
         .expect("malformed config should be written");
+    fs::write(
+        team_tasks.join("1.json"),
+        b"{\"id\":\"1\",\"subject\":\"Implement parser\",\"status\":\"in_progress\",\"owner\":\"rust-worker\"}",
+    )
+    .expect("team task should be written");
 
     let database = fixture.path().join("watchdog.db");
     let store = WatchdogStore::open(&database)
@@ -69,7 +77,13 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
 
     let mapping = WorktreePathMapping::new(native_worktree_root.clone(), worktree_root.clone())
         .expect("path mapping should be valid");
-    let report = discovery.reconcile(&[team_root], &[], &[mapping]).await;
+    let report = discovery
+        .reconcile(
+            &[team_root.clone(), task_root.clone()],
+            &[],
+            std::slice::from_ref(&mapping),
+        )
+        .await;
     assert_eq!(report.main_sessions(), 1);
     assert_eq!(report.child_sessions(), 1);
     assert_eq!(report.warning_count(), 1);
@@ -79,6 +93,23 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
         .await
         .expect("main sessions should query");
     assert_eq!(sessions.len(), 1);
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(children.len(), 1);
+    assert_session_state(&store, children[0].session, DetailedState::Running).await;
+    fs::write(
+        team_tasks.join("1.json"),
+        b"{\"id\":\"1\",\"subject\":\"Implement parser\",\"status\":\"completed\",\"owner\":\"rust-worker\"}",
+    )
+    .expect("team task should update");
+    clock.advance(DurationMs::new(1));
+    let completed = discovery
+        .reconcile(&[team_root, task_root], &[], std::slice::from_ref(&mapping))
+        .await;
+    assert_eq!(completed.warning_count(), 1);
+    assert_session_state(&store, children[0].session, DetailedState::Completed).await;
     let dashboard = DashboardService::new(store, clock)
         .snapshot(DashboardQuery::default())
         .await
@@ -277,6 +308,21 @@ async fn load_snapshot(
         .await
         .expect("snapshot should query")
         .expect("snapshot should exist")
+}
+
+async fn assert_session_state(
+    store: &WatchdogStore,
+    session: watchdog_domain::SessionIdentity,
+    expected: DetailedState,
+) {
+    assert_eq!(
+        load_snapshot(store, session)
+            .await
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .state(),
+        expected
+    );
 }
 
 async fn reconcile_claude_fixture(

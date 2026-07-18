@@ -279,6 +279,13 @@ duplicate main-session card. Ambiguous matches remain independent rather than
 guessing. Positive bindings are cached under the same 2,048-entry bound; after
 a restart, an unresolved teammate cursor performs one bounded prefix recheck.
 
+Task snapshots are joined through the team config's exact native name and a
+unique active member owner. Unassigned tasks remain neutral. For each member,
+any in-progress task normalizes to running, then pending to starting; when no
+active task remains, the newest terminal task supplies completed, failed, or
+cancelled. The task file's nanosecond modification time and aggregate count form
+the idempotent native revision, and already stored revisions are not replayed.
+
 ### 7.2 Native Codex CLI
 
 Evidence precedence:
