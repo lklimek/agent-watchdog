@@ -457,6 +457,17 @@ discard path evidence and degrade the affected adapter. Human-facing metadata
 retains the native host path; filesystem access always uses the projected
 container path.
 
+The same positional projection applies independently to Claude, Codex, and
+Companion native-state roots. Codex state-database rollout paths are projected
+to a held directory capability and tailed with a persisted device/inode and
+complete-record offset. First discovery starts at EOF; each pass is capped by
+bytes, record size, record count, and batch count. Partial trailing records are
+re-read from the last complete boundary after restart, while replacement or
+truncation moves to a newly established EOF boundary and degrades adapter health.
+Incompatible complete records advance the cursor, degrade adapter health, and
+place an `UPGRADE` warning on the exactly associated session.
+Only typed lifecycle/activity evidence is retained; transcript bodies are not.
+
 ## 13. Persistence
 
 SQLite uses WAL, foreign keys, a busy timeout, and migrations embedded in the

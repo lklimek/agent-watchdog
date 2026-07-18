@@ -9,6 +9,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use watchdog_domain::{
     BoundedText, DeadlinePolicy, DurationMs, PolicyError, ReducerPolicy, ReducerPolicyError,
+    RuntimeKind,
 };
 
 use crate::{PathMappingError, WorktreePathMapping};
@@ -42,8 +43,11 @@ pub(crate) struct RuntimeConfig {
     allowed_worktree_roots: Vec<PathBuf>,
     worktree_mappings: Vec<WorktreePathMapping>,
     claude_roots: Vec<PathBuf>,
+    claude_path_mappings: Vec<WorktreePathMapping>,
     codex_roots: Vec<PathBuf>,
+    codex_path_mappings: Vec<WorktreePathMapping>,
     companion_roots: Vec<PathBuf>,
+    companion_path_mappings: Vec<WorktreePathMapping>,
     exclusions: Vec<PathBuf>,
     reducer_policy: ReducerPolicy,
     deadline_policy: DeadlinePolicy,
@@ -74,6 +78,15 @@ impl RuntimeConfig {
 
     pub(crate) fn companion_roots(&self) -> &[PathBuf] {
         &self.companion_roots
+    }
+
+    pub(crate) fn runtime_path_mappings(&self, runtime: RuntimeKind) -> &[WorktreePathMapping] {
+        match runtime {
+            RuntimeKind::ClaudeCode => &self.claude_path_mappings,
+            RuntimeKind::CodexCli => &self.codex_path_mappings,
+            RuntimeKind::CodexCompanion => &self.companion_path_mappings,
+            RuntimeKind::OpenCode => &[],
+        }
     }
 
     pub(crate) fn exclusions(&self) -> &[PathBuf] {
@@ -232,6 +245,12 @@ impl RawConfig {
         let claude_roots = canonical_directories(self.paths.claude_roots)?;
         let codex_roots = canonical_directories(self.paths.codex_roots)?;
         let companion_roots = canonical_directories(self.paths.companion_roots)?;
+        let claude_path_mappings =
+            runtime_path_mappings(self.paths.native_claude_roots, claude_roots.clone())?;
+        let codex_path_mappings =
+            runtime_path_mappings(self.paths.native_codex_roots, codex_roots.clone())?;
+        let companion_path_mappings =
+            runtime_path_mappings(self.paths.native_companion_roots, companion_roots.clone())?;
         if (self.adapters.claude && claude_roots.is_empty())
             || (self.adapters.codex && codex_roots.is_empty())
             || (self.adapters.companion && companion_roots.is_empty())
@@ -265,8 +284,11 @@ impl RawConfig {
             allowed_worktree_roots,
             worktree_mappings,
             claude_roots,
+            claude_path_mappings,
             codex_roots,
+            codex_path_mappings,
             companion_roots,
+            companion_path_mappings,
             exclusions,
             reducer_policy,
             deadline_policy,
@@ -291,9 +313,15 @@ struct RawPaths {
     #[serde(default)]
     native_worktree_roots: Vec<PathBuf>,
     #[serde(default)]
+    native_claude_roots: Vec<PathBuf>,
+    #[serde(default)]
     claude_roots: Vec<PathBuf>,
     #[serde(default)]
+    native_codex_roots: Vec<PathBuf>,
+    #[serde(default)]
     codex_roots: Vec<PathBuf>,
+    #[serde(default)]
+    native_companion_roots: Vec<PathBuf>,
     #[serde(default)]
     companion_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -424,6 +452,25 @@ fn worktree_mappings(
     Ok(mappings)
 }
 
+fn runtime_path_mappings(
+    native_roots: Vec<PathBuf>,
+    mounted_roots: Vec<PathBuf>,
+) -> Result<Vec<WorktreePathMapping>, ConfigError> {
+    let native_roots = if native_roots.is_empty() {
+        mounted_roots.clone()
+    } else {
+        native_roots
+    };
+    if native_roots.len() != mounted_roots.len() {
+        return Err(ConfigError::RuntimeMappingCount);
+    }
+    native_roots
+        .into_iter()
+        .zip(mounted_roots)
+        .map(|(native, mounted)| WorktreePathMapping::new(native, mounted).map_err(Into::into))
+        .collect()
+}
+
 fn seconds(value: u64) -> Result<DurationMs, ConfigError> {
     value
         .checked_mul(1_000)
@@ -445,6 +492,8 @@ pub(crate) enum ConfigError {
     MissingWorktreeRoot,
     #[error("Native and mounted worktree root counts must match")]
     WorktreeMappingCount,
+    #[error("Native and mounted runtime state root counts must match")]
+    RuntimeMappingCount,
     #[error("Every enabled runtime adapter requires at least one state root")]
     MissingRuntimeRoot,
     #[error("Configured path is absent or not a directory")]
@@ -492,6 +541,10 @@ mod tests {
             fixture.worktrees
         );
         assert_eq!(config.claude_roots(), [fixture.claude.as_path()]);
+        assert_eq!(
+            config.runtime_path_mappings(watchdog_domain::RuntimeKind::CodexCli)[0].native_root(),
+            fixture.codex
+        );
         assert!(config.adapters().claude());
         assert!(config.adapters().codex());
         assert!(config.adapters().companion());
@@ -554,6 +607,21 @@ mod tests {
 
         let error = ConfigManager::load(&fixture.config_path).expect_err("overbroad root");
         assert_eq!(error.to_string(), "Configured path is too broad");
+    }
+
+    #[test]
+    fn native_and_mounted_runtime_root_counts_must_match() {
+        let fixture = ConfigFixture::new();
+        fixture.write(&fixture.valid_toml().replace(
+            "native_worktree_roots = [\"/host/repositories\"]",
+            "native_worktree_roots = [\"/host/repositories\"]\nnative_codex_roots = [\"/host/.codex\", \"/host/.codex/sessions\"]",
+        ));
+
+        let error = ConfigManager::load(&fixture.config_path).expect_err("mismatched roots");
+        assert_eq!(
+            error.to_string(),
+            "Native and mounted runtime state root counts must match"
+        );
     }
 
     struct ConfigFixture {

@@ -486,7 +486,7 @@ fn start_discovery(
 ) -> JoinHandle<()> {
     let discoveries = RuntimeDiscoveries {
         claude: ClaudeTeamDiscovery::new(api.clone()),
-        codex: CodexDiscovery::new(api.clone(), clock.clone()),
+        codex: CodexDiscovery::new(api.clone(), store.clone(), clock.clone()),
         companion: CompanionDiscovery::new(api, clock.clone()),
     };
     spawn_discovery_worker(config, discoveries, store, clock, health, requested)
@@ -537,7 +537,11 @@ fn spawn_discovery_worker(
             if current.adapters().codex() {
                 let report = discoveries
                     .codex
-                    .reconcile(current.codex_roots(), current.worktree_mappings())
+                    .reconcile(
+                        current.codex_roots(),
+                        current.runtime_path_mappings(RuntimeKind::CodexCli),
+                        current.worktree_mappings(),
+                    )
                     .await;
                 record_discovery_health(
                     &store,

@@ -1,6 +1,6 @@
 //! Automatic runtime discovery and best-effort reconciliation acceptance tests.
 
-use std::{fs, sync::Arc};
+use std::{fs, io::Write as _, sync::Arc};
 
 use serde_json::json;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -204,9 +204,11 @@ fn update_companion_summary(path: &std::path::Path) {
 async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let state_root = fixture.path().join("codex-state");
+    let rollout_root = fixture.path().join("codex-rollouts");
     let mounted_worktrees = fixture.path().join("worktrees");
     for directory in [
         &state_root,
+        &rollout_root,
         &mounted_worktrees,
         &mounted_worktrees.join("main"),
         &mounted_worktrees.join("child"),
@@ -214,6 +216,7 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
     ] {
         fs::create_dir(directory).expect("fixture directory should be created");
     }
+    create_rollout_fixtures(&rollout_root);
     let now_ms = 2_000_000_000_000_i64;
     create_codex_state(&state_root.join("state_5.sqlite"), now_ms).await;
     set_codex_version(&state_root.join("state_5.sqlite"), "codex-main", "0.999.0").await;
@@ -228,13 +231,16 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
     let api = AgentApi::new(store.clone(), clock.clone())
         .await
         .expect("API should initialize");
-    let discovery = CodexDiscovery::new(api, clock);
+    let discovery = CodexDiscovery::new(api, store.clone(), clock.clone());
     let mapping = WorktreePathMapping::new("/host/repositories", mounted_worktrees)
         .expect("path mapping should be valid");
+    let rollout_mapping = WorktreePathMapping::new("/state", &rollout_root)
+        .expect("rollout path mapping should be valid");
 
     let report = discovery
         .reconcile(
             std::slice::from_ref(&state_root),
+            std::slice::from_ref(&rollout_mapping),
             std::slice::from_ref(&mapping),
         )
         .await;
@@ -274,6 +280,50 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
         child_metadata.startup_directory(),
         Some("/host/repositories/child")
     );
+
+    append_rollout_activity(&rollout_root.join("codex-child.jsonl"));
+    clock.advance(DurationMs::new(1_000));
+
+    let appended = discovery
+        .reconcile(
+            std::slice::from_ref(&state_root),
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&mapping),
+        )
+        .await;
+    assert_eq!(appended.warning_count(), 0);
+    let child_snapshot = store
+        .snapshot(children[0].session)
+        .await
+        .expect("child snapshot should query")
+        .expect("child snapshot should exist");
+    assert_eq!(
+        child_snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .last_progress_summary(),
+        Some("Codex rollout activity")
+    );
+}
+
+fn create_rollout_fixtures(rollout_root: &std::path::Path) {
+    for id in ["codex-main", "codex-child"] {
+        fs::write(
+            rollout_root.join(format!("{id}.jsonl")),
+            b"{\"type\":\"event_msg\",\"payload\":{}}\n",
+        )
+        .expect("rollout fixture should be written");
+    }
+}
+
+fn append_rollout_activity(path: &std::path::Path) {
+    let mut rollout = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("rollout should reopen for append");
+    rollout
+        .write_all(b"{\"type\":\"event_msg\",\"payload\":{}}\n")
+        .expect("new rollout activity should append");
 }
 
 async fn set_codex_version(path: &std::path::Path, id: &str, version: &str) {
