@@ -235,6 +235,10 @@ impl std::fmt::Debug for AgentApi {
 }
 
 impl AgentApi {
+    pub(crate) fn event_sequence(&self) -> Arc<EventSequence> {
+        Arc::clone(&self.inner.event_sequence)
+    }
+
     /// Construct the agent API and resume durable event allocation.
     ///
     /// # Errors

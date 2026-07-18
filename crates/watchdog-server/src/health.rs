@@ -120,6 +120,14 @@ impl HealthService {
         );
     }
 
+    /// Read the latest global component status for safety-gate evaluation.
+    #[must_use]
+    pub fn component_status(&self, component: ComponentId) -> Option<ComponentStatus> {
+        self.read_components()
+            .get(&component)
+            .map(|entry| entry.status)
+    }
+
     /// Replace or clear the last rejected configuration reload warning.
     pub fn record_configuration_warning(&self, warning: Option<&str>) {
         *self.write_configuration_warning() = warning.and_then(|warning| {
@@ -283,5 +291,6 @@ fn component_name(component: ComponentId) -> String {
         ComponentId::Watcher => "watcher".to_owned(),
         ComponentId::ObservationQueue => "observation_queue".to_owned(),
         ComponentId::Notifications => "notifications".to_owned(),
+        ComponentId::TerminationAutomation => "termination_automation".to_owned(),
     }
 }

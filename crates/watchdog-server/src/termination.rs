@@ -1,19 +1,232 @@
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use thiserror::Error;
 use watchdog_domain::{
-    DetailedState, DomainEvent, DomainEventKind, DurationMs, MainSessionId, RuntimeKind,
-    TerminationActionOutcome, TerminationBlocker, TerminationCandidate, TerminationFacts,
+    DetailedState, DomainEvent, DomainEventKind, DurationMs, EvidenceTrust, MainSessionId,
+    ProcessIdentity, RuntimeKind, SessionKind, TerminationActionOutcome, TerminationBlocker,
+    TerminationCandidate, TerminationComponent, TerminationFacts, TerminationHealth,
     TerminationStage, TimePoint, WallTimeMs, assess_termination,
 };
-use watchdog_process::{ProcessControl, ProcessSignal};
-use watchdog_runtime::{CoordinatorError, EventSequence};
+use watchdog_process::{LinuxProcessControl, LinuxProcessSampler, ProcessControl, ProcessSignal};
+use watchdog_runtime::{ComponentId, ComponentStatus, CoordinatorError, EventSequence};
 use watchdog_store::{
     OutboxDestination, StoreError, TerminationAdvance, TerminationSafetyRecord,
     TerminationSagaRecord, WatchdogStore,
 };
 
+use crate::{AgentApi, HealthService};
+
 const TEN_MINUTES_MS: u64 = 10 * 60_000;
+const MAX_CHILD_SESSIONS: u32 = 1_000;
+const MAX_RELATIONS_PER_ROOT: u32 = 1_000;
+
+trait FreshProcessSampler: fmt::Debug + Send + Sync {
+    fn read_identity(&self, expected: &ProcessIdentity) -> Option<ProcessIdentity>;
+}
+
+impl FreshProcessSampler for LinuxProcessSampler {
+    fn read_identity(&self, expected: &ProcessIdentity) -> Option<ProcessIdentity> {
+        LinuxProcessSampler::read_identity(self, expected.pid()).ok()
+    }
+}
+
+/// Result of one bounded child-only termination reconciliation pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TerminationMonitorReport {
+    evaluated_children: u32,
+    changed_sagas: u32,
+}
+
+impl TerminationMonitorReport {
+    pub(crate) const fn evaluated_children(self) -> u32 {
+        self.evaluated_children
+    }
+
+    pub(crate) const fn changed_sagas(self) -> u32 {
+        self.changed_sagas
+    }
+}
+
+/// Periodic composition of fresh store, health, relation, and process facts.
+#[derive(Clone)]
+pub(crate) struct TerminationMonitor {
+    store: WatchdogStore,
+    clock: Arc<dyn watchdog_domain::Clock>,
+    health: HealthService,
+    sampler: Arc<dyn FreshProcessSampler>,
+    engine: TerminationEngine,
+    terminate_after_stalled: DurationMs,
+}
+
+impl fmt::Debug for TerminationMonitor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminationMonitor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TerminationMonitor {
+    pub(crate) fn new(
+        api: &AgentApi,
+        store: WatchdogStore,
+        clock: Arc<dyn watchdog_domain::Clock>,
+        health: HealthService,
+        config: TerminationConfig,
+        terminate_after_stalled: DurationMs,
+    ) -> Result<Self, TerminationEngineError> {
+        let sampler =
+            LinuxProcessSampler::new(32_768).map_err(|_| TerminationEngineError::ProcessSampler)?;
+        let engine = TerminationEngine::new(
+            store.clone(),
+            api.event_sequence(),
+            Arc::new(LinuxProcessControl::new()),
+            Arc::new(NoGracefulCanceller),
+            config,
+        );
+        Ok(Self::with_parts(
+            store,
+            clock,
+            health,
+            Arc::new(sampler),
+            engine,
+            terminate_after_stalled,
+        ))
+    }
+
+    fn with_parts(
+        store: WatchdogStore,
+        clock: Arc<dyn watchdog_domain::Clock>,
+        health: HealthService,
+        sampler: Arc<dyn FreshProcessSampler>,
+        engine: TerminationEngine,
+        terminate_after_stalled: DurationMs,
+    ) -> Self {
+        Self {
+            store,
+            clock,
+            health,
+            sampler,
+            engine,
+            terminate_after_stalled,
+        }
+    }
+
+    pub(crate) const fn update_policy(
+        &mut self,
+        config: TerminationConfig,
+        terminate_after_stalled: DurationMs,
+    ) {
+        self.engine.set_config(config);
+        self.terminate_after_stalled = terminate_after_stalled;
+    }
+
+    pub(crate) async fn reconcile(
+        &self,
+    ) -> Result<TerminationMonitorReport, TerminationEngineError> {
+        let children = self
+            .store
+            .sessions_by_kind(SessionKind::Child, MAX_CHILD_SESSIONS)
+            .await?;
+        let trustworthy = self.trustworthy_relations(&children).await?;
+        let now = self.clock.now();
+        let mut report = TerminationMonitorReport::default();
+        for child in children {
+            let Some(stored) = self.store.snapshot(child.session).await? else {
+                continue;
+            };
+            let Some(snapshot) = stored.reducer_snapshot() else {
+                continue;
+            };
+            let watchdog_domain::SessionIdentity::Child(child_id) = child.session else {
+                continue;
+            };
+            report.evaluated_children = report.evaluated_children.saturating_add(1);
+            let fresh_process = snapshot
+                .process_identity()
+                .and_then(|expected| self.sampler.read_identity(expected))
+                .filter(|fresh| snapshot.process_identity() == Some(fresh));
+            let facts = TerminationFacts {
+                snapshot,
+                runtime: child.native.runtime(),
+                trustworthy_relation: trustworthy.contains(&child_id),
+                active_operation: matches!(
+                    snapshot.state(),
+                    DetailedState::Running | DetailedState::WaitingForTool
+                ),
+                fresh_process: fresh_process.as_ref(),
+                health: self.termination_health(child.native.runtime()),
+                now,
+                terminate_after_stalled: self.terminate_after_stalled,
+            };
+            let status = self
+                .engine
+                .reconcile(TerminationContext {
+                    candidate: TerminationCandidate::new(child_id),
+                    root: child.root,
+                    facts,
+                    native_id: child.native.native_id(),
+                    child_exited: matches!(
+                        snapshot.state(),
+                        DetailedState::Completed | DetailedState::Cancelled
+                    ),
+                })
+                .await?;
+            if !matches!(
+                status,
+                TerminationStatus::NoAction | TerminationStatus::Suspended
+            ) {
+                report.changed_sagas = report.changed_sagas.saturating_add(1);
+            }
+        }
+        Ok(report)
+    }
+
+    async fn trustworthy_relations(
+        &self,
+        children: &[watchdog_store::StoredSessionRecord],
+    ) -> Result<HashSet<watchdog_domain::ChildSessionId>, StoreError> {
+        let mut roots = HashSet::new();
+        for child in children {
+            roots.insert(child.root);
+        }
+        let mut trustworthy = HashSet::new();
+        for root in roots {
+            for relation in self
+                .store
+                .relations_for_root(root, MAX_RELATIONS_PER_ROOT)
+                .await?
+            {
+                if relation.selected
+                    && relation.valid_until.is_none()
+                    && relation.provenance.trust() != EvidenceTrust::Uncertain
+                {
+                    trustworthy.insert(relation.child);
+                }
+            }
+        }
+        Ok(trustworthy)
+    }
+
+    fn termination_health(&self, runtime: RuntimeKind) -> TerminationHealth {
+        let mut health = TerminationHealth::healthy();
+        for (component, termination_component) in [
+            (ComponentId::Store, TerminationComponent::Store),
+            (ComponentId::ObservationQueue, TerminationComponent::Queue),
+            (ComponentId::Adapter(runtime), TerminationComponent::Adapter),
+            (ComponentId::ProcessSampler, TerminationComponent::Process),
+        ] {
+            if self.health.component_status(component) != Some(ComponentStatus::Healthy) {
+                health = health.with_unhealthy(termination_component);
+            }
+        }
+        health
+    }
+}
 
 /// Validated automated-termination configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +413,10 @@ impl TerminationEngine {
             graceful,
             config,
         }
+    }
+
+    const fn set_config(&mut self, config: TerminationConfig) {
+        self.config = config;
     }
 
     /// Reconcile one child saga without ever accepting a main-session identity.
@@ -549,6 +766,9 @@ pub enum TerminationEngineError {
     /// Atomic saga/event persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// Linux process sampler could not be initialized.
+    #[error("Termination process sampler initialization failed")]
+    ProcessSampler,
 }
 
 fn safety(
@@ -601,4 +821,173 @@ fn destinations(stage: TerminationStage) -> Vec<OutboxDestination> {
         ]);
     }
     destinations
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use watchdog_domain::{
+        AdapterIdentity, BoundedText, Clock as _, NativeSessionKey, ObservationEnvelope,
+        ObservationId, ObservationPayload, ObservationSource, ProcessId, ReducerPolicy,
+        SessionIdentity, TimePoint,
+    };
+    use watchdog_testkit::FakeClock;
+
+    use super::*;
+    use crate::{RegisterSession, TransportKey};
+
+    #[derive(Debug)]
+    struct FakeFreshSampler;
+
+    impl FreshProcessSampler for FakeFreshSampler {
+        fn read_identity(&self, expected: &ProcessIdentity) -> Option<ProcessIdentity> {
+            Some(expected.clone())
+        }
+    }
+
+    async fn api_with_stalled_child(
+        store: &WatchdogStore,
+        clock: &Arc<FakeClock>,
+    ) -> (AgentApi, watchdog_domain::ChildSessionId) {
+        let api = AgentApi::with_policy(store.clone(), clock.clone(), ReducerPolicy::default())
+            .await
+            .expect("API should initialize");
+        let transport =
+            TransportKey::new("termination-monitor").expect("transport should validate");
+        let main = api
+            .register_session(
+                &transport,
+                RegisterSession {
+                    runtime: RuntimeKind::ClaudeCode,
+                    native_id: "monitor-main".to_owned(),
+                    kind: SessionKind::Main,
+                    parent: None,
+                    event_key: "register-main".to_owned(),
+                },
+            )
+            .await
+            .expect("main should register");
+        let child = api
+            .register_session(
+                &transport,
+                RegisterSession {
+                    runtime: RuntimeKind::ClaudeCode,
+                    native_id: "monitor-child".to_owned(),
+                    kind: SessionKind::Child,
+                    parent: Some(main.session.session_id()),
+                    event_key: "register-child".to_owned(),
+                },
+            )
+            .await
+            .expect("child should register");
+        let process = ProcessIdentity::new(
+            ProcessId::new(42).expect("PID should validate"),
+            7,
+            BoundedText::new("executable", "/usr/bin/claude").expect("executable should validate"),
+        );
+        let native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "monitor-child")
+            .expect("native identity should validate");
+        api.ingest_native_observation(
+            ObservationEnvelope::new(
+                ObservationId::from_native(RuntimeKind::ClaudeCode, "process", "monitor-child")
+                    .expect("observation ID should validate"),
+                native,
+                clock.now(),
+                ObservationSource::new(
+                    AdapterIdentity::new(RuntimeKind::ClaudeCode, "test")
+                        .expect("adapter should validate"),
+                    "test:process",
+                    EvidenceTrust::Authoritative,
+                    None,
+                )
+                .expect("source should validate"),
+                ObservationPayload::ProcessIdentity(process),
+            )
+            .expect("observation should validate"),
+        )
+        .await
+        .expect("process identity should persist");
+        clock.advance(DurationMs::new(15 * 60_000));
+        api.reconcile_timers()
+            .await
+            .expect("stall threshold should reconcile");
+        clock.advance(DurationMs::new(60 * 60_000));
+        let SessionIdentity::Child(child_id) = child.session else {
+            panic!("child registration must return child identity");
+        };
+        (api, child_id)
+    }
+
+    #[tokio::test]
+    async fn monitor_starts_only_child_saga_after_fresh_health_and_process_gates_pass() {
+        let directory = tempfile::tempdir().expect("fixture directory should exist");
+        let retained = directory.keep();
+        let store = WatchdogStore::open(&retained.join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(WallTimeMs::new(0), 0)));
+        let (api, child_id) = api_with_stalled_child(&store, &clock).await;
+
+        let health = HealthService::new(clock.clone());
+        for component in [
+            ComponentId::Store,
+            ComponentId::ObservationQueue,
+            ComponentId::ProcessSampler,
+        ] {
+            health.record(component, ComponentStatus::Healthy, None);
+        }
+        health.record(
+            ComponentId::Adapter(RuntimeKind::ClaudeCode),
+            ComponentStatus::Degraded,
+            Some("test degradation"),
+        );
+        let engine = TerminationEngine::new(
+            store.clone(),
+            api.event_sequence(),
+            Arc::new(LinuxProcessControl::new()),
+            Arc::new(NoGracefulCanceller),
+            TerminationConfig::default(),
+        );
+        let monitor = TerminationMonitor::with_parts(
+            store.clone(),
+            clock,
+            health.clone(),
+            Arc::new(FakeFreshSampler),
+            engine,
+            DurationMs::new(60 * 60_000),
+        );
+
+        let suspended = monitor
+            .reconcile()
+            .await
+            .expect("degraded reconciliation should fail closed");
+        assert_eq!(suspended.evaluated_children(), 1);
+        assert_eq!(suspended.changed_sagas(), 0);
+        assert!(
+            store
+                .termination_saga(child_id)
+                .await
+                .expect("saga query should succeed")
+                .is_none()
+        );
+
+        health.record(
+            ComponentId::Adapter(RuntimeKind::ClaudeCode),
+            ComponentStatus::Healthy,
+            None,
+        );
+        let started = monitor
+            .reconcile()
+            .await
+            .expect("healthy reconciliation should succeed");
+        assert_eq!(started.changed_sagas(), 1);
+        assert_eq!(
+            store
+                .termination_saga(child_id)
+                .await
+                .expect("saga query should succeed")
+                .expect("child saga should start")
+                .stage,
+            TerminationStage::WarningGrace
+        );
+    }
 }
