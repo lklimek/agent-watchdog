@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
@@ -67,17 +67,38 @@ impl ScanBudget {
 #[error("Directory scan budgets must be positive")]
 pub struct ScanBudgetError;
 
+/// Lexicographic traversal order within each scanned directory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScanOrder {
+    /// Visit lower filenames first.
+    #[default]
+    Ascending,
+    /// Visit higher filenames first.
+    Descending,
+}
+
 /// Bounded non-symlink-following directory enumerator.
 #[derive(Clone, Copy, Debug)]
 pub struct DirectoryScanner {
     budget: ScanBudget,
+    order: ScanOrder,
 }
 
 impl DirectoryScanner {
     /// Construct a scanner with validated limits.
     #[must_use]
     pub const fn new(budget: ScanBudget) -> Self {
-        Self { budget }
+        Self {
+            budget,
+            order: ScanOrder::Ascending,
+        }
+    }
+
+    /// Select the lexicographic traversal order for each directory.
+    #[must_use]
+    pub const fn with_order(mut self, order: ScanOrder) -> Self {
+        self.order = order;
+        self
     }
 
     /// Enumerate subdirectories beneath a capability root without following links.
@@ -109,25 +130,46 @@ impl DirectoryScanner {
                 continue;
             };
             let fd_path = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
-            let Ok(mut entries) = fs::read_dir(fd_path) else {
+            let Ok(mut directory_entries) = fs::read_dir(fd_path) else {
                 uncertainty.get_or_insert(ScanUncertainty::PathRace);
                 continue;
             };
             let remaining = self.budget.max_entries.saturating_sub(entry_count);
             if remaining == 0 {
-                if entries.next().is_some() {
+                if directory_entries.next().is_some() {
                     uncertainty.get_or_insert(ScanUncertainty::EntryBudget);
                     break;
                 }
                 continue;
             }
-            let mut entries = entries
-                .filter_map(Result::ok)
-                .take(remaining.saturating_add(1))
-                .collect::<Vec<_>>();
-            let entry_budget_exhausted = entries.len() > remaining;
-            entries.truncate(remaining);
-            entries.sort_by_key(fs::DirEntry::file_name);
+            let mut entries = BTreeMap::new();
+            let mut entry_budget_exhausted = false;
+            for entry in &mut directory_entries {
+                if started.elapsed() >= self.budget.max_elapsed {
+                    uncertainty.get_or_insert(ScanUncertainty::TimeBudget);
+                    break;
+                }
+                let Ok(entry) = entry else {
+                    uncertainty.get_or_insert(ScanUncertainty::PathRace);
+                    continue;
+                };
+                entries.insert(entry.file_name(), entry);
+                if entries.len() > remaining {
+                    entry_budget_exhausted = true;
+                    match self.order {
+                        ScanOrder::Ascending => {
+                            entries.pop_last();
+                        }
+                        ScanOrder::Descending => {
+                            entries.pop_first();
+                        }
+                    }
+                }
+            }
+            let mut entries = entries.into_values().collect::<Vec<_>>();
+            if self.order == ScanOrder::Descending {
+                entries.reverse();
+            }
             for entry in entries {
                 entry_count = entry_count.saturating_add(1);
                 let Ok(file_type) = entry.file_type() else {

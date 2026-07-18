@@ -5,7 +5,8 @@ use std::{fs, path::Path};
 
 use watchdog_domain::{ChildSessionId, NativeSessionKey, RuntimeKind, SessionId};
 use watchdog_runtime::{
-    Attribution, CapabilityRoot, DirectoryScanner, ScanBudget, ScanUncertainty, WorktreeOwners,
+    Attribution, CapabilityRoot, DirectoryScanner, ScanBudget, ScanOrder, ScanUncertainty,
+    WorktreeOwners,
 };
 
 fn child(native_id: &str) -> ChildSessionId {
@@ -29,6 +30,34 @@ fn directory_scan_stops_at_the_entry_budget() {
         .expect("bounded scan should complete");
 
     assert_eq!(result.directories().len(), 2);
+    assert_eq!(result.uncertainty(), Some(ScanUncertainty::EntryBudget));
+}
+
+#[test]
+fn descending_directory_scan_prefers_lexicographically_newest_entries() {
+    let root = tempfile::tempdir().expect("temporary root should exist");
+    for name in ["2024", "2025", "2026"] {
+        fs::create_dir(root.path().join(name)).expect("fixture directory should exist");
+    }
+    let capability = CapabilityRoot::new(root.path()).expect("root should be accepted");
+    let scanner =
+        DirectoryScanner::new(ScanBudget::new(4, 2, 1_024).expect("scan budget should be valid"))
+            .with_order(ScanOrder::Descending);
+
+    let result = scanner
+        .scan(&capability, Path::new(""))
+        .expect("bounded scan should complete");
+
+    let names = result
+        .directories()
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("fixture name should be UTF-8")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["2026", "2025"]);
     assert_eq!(result.uncertainty(), Some(ScanUncertainty::EntryBudget));
 }
 

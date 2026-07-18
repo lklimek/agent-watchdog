@@ -1,7 +1,6 @@
 # Codex official-integration scope
 
-Status: production hook path resolved; independent automatic rollout scan is
-the next required implementation slice
+Status: resolved and implemented
 
 Date: 2026-07-18
 
@@ -56,6 +55,19 @@ and configuration contrary to the concrete least-privilege inventory.
   capability-mounted rollout roots and use process evidence, so missing WAL rows
   cannot hide a current session.
 - Never broaden the Compose mount to all of `~/.codex` merely to read WAL/SHM.
+
+## Implementation evidence
+
+- `/hooks/codex` accepts bounded, Bearer-authenticated official lifecycle input
+  without retaining prompt, result, or transcript bodies.
+- `CodexDiscovery` scans capability-mounted rollout roots in descending
+  lexicographic order, so timestamp-prefixed current paths win when a result
+  budget is reached. The scanner retains only the bounded selected set and also
+  enforces its wall-time budget.
+- Rollout-only integration coverage proves current main/child metadata and
+  subsequent activity are discovered without any visible SQLite database.
+- Existing SQLite integration coverage still proves recent/unarchived filtering
+  and exact spawn-edge preservation.
 
 ## Primary sources
 

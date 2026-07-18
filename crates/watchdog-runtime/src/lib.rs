@@ -24,7 +24,9 @@ pub use incremental::{
 };
 pub use queue::{AdmissionError, ObservationClass, QueueCapacityError, SessionQueue};
 #[cfg(target_os = "linux")]
-pub use scan::{DirectoryScanner, ScanBudget, ScanBudgetError, ScanResult, ScanUncertainty};
+pub use scan::{
+    DirectoryScanner, ScanBudget, ScanBudgetError, ScanOrder, ScanResult, ScanUncertainty,
+};
 #[cfg(target_os = "linux")]
 pub use watcher::{
     WatchError, WatchService, WatchSignal, WatchTargetId, WatchTargetIdError, WatchUncertainty,

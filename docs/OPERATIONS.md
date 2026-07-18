@@ -75,12 +75,23 @@ mounted adapter roots. These exact mappings let the server follow native file
 paths recorded in runtime state without mounting a home directory. A missing or
 escaping target is ignored and degrades only that adapter.
 
-Codex rollout ingestion places a durable cursor at EOF when a file is first
-discovered, then parses only bounded, complete records appended afterward. This
-avoids loading retained transcripts. Cursor replacement, truncation, oversized
-records, and schema drift never cause an implicit scan from byte zero. File
-discontinuities degrade adapter health, while incompatible records additionally
-place an actionable `UPGRADE` warning on the affected session.
+Codex automatic discovery scans rollout roots newest-first under depth, entry,
+path-byte, record-size, and wall-time budgets. It reads only the first bounded
+metadata record needed to establish identity and hierarchy, places a durable
+cursor at EOF, and then parses only bounded, complete records appended
+afterward. This avoids loading retained transcripts. Cursor replacement,
+truncation, oversized records, and schema drift never cause an implicit scan
+from byte zero. File discontinuities degrade adapter health, while incompatible
+records additionally place an actionable `UPGRADE` warning on the affected
+session.
+
+The exact `state_5.sqlite` bind supplies bootstrap thread metadata but may lag
+rows that Codex has not checkpointed out of its WAL. Watchdog therefore does not
+treat that file as its sole live source: rollout scanning, lifecycle hooks when
+configured, and process evidence continue independently. Do not mount all of
+`~/.codex` or bind `-wal`/`-shm` siblings individually; the former exposes
+credentials and configuration, while the latter can pin stale inodes after
+SQLite recreates them.
 
 Keep `automation_enabled = false` while validating a new
 installation. Main sessions are excluded from automated termination regardless

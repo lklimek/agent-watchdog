@@ -824,14 +824,22 @@ structure.
   ID/type/transcript/final message. Team config/tasks were observed under
   `~/.claude/teams/<team>/config.json` and `~/.claude/tasks/<team>/`; project
   transcripts under `~/.claude/projects/`. Transcripts can be disabled or pruned.
-- Current Codex local state used `~/.codex/state_5.sqlite`. Relevant observed
-  tables included `threads`, `thread_spawn_edges`, `agent_jobs`, and
-  `agent_job_items`; spawn edges used parent thread ID, child thread ID, and
-  status. Session JSONL metadata exposed `parent_thread_id` plus subagent source,
-  path, and nickname fields. These are internal and require version guards.
-- Codex app-server was documented as bidirectional JSON-RPC with thread/turn
-  lifecycle, streamed events, and interrupt support. Prefer it and official hooks
-  over internal files when they provide equivalent automatic coverage.
+- Current Codex local state uses `~/.codex/state_5.sqlite`. Relevant observed
+  tables include `threads`, `thread_spawn_edges`, `agent_jobs`, and
+  `agent_job_items`; spawn edges use parent thread ID, child thread ID, and
+  status. The database is bootstrap evidence rather than the sole live source:
+  its narrow file bind may lag rows held in WAL files that are not safely
+  mountable by stable inode. Independent recent rollout discovery reads one
+  bounded metadata record, establishes a durable EOF cursor, and then consumes
+  only bounded appended activity. Rollout metadata exposes `parent_thread_id`
+  plus subagent source, path, and nickname fields. These formats are internal
+  and require version guards.
+- Codex app-server is bidirectional JSON-RPC with thread/turn lifecycle,
+  streamed events, and interrupt support for clients launched through or
+  connected to that server. It is not a passive observer of unrelated CLI
+  processes, so v1 keeps its parser adapter-ready without making app-server a
+  hidden discovery dependency. Official lifecycle hooks are optional exact
+  enrichment; filesystem, process, and rollout evidence remain automatic.
 - Codex Companion 1.0.6 was inspected at
   `/home/ubuntu/.claude/plugins/cache/openai-codex/codex/1.0.6/`. Its v1 store
   used per-workspace state, `jobs/<id>.json`, logs, launcher PIDs, session IDs,
