@@ -18,7 +18,7 @@ use watchdog_runtime::{
 };
 use watchdog_store::{FileCursorRecord, WatchdogStore};
 
-use crate::{AgentApi, DiscoveredSession};
+use crate::{AgentApi, DiscoveredSession, GitHubEnricher, RepositoryMetadata};
 
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCAN_ENTRIES: usize = 2_048;
@@ -909,7 +909,7 @@ impl CodexDiscovery {
     ) {
         let main_id = SessionId::from_native(thread.subject());
         let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
-        if let Err(error) = self
+        let Ok(view) = self
             .api
             .discover_session(DiscoveredSession {
                 runtime: RuntimeKind::CodexCli,
@@ -923,10 +923,28 @@ impl CodexDiscovery {
                 startup_directory,
             })
             .await
-        {
-            log_reconcile_failure(RuntimeKind::CodexCli, "main", &error);
+        else {
             report.warn();
-        } else if mains.insert(main_id) {
+            return;
+        };
+        if self
+            .api
+            .enrich_repository_metadata(
+                view.session,
+                RepositoryMetadata {
+                    remote: thread
+                        .git_origin_url()
+                        .and_then(GitHubEnricher::canonical_remote),
+                    branch: thread.git_branch().map(ToOwned::to_owned),
+                    ..RepositoryMetadata::default()
+                },
+            )
+            .await
+            .is_err()
+        {
+            report.warn();
+        }
+        if mains.insert(main_id) {
             report.main_sessions = report.main_sessions.saturating_add(1);
         }
     }
@@ -974,7 +992,7 @@ impl CodexDiscovery {
             .or_else(|| thread.agent_role())
             .unwrap_or_else(|| thread.title())
             .to_owned();
-        if let Err(error) = self
+        let Ok(view) = self
             .api
             .discover_session(DiscoveredSession {
                 runtime: RuntimeKind::CodexCli,
@@ -988,10 +1006,28 @@ impl CodexDiscovery {
                 startup_directory,
             })
             .await
-        {
-            log_reconcile_failure(RuntimeKind::CodexCli, "child", &error);
+        else {
             report.warn();
-        } else if children.insert(child_id) {
+            return;
+        };
+        if self
+            .api
+            .enrich_repository_metadata(
+                view.session,
+                RepositoryMetadata {
+                    remote: thread
+                        .git_origin_url()
+                        .and_then(GitHubEnricher::canonical_remote),
+                    branch: thread.git_branch().map(ToOwned::to_owned),
+                    ..RepositoryMetadata::default()
+                },
+            )
+            .await
+            .is_err()
+        {
+            report.warn();
+        }
+        if children.insert(child_id) {
             report.child_sessions = report.child_sessions.saturating_add(1);
         }
     }

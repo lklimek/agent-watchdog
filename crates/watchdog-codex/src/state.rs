@@ -51,6 +51,7 @@ impl CodexStateReader {
         validate_limit(limit)?;
         let rows = sqlx::query(
             "SELECT t.id, t.rollout_path, t.cwd, t.title, t.archived, t.cli_version, \
+                    t.git_branch, t.git_origin_url, \
                     t.agent_nickname, t.agent_role, t.recency_at_ms, e.parent_thread_id \
              FROM threads AS t \
              LEFT JOIN thread_spawn_edges AS e ON e.child_thread_id = t.id \
@@ -81,6 +82,7 @@ impl CodexStateReader {
         validate_limit(limit)?;
         let rows = sqlx::query(
             "SELECT t.id, t.rollout_path, t.cwd, t.title, t.archived, t.cli_version, \
+                    t.git_branch, t.git_origin_url, \
                     t.agent_nickname, t.agent_role, t.recency_at_ms, e.parent_thread_id \
              FROM threads AS t \
              LEFT JOIN thread_spawn_edges AS e ON e.child_thread_id = t.id \
@@ -105,6 +107,8 @@ pub struct CodexThread {
     title: BoundedText<512>,
     archived: bool,
     cli_version: BoundedText<128>,
+    git_branch: Option<BoundedText<512>>,
+    git_origin_url: Option<BoundedText<2_048>>,
     agent_nickname: Option<BoundedText<256>>,
     agent_role: Option<BoundedText<256>>,
     recency_at: WallTimeMs,
@@ -161,6 +165,18 @@ impl CodexThread {
     #[must_use]
     pub fn cli_version(&self) -> &str {
         self.cli_version.as_str()
+    }
+
+    /// Git branch recorded when Codex created or refreshed the thread.
+    #[must_use]
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Git origin URL recorded by Codex.
+    #[must_use]
+    pub fn git_origin_url(&self) -> Option<&str> {
+        self.git_origin_url.as_ref().map(BoundedText::as_str)
     }
 
     /// Optional native subagent nickname.
@@ -226,6 +242,16 @@ fn decode_row(row: &SqliteRow) -> Result<CodexThread, CodexStateError> {
             "cli_version",
             row.try_get::<String, _>("cli_version")
                 .map_err(|_| CodexStateError::Schema)?,
+        )?,
+        git_branch: optional_text(
+            row.try_get::<Option<String>, _>("git_branch")
+                .map_err(|_| CodexStateError::Schema)?,
+            "git_branch",
+        )?,
+        git_origin_url: optional_text(
+            row.try_get::<Option<String>, _>("git_origin_url")
+                .map_err(|_| CodexStateError::Schema)?,
+            "git_origin_url",
         )?,
         agent_nickname: optional_text(
             row.try_get::<Option<String>, _>("agent_nickname")

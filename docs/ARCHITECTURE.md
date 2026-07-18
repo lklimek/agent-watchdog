@@ -657,6 +657,17 @@ remote and branch, then resolves an open PR through the GitHub API when a token 
 configured. A separately configured `gh` executable adapter may be used with
 literal argument arrays, no shell, strict timeout, and bounded output.
 
+Current Codex thread state supplies bounded `git_origin_url` and `git_branch`
+fields directly, so branch fallback appears without running `git` in the
+distroless container. Only supported GitHub remotes are retained, canonicalized
+to a credential-free HTTPS URL; unsupported or credential-bearing remotes are
+discarded while their branch remains available. A background worker checks
+main-session repository/branch pairs every 30 seconds; the five-minute cache
+prevents repeated API traffic.
+Successful lookup stores a locally constructed GitHub PR URL. No match, offline
+service, unsupported remote, authorization failure, or schema failure clears a
+stale PR while retaining the branch.
+
 Cache keys include repository and branch. Failures preserve the branch and do
 not degrade monitoring health beyond the enrichment component.
 

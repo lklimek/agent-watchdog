@@ -282,7 +282,7 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
         .await
         .expect("fixture database should open");
     sqlx::query(
-        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, cli_version TEXT NOT NULL DEFAULT '', agent_nickname TEXT, agent_role TEXT, recency_at_ms INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, git_branch TEXT, git_origin_url TEXT, cli_version TEXT NOT NULL DEFAULT '', agent_nickname TEXT, agent_role TEXT, recency_at_ms INTEGER NOT NULL DEFAULT 0)",
     )
     .execute(&pool)
     .await
@@ -297,7 +297,7 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
         ("main-1", "/work/main", "Main title", 10_i64),
         ("child-1", "/work/wt", "Child title", 20_i64),
     ] {
-        sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, cli_version, recency_at_ms) VALUES (?, ?, 1, 1, 'cli', 'openai', ?, ?, '{}', 'default', '0.144.5', ?)")
+        sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, git_origin_url, cli_version, recency_at_ms) VALUES (?, ?, 1, 1, 'cli', 'openai', ?, ?, '{}', 'default', 'feat/watchdog', 'https://github.com/lklimek/agent-watchdog.git', '0.144.5', ?)")
             .bind(id)
             .bind(format!("/state/{id}.jsonl"))
             .bind(cwd)
@@ -336,6 +336,11 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
         "main-1"
     );
     assert_eq!(child.cwd().to_str(), Some("/work/wt"));
+    assert_eq!(child.git_branch(), Some("feat/watchdog"));
+    assert_eq!(
+        child.git_origin_url(),
+        Some("https://github.com/lklimek/agent-watchdog.git")
+    );
 
     let recent = reader
         .discover_recent_threads(WallTimeMs::new(10), 10)

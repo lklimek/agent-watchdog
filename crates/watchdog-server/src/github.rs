@@ -67,6 +67,17 @@ pub struct GitHubEnricher {
 }
 
 impl GitHubEnricher {
+    /// Return a credential-free canonical URL for a supported GitHub remote.
+    #[must_use]
+    pub(crate) fn canonical_remote(remote: &str) -> Option<String> {
+        let repository = parse_github_remote(remote)?;
+        Some(format!(
+            "https://github.com/{}/{}.git",
+            repository.owner.as_str(),
+            repository.name.as_str()
+        ))
+    }
+
     /// Construct an enricher fixed to GitHub's public API.
     ///
     /// The optional token is copied only into a sensitive HTTP header. Requests
@@ -432,6 +443,20 @@ mod tests {
                 "remote {remote}"
             );
         }
+    }
+
+    #[test]
+    fn canonicalizes_supported_remotes_without_retaining_credentials() {
+        assert_eq!(
+            GitHubEnricher::canonical_remote("ssh://git@github.com/lklimek/agent-watchdog.git"),
+            Some("https://github.com/lklimek/agent-watchdog.git".to_owned())
+        );
+        assert_eq!(
+            GitHubEnricher::canonical_remote(
+                "https://user:secret@github.com/lklimek/agent-watchdog.git"
+            ),
+            None
+        );
     }
 
     #[test]

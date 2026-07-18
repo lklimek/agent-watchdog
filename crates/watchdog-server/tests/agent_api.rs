@@ -8,7 +8,8 @@ use watchdog_domain::{
     RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
 };
 use watchdog_server::{
-    AgentApi, AgentApiError, CompletionOutcome, DiscoveredSession, RegisterSession, TransportKey,
+    AgentApi, AgentApiError, CompletionOutcome, DiscoveredSession, RegisterSession,
+    RepositoryMetadata, TransportKey,
 };
 use watchdog_store::{OutboxDestination, WatchdogStore};
 use watchdog_testkit::FakeClock;
@@ -244,6 +245,57 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
             .len(),
         2
     );
+}
+
+#[tokio::test]
+async fn repository_enrichment_can_clear_a_stale_pull_request() {
+    let (api, store, _) = api_fixture().await;
+    let session = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::CodexCli,
+            native_id: "repository-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "repository-main".to_owned(),
+            adapter_version: "0.144.5".to_owned(),
+            evidence_source: "codex:state-db".to_owned(),
+            title: Some("Repository session".to_owned()),
+            startup_directory: Some("/work/repository".to_owned()),
+        })
+        .await
+        .expect("session should be discovered");
+    api.enrich_repository_metadata(
+        session.session,
+        RepositoryMetadata {
+            remote: Some("https://github.com/lklimek/agent-watchdog.git".to_owned()),
+            branch: Some("feat/metadata".to_owned()),
+            pull_request_number: Some(42),
+            pull_request_url: Some("https://github.com/lklimek/agent-watchdog/pull/42".to_owned()),
+            replace_pull_request: true,
+        },
+    )
+    .await
+    .expect("repository metadata should persist");
+    api.enrich_repository_metadata(
+        session.session,
+        RepositoryMetadata {
+            remote: None,
+            branch: None,
+            replace_pull_request: true,
+            ..RepositoryMetadata::default()
+        },
+    )
+    .await
+    .expect("stale pull request should clear");
+
+    let metadata = store
+        .session_metadata(session.session)
+        .await
+        .expect("metadata should query")
+        .expect("metadata should exist");
+    assert_eq!(metadata.branch(), Some("feat/metadata"));
+    assert_eq!(metadata.pull_request_number(), None);
+    assert_eq!(metadata.pull_request_url(), None);
 }
 
 async fn assert_native_discovery_provenance(
