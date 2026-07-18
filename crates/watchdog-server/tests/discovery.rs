@@ -3,10 +3,11 @@
 use std::{fs, sync::Arc};
 
 use serde_json::json;
+use sqlx::sqlite::SqliteConnectOptions;
 use watchdog_domain::{DetailedState, DurationMs, SessionKind, TimePoint, WallTimeMs};
 use watchdog_server::{
-    AgentApi, ClaudeTeamDiscovery, CompanionDiscovery, DashboardQuery, DashboardService,
-    WorktreePathMapping,
+    AgentApi, ClaudeTeamDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
+    DashboardService, WorktreePathMapping,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
@@ -182,4 +183,140 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         .expect("metadata should exist");
     assert_eq!(metadata.title(), Some("Review persistence"));
     assert_eq!(metadata.startup_directory(), Some("/host/repositories/job"));
+}
+
+#[tokio::test]
+async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let state_root = fixture.path().join("codex-state");
+    let mounted_worktrees = fixture.path().join("worktrees");
+    for directory in [
+        &state_root,
+        &mounted_worktrees,
+        &mounted_worktrees.join("main"),
+        &mounted_worktrees.join("child"),
+        &mounted_worktrees.join("old"),
+    ] {
+        fs::create_dir(directory).expect("fixture directory should be created");
+    }
+    let now_ms = 2_000_000_000_000_i64;
+    create_codex_state(&state_root.join("state_5.sqlite"), now_ms).await;
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(now_ms),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = CodexDiscovery::new(api, clock);
+    let mapping = WorktreePathMapping::new("/host/repositories", mounted_worktrees)
+        .expect("path mapping should be valid");
+
+    let report = discovery
+        .reconcile(
+            std::slice::from_ref(&state_root),
+            std::slice::from_ref(&mapping),
+        )
+        .await;
+    assert_eq!(report.main_sessions(), 1);
+    assert_eq!(report.child_sessions(), 1);
+    assert_eq!(report.warning_count(), 0);
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(children.len(), 1);
+    let child_metadata = store
+        .session_metadata(children[0].session)
+        .await
+        .expect("metadata should query")
+        .expect("metadata should exist");
+    assert_eq!(child_metadata.title(), Some("reviewer"));
+    assert_eq!(
+        child_metadata.startup_directory(),
+        Some("/host/repositories/child")
+    );
+}
+
+async fn create_codex_state(path: &std::path::Path, now_ms: i64) {
+    let pool = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true),
+    )
+    .await
+    .expect("fixture database should open");
+    sqlx::query(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, cli_version TEXT NOT NULL DEFAULT '', agent_nickname TEXT, agent_role TEXT, recency_at_ms INTEGER NOT NULL DEFAULT 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("threads schema should exist");
+    sqlx::query(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("edge schema should exist");
+    for (id, cwd, title, nickname, archived, recency) in [
+        (
+            "codex-main",
+            "/host/repositories/main",
+            "Native main",
+            None,
+            0_i64,
+            now_ms - 1_000,
+        ),
+        (
+            "codex-child",
+            "/host/repositories/child",
+            "Native child",
+            Some("reviewer"),
+            0,
+            now_ms - 500,
+        ),
+        (
+            "codex-old",
+            "/host/repositories/old",
+            "Old session",
+            None,
+            0,
+            now_ms - 86_400_001,
+        ),
+        (
+            "codex-archived",
+            "/host/repositories/old",
+            "Archived session",
+            None,
+            1,
+            now_ms,
+        ),
+    ] {
+        sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, archived, cli_version, agent_nickname, recency_at_ms) VALUES (?, ?, 1, 1, 'cli', 'openai', ?, ?, '{}', 'default', ?, '0.144.5', ?, ?)")
+            .bind(id)
+            .bind(format!("/state/{id}.jsonl"))
+            .bind(cwd)
+            .bind(title)
+            .bind(archived)
+            .bind(nickname)
+            .bind(recency)
+            .execute(&pool)
+            .await
+            .expect("thread fixture should insert");
+    }
+    sqlx::query("INSERT INTO thread_spawn_edges VALUES ('codex-main', 'codex-child', 'active')")
+        .execute(&pool)
+        .await
+        .expect("edge fixture should insert");
+    pool.close().await;
 }

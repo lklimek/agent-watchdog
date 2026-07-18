@@ -14,7 +14,6 @@ use watchdog_domain::{
 
 /// Largest accepted app-server JSONL/WebSocket message.
 pub const MAX_APP_SERVER_BYTES: usize = 256 * 1_024;
-const TESTED_VERSION: &str = "0.144.5";
 
 /// Parser for generated-schema Codex app-server notifications.
 #[derive(Clone, Debug)]
@@ -384,7 +383,8 @@ impl CodexParseError {
         CompatibilityWarning::new(
             WarningKind::Upgrade,
             format!(
-                "Update Agent Watchdog's Codex adapter; tested with Codex CLI {TESTED_VERSION}"
+                "Update Agent Watchdog's Codex adapter; tested with Codex CLI {}",
+                crate::TESTED_CODEX_VERSION
             ),
         )
         .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))

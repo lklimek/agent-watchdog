@@ -24,10 +24,10 @@ use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
 
 use crate::config::{ConfigManager, RuntimeConfig};
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CompanionDiscovery,
-    DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService, HumanNotifier,
-    NotificationEndpoints, RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint,
-    dashboard_router, health_router, mcp_router,
+    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
+    CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService,
+    HumanNotifier, NotificationEndpoints, RuntimeDiscoveryReport, SystemClock, TerminationConfig,
+    WebhookEndpoint, dashboard_router, health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
@@ -229,21 +229,23 @@ fn start_discovery(
     health: HealthService,
     requested: mpsc::Receiver<()>,
 ) -> JoinHandle<()> {
-    spawn_discovery_worker(
-        config,
-        ClaudeTeamDiscovery::new(api.clone()),
-        CompanionDiscovery::new(api, clock.clone()),
-        store,
-        clock,
-        health,
-        requested,
-    )
+    let discoveries = RuntimeDiscoveries {
+        claude: ClaudeTeamDiscovery::new(api.clone()),
+        codex: CodexDiscovery::new(api.clone(), clock.clone()),
+        companion: CompanionDiscovery::new(api, clock.clone()),
+    };
+    spawn_discovery_worker(config, discoveries, store, clock, health, requested)
+}
+
+struct RuntimeDiscoveries {
+    claude: ClaudeTeamDiscovery,
+    codex: CodexDiscovery,
+    companion: CompanionDiscovery,
 }
 
 fn spawn_discovery_worker(
     config: ConfigManager,
-    claude: ClaudeTeamDiscovery,
-    companion: CompanionDiscovery,
+    discoveries: RuntimeDiscoveries,
     store: WatchdogStore,
     clock: Arc<SystemClock>,
     health: HealthService,
@@ -263,7 +265,8 @@ fn spawn_discovery_worker(
             }
             let current = config.current();
             if current.adapters().claude() {
-                let report = claude
+                let report = discoveries
+                    .claude
                     .reconcile(current.claude_roots(), current.worktree_mappings())
                     .await;
                 record_discovery_health(
@@ -276,8 +279,24 @@ fn spawn_discovery_worker(
                 )
                 .await;
             }
+            if current.adapters().codex() {
+                let report = discoveries
+                    .codex
+                    .reconcile(current.codex_roots(), current.worktree_mappings())
+                    .await;
+                record_discovery_health(
+                    &store,
+                    &clock,
+                    &health,
+                    RuntimeKind::CodexCli,
+                    watchdog_codex::TESTED_CODEX_VERSION,
+                    report,
+                )
+                .await;
+            }
             if current.adapters().companion() {
-                let report = companion
+                let report = discoveries
+                    .companion
                     .reconcile(current.companion_roots(), current.worktree_mappings())
                     .await;
                 record_discovery_health(

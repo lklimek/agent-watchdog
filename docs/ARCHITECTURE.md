@@ -274,6 +274,14 @@ parsing. The adapter opens native SQLite read-only and tolerates absent WAL/SHM;
 failure falls back to JSONL/process evidence and adds `UPGRADE` when the format is
 unrecognized. It never migrates, locks for writing, or repairs Codex state.
 
+SQLite bootstrap selects only unarchived threads with native recency in the
+preceding 24 hours, under a 1,000-row cap, then preserves exact spawn edges.
+This is deliberately a bounded false-positive-tolerant heuristic, not a claim
+that retained Codex threads are running. Official hook/app-server evidence,
+MCP registration, and trustworthy process correlation may add or retain an
+older live session; the bootstrap window prevents all retained history from
+flooding the default dashboard.
+
 ### 7.3 Codex Companion
 
 The adapter observes per-workspace state, job detail, logs, launcher/session IDs,

@@ -29,8 +29,9 @@ pub use dashboard::{
     dashboard_router,
 };
 pub use discovery::{
-    ClaudeDiscoveryReport, ClaudeTeamDiscovery, CompanionDiscovery, CompanionDiscoveryReport,
-    PathMappingError, RuntimeDiscoveryReport, WorktreePathMapping,
+    ClaudeDiscoveryReport, ClaudeTeamDiscovery, CodexDiscovery, CodexDiscoveryReport,
+    CompanionDiscovery, CompanionDiscoveryReport, PathMappingError, RuntimeDiscoveryReport,
+    WorktreePathMapping,
 };
 pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};

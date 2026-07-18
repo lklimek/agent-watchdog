@@ -79,6 +79,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-DIS-007 | Path registration is outside or escapes an allowlisted root. | Request is rejected without access. | FR-DIS-007, FR-SEC-002 |
 | T-DIS-008 | Default and overridden runtime locations coexist. | Both are discovered within configured mounts. | FR-DIS-008 |
 | T-DIS-009 | Runtime-neutral adapter emits API parent/child events. | Core represents them without filesystem fields. | FR-DIS-003 |
+| T-DIS-010 | Codex SQLite contains recent, old, and archived threads plus an exact spawn edge. | Only recent unarchived threads bootstrap; the exact edge is retained. | FR-DIS-002, FR-DIS-006 |
 | T-DIS-010 | Native session ID repeats in two runtimes. | Watchdog identities remain distinct. | FR-DIS-004 |
 
 ### 5.2 Filesystem ingestion and native parsing

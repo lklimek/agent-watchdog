@@ -14,6 +14,8 @@ use crate::{AgentApi, DiscoveredSession};
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCAN_ENTRIES: usize = 2_048;
 const MAX_SCAN_PATH_BYTES: usize = 2 * 1_024 * 1_024;
+const CODEX_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_CODEX_THREADS: u32 = 1_000;
 
 /// Explicit projection from a runtime-native host prefix to its read-only
 /// mount inside the supported Docker container.
@@ -139,6 +141,9 @@ pub type ClaudeDiscoveryReport = RuntimeDiscoveryReport;
 
 /// Codex Companion reconciliation report.
 pub type CompanionDiscoveryReport = RuntimeDiscoveryReport;
+
+/// Native Codex reconciliation report.
+pub type CodexDiscoveryReport = RuntimeDiscoveryReport;
 
 /// Automatic Claude team discovery independent from optional MCP/hooks.
 #[derive(Clone, Debug)]
@@ -435,6 +440,219 @@ impl std::fmt::Debug for CompanionDiscovery {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CompanionDiscovery")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Automatic bounded Codex thread/spawn-edge discovery from read-only state.
+#[derive(Clone)]
+pub struct CodexDiscovery {
+    api: AgentApi,
+    clock: Arc<dyn Clock>,
+}
+
+impl CodexDiscovery {
+    /// Construct discovery over the shared durable ingestion service.
+    #[must_use]
+    pub fn new(api: AgentApi, clock: Arc<dyn Clock>) -> Self {
+        Self { api, clock }
+    }
+
+    /// Reconcile recent unarchived threads and exact native spawn edges.
+    ///
+    /// The bounded recency window is a bootstrap heuristic only: official
+    /// events, MCP, and later process correlation may retain or add sessions
+    /// outside it without broad historical discovery.
+    pub async fn reconcile(
+        &self,
+        codex_roots: &[PathBuf],
+        worktree_mappings: &[WorktreePathMapping],
+    ) -> CodexDiscoveryReport {
+        let mut report = RuntimeDiscoveryReport::default();
+        let mut mains = BTreeSet::new();
+        let mut children = BTreeSet::new();
+        let cutoff = watchdog_domain::WallTimeMs::new(
+            self.clock
+                .now()
+                .wall_time()
+                .value()
+                .saturating_sub(CODEX_BOOTSTRAP_WINDOW_MS),
+        );
+        for configured_root in codex_roots {
+            let Ok(root) = CapabilityRoot::new(configured_root) else {
+                report.warn();
+                continue;
+            };
+            let database_relative = Path::new("state_5.sqlite");
+            let database_path = root.path().join(database_relative);
+            match database_path.symlink_metadata() {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    report.warn();
+                    continue;
+                }
+            }
+            if root.open_file(database_relative).is_err() {
+                report.warn();
+                continue;
+            }
+            let Ok(database_path) = database_path.canonicalize() else {
+                report.warn();
+                continue;
+            };
+            if !database_path.starts_with(root.path()) {
+                report.warn();
+                continue;
+            }
+            let Ok(reader) = watchdog_codex::CodexStateReader::open(&database_path).await else {
+                report.warn();
+                continue;
+            };
+            let Ok(threads) = reader
+                .discover_recent_threads(cutoff, MAX_CODEX_THREADS)
+                .await
+            else {
+                report.warn();
+                continue;
+            };
+            self.reconcile_codex_threads(
+                &threads,
+                worktree_mappings,
+                &mut report,
+                &mut mains,
+                &mut children,
+            )
+            .await;
+        }
+        report
+    }
+
+    async fn reconcile_codex_threads(
+        &self,
+        threads: &[watchdog_codex::CodexThread],
+        worktree_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+        mains: &mut BTreeSet<SessionId>,
+        children: &mut BTreeSet<SessionId>,
+    ) {
+        for thread in threads
+            .iter()
+            .filter(|thread| thread.kind() == SessionKind::Main)
+        {
+            self.reconcile_codex_main(thread, worktree_mappings, report, mains)
+                .await;
+        }
+        for thread in threads
+            .iter()
+            .filter(|thread| thread.kind() == SessionKind::Child)
+        {
+            self.reconcile_codex_child(thread, worktree_mappings, report, mains, children)
+                .await;
+        }
+    }
+
+    async fn reconcile_codex_main(
+        &self,
+        thread: &watchdog_codex::CodexThread,
+        worktree_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+        mains: &mut BTreeSet<SessionId>,
+    ) {
+        if thread.cli_version() != watchdog_codex::TESTED_CODEX_VERSION {
+            report.warn();
+        }
+        let main_id = SessionId::from_native(thread.subject());
+        let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
+        if let Err(error) = self
+            .api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::CodexCli,
+                native_id: thread.subject().native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: discovery_key("codex-state", main_id),
+                title: Some(thread.title().to_owned()),
+                startup_directory,
+            })
+            .await
+        {
+            log_reconcile_failure(RuntimeKind::CodexCli, "main", &error);
+            report.warn();
+        } else if mains.insert(main_id) {
+            report.main_sessions = report.main_sessions.saturating_add(1);
+        }
+    }
+
+    async fn reconcile_codex_child(
+        &self,
+        thread: &watchdog_codex::CodexThread,
+        worktree_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+        mains: &mut BTreeSet<SessionId>,
+        children: &mut BTreeSet<SessionId>,
+    ) {
+        if thread.cli_version() != watchdog_codex::TESTED_CODEX_VERSION {
+            report.warn();
+        }
+        let Some(parent) = thread.parent() else {
+            report.warn();
+            return;
+        };
+        let parent_id = SessionId::from_native(parent);
+        if !mains.contains(&parent_id) {
+            if let Err(error) = self
+                .api
+                .discover_session(DiscoveredSession {
+                    runtime: RuntimeKind::CodexCli,
+                    native_id: parent.native_id().to_owned(),
+                    kind: SessionKind::Main,
+                    parent: None,
+                    event_key: discovery_key("codex-state-parent", parent_id),
+                    title: None,
+                    startup_directory: None,
+                })
+                .await
+            {
+                log_reconcile_failure(RuntimeKind::CodexCli, "parent", &error);
+                report.warn();
+                return;
+            }
+            mains.insert(parent_id);
+            report.main_sessions = report.main_sessions.saturating_add(1);
+        }
+        let child_id = SessionId::from_native(thread.subject());
+        let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
+        let title = thread
+            .agent_nickname()
+            .or_else(|| thread.agent_role())
+            .unwrap_or_else(|| thread.title())
+            .to_owned();
+        if let Err(error) = self
+            .api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::CodexCli,
+                native_id: thread.subject().native_id().to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(parent_id),
+                event_key: discovery_key("codex-state", child_id),
+                title: Some(title),
+                startup_directory,
+            })
+            .await
+        {
+            log_reconcile_failure(RuntimeKind::CodexCli, "child", &error);
+            report.warn();
+        } else if children.insert(child_id) {
+            report.child_sessions = report.child_sessions.saturating_add(1);
+        }
+    }
+}
+
+impl std::fmt::Debug for CodexDiscovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodexDiscovery")
             .finish_non_exhaustive()
     }
 }

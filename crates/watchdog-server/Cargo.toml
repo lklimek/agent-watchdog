@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 watchdog-domain.workspace = true
 watchdog-claude = { path = "../watchdog-claude", version = "=0.1.0" }
 watchdog-companion = { path = "../watchdog-companion", version = "=0.1.0" }
+watchdog-codex = { path = "../watchdog-codex", version = "=0.1.0" }
 watchdog-runtime.workspace = true
 watchdog-store.workspace = true
 
@@ -31,6 +32,7 @@ watchdog-store.workspace = true
 watchdog-process = { path = "../watchdog-process", version = "=0.1.0" }
 
 [dev-dependencies]
+sqlx.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 watchdog-testkit = { path = "../watchdog-testkit", version = "=0.1.0" }
