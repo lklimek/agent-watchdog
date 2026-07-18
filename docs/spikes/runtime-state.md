@@ -13,7 +13,7 @@ read-only mounts?
 ## Environment
 
 - Linux 7.0.0-27-generic x86_64
-- Claude Code 2.1.212
+- Claude Code 2.1.214
 - Codex CLI 0.144.5
 - Codex Companion 1.0.6
 - OpenCode 1.17.15, inspected only as future-adapter context

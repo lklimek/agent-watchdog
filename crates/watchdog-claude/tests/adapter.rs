@@ -1,8 +1,8 @@
 //! Claude hook and automatic team-discovery contracts.
 
 use watchdog_claude::{
-    ClaudeHookParser, ClaudeParseError, parse_task_record, parse_team_config,
-    parse_transcript_record,
+    ClaudeHookParser, ClaudeParseError, TESTED_CLAUDE_VERSION, parse_subagent_metadata,
+    parse_task_record, parse_team_config, parse_transcript_record,
 };
 use watchdog_domain::{
     DetailedState, ObservationPayload, RuntimeKind, SessionKind, TimePoint, WallTimeMs,
@@ -14,7 +14,7 @@ fn now() -> TimePoint {
 
 #[test]
 fn session_start_hook_discovers_a_main_without_registration() {
-    let parser = ClaudeHookParser::new("2.1.212").expect("version should be valid");
+    let parser = ClaudeHookParser::new(TESTED_CLAUDE_VERSION).expect("version should be valid");
     let evidence = parser
         .parse_hook(
             br#"{
@@ -46,7 +46,7 @@ fn session_start_hook_discovers_a_main_without_registration() {
 
 #[test]
 fn subagent_hooks_create_an_exact_parent_relation_and_terminal_state() {
-    let parser = ClaudeHookParser::new("2.1.212").expect("version should be valid");
+    let parser = ClaudeHookParser::new(TESTED_CLAUDE_VERSION).expect("version should be valid");
     let started = parser
         .parse_hook(
             br#"{
@@ -138,7 +138,7 @@ fn malformed_or_drifted_hook_returns_an_actionable_bounded_error() {
 
 #[test]
 fn oversized_hook_is_rejected_before_json_allocation() {
-    let parser = ClaudeHookParser::new("2.1.212").expect("version should be valid");
+    let parser = ClaudeHookParser::new(TESTED_CLAUDE_VERSION).expect("version should be valid");
     let input = vec![b'x'; watchdog_claude::MAX_HOOK_BYTES + 1];
     let error = parser
         .parse_hook(&input, "oversized", now())
@@ -154,6 +154,7 @@ fn incremental_transcript_record_emits_metadata_only_activity() {
             "type":"assistant",
             "sessionId":"main-1",
             "cwd":"/work/repo",
+            "gitBranch":"feat/claude-ingestion",
             "message":{"content":"SECRET_TRANSCRIPT_CONTENT"}
         }"#,
     )
@@ -161,7 +162,43 @@ fn incremental_transcript_record_emits_metadata_only_activity() {
 
     assert!(signal.is_activity());
     assert_eq!(signal.session_id(), Some("main-1"));
+    assert_eq!(signal.git_branch(), Some("feat/claude-ingestion"));
     assert!(!format!("{signal:?}").contains("SECRET_TRANSCRIPT_CONTENT"));
+}
+
+#[test]
+fn current_metadata_records_are_recognized_but_do_not_invent_activity() {
+    for record in [
+        br#"{"type":"agent-setting","agentSetting":"claudius:claudius","sessionId":"main-1"}"#
+            .as_slice(),
+        br#"{"type":"file-history-snapshot","snapshot":{"secret":"SECRET_TRANSCRIPT_CONTENT"}}"#
+            .as_slice(),
+        br#"{"type":"last-prompt","sessionId":"main-1","lastPrompt":"SECRET_TRANSCRIPT_CONTENT"}"#
+            .as_slice(),
+        br#"{"type":"mode","sessionId":"main-1","mode":"default"}"#.as_slice(),
+        br#"{"type":"permission-mode","sessionId":"main-1","permissionMode":"default"}"#.as_slice(),
+    ] {
+        let signal = parse_transcript_record(record)
+            .expect("current metadata-only record should be accepted");
+        assert!(!signal.is_activity());
+        assert!(!format!("{signal:?}").contains("SECRET_TRANSCRIPT_CONTENT"));
+    }
+}
+
+#[test]
+fn native_agent_titles_are_bounded_metadata_only() {
+    let setting = parse_transcript_record(
+        br#"{"type":"agent-setting","agentSetting":"claudius:claudius","sessionId":"main-1"}"#,
+    )
+    .expect("agent setting should parse");
+    assert_eq!(setting.agent_setting(), Some("claudius:claudius"));
+
+    let subagent = parse_subagent_metadata(
+        br#"{"agentType":"security-reviewer","description":"SECRET_TRANSCRIPT_CONTENT"}"#,
+    )
+    .expect("subagent metadata should parse");
+    assert_eq!(subagent.agent_type(), Some("security-reviewer"));
+    assert!(!format!("{subagent:?}").contains("SECRET_TRANSCRIPT_CONTENT"));
 }
 
 #[test]

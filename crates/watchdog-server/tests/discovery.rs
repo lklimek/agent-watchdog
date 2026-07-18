@@ -1,12 +1,18 @@
 //! Automatic runtime discovery and best-effort reconciliation acceptance tests.
 
-use std::{fs, io::Write as _, sync::Arc};
+use std::{
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::json;
 use sqlx::sqlite::SqliteConnectOptions;
 use watchdog_domain::{DetailedState, DurationMs, SessionKind, TimePoint, WallTimeMs};
 use watchdog_server::{
-    AgentApi, ClaudeTeamDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
+    AgentApi, ClaudeDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
     DashboardService, WorktreePathMapping,
 };
 use watchdog_store::WatchdogStore;
@@ -30,7 +36,7 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
         &main_worktree,
         &child_worktree,
     ] {
-        fs::create_dir(directory).expect("fixture directory should be created");
+        fs::create_dir_all(directory).expect("fixture directory should be created");
     }
     fs::write(
         good_team.join("config.json"),
@@ -59,11 +65,11 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
     let api = AgentApi::new(store.clone(), clock.clone())
         .await
         .expect("API should initialize");
-    let discovery = ClaudeTeamDiscovery::new(api);
+    let discovery = ClaudeDiscovery::new(api, store.clone(), clock.clone());
 
     let mapping = WorktreePathMapping::new(native_worktree_root.clone(), worktree_root.clone())
         .expect("path mapping should be valid");
-    let report = discovery.reconcile(&[team_root], &[mapping]).await;
+    let report = discovery.reconcile(&[team_root], &[], &[mapping]).await;
     assert_eq!(report.main_sessions(), 1);
     assert_eq!(report.child_sessions(), 1);
     assert_eq!(report.warning_count(), 1);
@@ -84,6 +90,304 @@ async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malforme
         native_worktree_root.join("main").to_string_lossy()
     );
     assert_eq!(dashboard.sessions[0].child_counts.values().sum::<u32>(), 1);
+}
+
+#[tokio::test]
+async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementally() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let (projects_root, mounted_worktrees, child_transcript) =
+        create_claude_transcript_fixtures(fixture.path());
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_millis(),
+    )
+    .expect("fixture time should fit");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(now_ms),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = ClaudeDiscovery::new(api, store.clone(), clock.clone());
+    let runtime_mapping =
+        WorktreePathMapping::new("/home/test/.claude/projects", projects_root.clone())
+            .expect("runtime path mapping should be valid");
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", mounted_worktrees)
+        .expect("worktree mapping should be valid");
+
+    let report = reconcile_claude_fixture(
+        &discovery,
+        &projects_root,
+        &runtime_mapping,
+        &worktree_mapping,
+    )
+    .await;
+    assert_eq!(report.main_sessions(), 1);
+    assert_eq!(report.child_sessions(), 1);
+    assert_eq!(report.warning_count(), 0);
+
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(children.len(), 1);
+    let metadata = store
+        .session_metadata(children[0].session)
+        .await
+        .expect("metadata should query")
+        .expect("metadata should exist");
+    assert_eq!(metadata.title(), Some("security-reviewer"));
+    assert_eq!(
+        metadata.startup_directory(),
+        Some("/host/repositories/child")
+    );
+    assert_eq!(metadata.branch(), Some("feat/claude"));
+
+    let mut transcript = fs::OpenOptions::new()
+        .append(true)
+        .open(child_transcript)
+        .expect("child transcript should reopen");
+    transcript
+        .write_all(
+            b"{\"type\":\"assistant\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"cwd\":\"/host/repositories/child\",\"message\":{\"content\":\"FUTURE_SECRET_CONTENT\"}}\n",
+        )
+        .expect("future activity should append");
+    clock.advance(DurationMs::new(1_000));
+
+    let appended = reconcile_claude_fixture(
+        &discovery,
+        &projects_root,
+        &runtime_mapping,
+        &worktree_mapping,
+    )
+    .await;
+    assert_eq!(appended.warning_count(), 0);
+    let snapshot = load_snapshot(&store, children[0].session).await;
+    assert_eq!(
+        snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .last_progress_summary(),
+        Some("Claude transcript activity")
+    );
+
+    transcript
+        .write_all(b"{\"type\":\"future-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\"}\n")
+        .expect("future schema record should append");
+    clock.advance(DurationMs::new(1_000));
+    let drifted = reconcile_claude_fixture(
+        &discovery,
+        &projects_root,
+        &runtime_mapping,
+        &worktree_mapping,
+    )
+    .await;
+    assert_eq!(drifted.warning_count(), 1);
+    let drifted_snapshot = load_snapshot(&store, children[0].session).await;
+    assert_eq!(
+        drifted_snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .compatibility_warning()
+            .expect("schema drift should be actionable")
+            .badge(),
+        "UPGRADE"
+    );
+}
+
+#[tokio::test]
+async fn claude_team_member_transcript_does_not_create_a_duplicate_main() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let (projects, teams, worktrees, teammate_transcript) =
+        create_claude_team_alias_fixtures(fixture.path());
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone());
+    let runtime_mappings = [
+        WorktreePathMapping::new("/home/test/.claude/projects", projects.clone())
+            .expect("projects mapping should be valid"),
+        WorktreePathMapping::new("/home/test/.claude/teams", teams.clone())
+            .expect("teams mapping should be valid"),
+    ];
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", worktrees)
+        .expect("worktree mapping should be valid");
+
+    let report = discovery
+        .reconcile(
+            &[projects.clone(), teams.clone()],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    assert_eq!(report.main_sessions(), 1);
+    assert_eq!(report.child_sessions(), 1);
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].native.native_id(), "team-worker");
+
+    append_claude_activity(&teammate_transcript, "teammate-session", None);
+    clock.advance(DurationMs::new(1_000));
+    let restarted = ClaudeDiscovery::new(api, store.clone(), clock.clone());
+    restarted
+        .reconcile(
+            &[projects, teams],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    let snapshot = load_snapshot(&store, children[0].session).await;
+    assert_eq!(
+        snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .last_progress_summary(),
+        Some("Claude transcript activity")
+    );
+}
+
+async fn load_snapshot(
+    store: &WatchdogStore,
+    session: watchdog_domain::SessionIdentity,
+) -> watchdog_store::SnapshotUpdate {
+    store
+        .snapshot(session)
+        .await
+        .expect("snapshot should query")
+        .expect("snapshot should exist")
+}
+
+async fn reconcile_claude_fixture(
+    discovery: &ClaudeDiscovery,
+    projects_root: &Path,
+    runtime_mapping: &WorktreePathMapping,
+    worktree_mapping: &WorktreePathMapping,
+) -> watchdog_server::RuntimeDiscoveryReport {
+    discovery
+        .reconcile(
+            &[projects_root.to_path_buf()],
+            std::slice::from_ref(runtime_mapping),
+            std::slice::from_ref(worktree_mapping),
+        )
+        .await
+}
+
+fn create_claude_transcript_fixtures(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let projects_root = root.join("projects");
+    let project = projects_root.join("-host-repositories-main");
+    let subagents = project.join("main-session/subagents");
+    let mounted_worktrees = root.join("worktrees");
+    for directory in [
+        &subagents,
+        &mounted_worktrees.join("main"),
+        &mounted_worktrees.join("child"),
+    ] {
+        fs::create_dir_all(directory).expect("fixture directory should be created");
+    }
+    fs::write(
+        project.join("main-session.jsonl"),
+        b"{\"type\":\"agent-setting\",\"agentSetting\":\"claudius:claudius\",\"sessionId\":\"main-session\"}\n{\"type\":\"assistant\",\"sessionId\":\"main-session\",\"cwd\":\"/host/repositories/main\",\"gitBranch\":\"feat/claude\",\"message\":{\"content\":\"SECRET_TRANSCRIPT_CONTENT\"}}\n",
+    )
+    .expect("main transcript should be written");
+    let child_transcript = subagents.join("agent-child-1.jsonl");
+    fs::write(
+        &child_transcript,
+        b"{\"type\":\"assistant\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"cwd\":\"/host/repositories/child\",\"gitBranch\":\"feat/claude\",\"message\":{\"content\":\"SECRET_TRANSCRIPT_CONTENT\"}}\n",
+    )
+    .expect("child transcript should be written");
+    fs::write(
+        subagents.join("agent-child-1.meta.json"),
+        b"{\"agentType\":\"security-reviewer\",\"description\":\"SECRET_TRANSCRIPT_CONTENT\"}",
+    )
+    .expect("child metadata should be written");
+    (projects_root, mounted_worktrees, child_transcript)
+}
+
+fn create_claude_team_alias_fixtures(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let projects = root.join("projects");
+    let project = projects.join("-host-repositories-main");
+    let teams = root.join("teams");
+    let team = teams.join("session-main");
+    let worktrees = root.join("worktrees");
+    for directory in [
+        &project,
+        &team,
+        &worktrees.join("main"),
+        &worktrees.join("worker"),
+    ] {
+        fs::create_dir_all(directory).expect("fixture directory should be created");
+    }
+    fs::write(
+        project.join("main-session.jsonl"),
+        b"{\"type\":\"assistant\",\"sessionId\":\"main-session\",\"cwd\":\"/host/repositories/main\"}\n",
+    )
+    .expect("lead transcript should be written");
+    let teammate = project.join("teammate-session.jsonl");
+    fs::write(
+        &teammate,
+        b"{\"type\":\"agent-setting\",\"agentSetting\":\"claudius:developer\",\"sessionId\":\"teammate-session\"}\n{\"type\":\"assistant\",\"sessionId\":\"teammate-session\",\"cwd\":\"/host/repositories/worker\"}\n",
+    )
+    .expect("teammate transcript should be written");
+    fs::write(
+        team.join("config.json"),
+        serde_json::to_vec(&json!({
+            "leadSessionId": "main-session",
+            "members": [
+                {"agentType": "team-lead", "name": "lead", "cwd": "/host/repositories/main", "isActive": true},
+                {"agentType": "claudius:developer", "name": "worker", "agentId": "team-worker", "cwd": "/host/repositories/worker", "isActive": true}
+            ]
+        }))
+        .expect("team config should serialize"),
+    )
+    .expect("team config should be written");
+    (projects, teams, worktrees, teammate)
+}
+
+fn append_claude_activity(path: &Path, session: &str, agent: Option<&str>) {
+    let mut transcript = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("transcript should reopen");
+    let record = json!({
+        "type": "assistant",
+        "sessionId": session,
+        "agentId": agent,
+        "message": {"content": "FUTURE_SECRET_CONTENT"}
+    });
+    serde_json::to_writer(&mut transcript, &record).expect("activity should serialize");
+    transcript.write_all(b"\n").expect("newline should append");
+}
+
+fn current_time_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_millis(),
+    )
+    .expect("fixture time should fit")
 }
 
 #[tokio::test]

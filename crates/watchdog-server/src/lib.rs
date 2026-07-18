@@ -33,7 +33,7 @@ pub use dashboard::{
     dashboard_router,
 };
 pub use discovery::{
-    ClaudeDiscoveryReport, ClaudeTeamDiscovery, CodexDiscovery, CodexDiscoveryReport,
+    ClaudeDiscovery, ClaudeDiscoveryReport, CodexDiscovery, CodexDiscoveryReport,
     CompanionDiscovery, CompanionDiscoveryReport, PathMappingError, RuntimeDiscoveryReport,
     WorktreePathMapping,
 };
