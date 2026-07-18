@@ -7,12 +7,16 @@ use std::{
 
 use thiserror::Error;
 #[cfg(target_os = "linux")]
+use watchdog_domain::ProcessId;
 use watchdog_domain::{
-    AdapterIdentity, EvidenceTrust, ObservationEnvelope, ObservationId, ObservationPayload,
-    ObservationSource, ProcessId,
+    AdapterIdentity, BoundedText, Clock, DetailedState, EvidenceTrust, ObservationEnvelope,
+    ObservationId, ObservationPayload, ObservationSource, RuntimeKind, SessionId, SessionKind,
 };
-use watchdog_domain::{Clock, DetailedState, RuntimeKind, SessionId, SessionKind};
-use watchdog_runtime::{CapabilityRoot, DirectoryScanner, ScanBudget};
+use watchdog_runtime::{
+    CapabilityRoot, DirectoryScanner, FileCursor, FileIdentity, IncrementalReader, ReadBudget,
+    ReadOutcome, ScanBudget,
+};
+use watchdog_store::{FileCursorRecord, WatchdogStore};
 
 use crate::{AgentApi, DiscoveredSession};
 
@@ -21,6 +25,10 @@ const MAX_SCAN_ENTRIES: usize = 2_048;
 const MAX_SCAN_PATH_BYTES: usize = 2 * 1_024 * 1_024;
 const CODEX_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_CODEX_THREADS: u32 = 1_000;
+const CODEX_ROLLOUT_PARSER_VERSION: u32 = 1;
+const MAX_CODEX_ROLLOUT_BATCHES: usize = 4;
+const MAX_CODEX_ROLLOUT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
+const MAX_CODEX_ROLLOUT_RECORDS: usize = 128;
 
 /// Explicit projection from a runtime-native host prefix to its read-only
 /// mount inside the supported Docker container.
@@ -75,6 +83,19 @@ impl WorktreePathMapping {
 
     fn validate_native_path(&self, candidate: &Path) -> Option<String> {
         let relative = candidate.strip_prefix(&self.native_root).ok()?;
+        self.project_relative(relative)?;
+        self.native_root
+            .join(relative)
+            .to_str()
+            .map(ToOwned::to_owned)
+    }
+
+    fn project_native_path(&self, candidate: &Path) -> Option<PathBuf> {
+        let relative = candidate.strip_prefix(&self.native_root).ok()?;
+        self.project_relative(relative)
+    }
+
+    fn project_relative(&self, relative: &Path) -> Option<PathBuf> {
         if relative
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -85,10 +106,7 @@ impl WorktreePathMapping {
         if !projected.starts_with(&self.mounted_root) {
             return None;
         }
-        self.native_root
-            .join(relative)
-            .to_str()
-            .map(ToOwned::to_owned)
+        Some(projected)
     }
 }
 
@@ -517,14 +535,15 @@ impl std::fmt::Debug for CompanionDiscovery {
 #[derive(Clone)]
 pub struct CodexDiscovery {
     api: AgentApi,
+    store: WatchdogStore,
     clock: Arc<dyn Clock>,
 }
 
 impl CodexDiscovery {
     /// Construct discovery over the shared durable ingestion service.
     #[must_use]
-    pub fn new(api: AgentApi, clock: Arc<dyn Clock>) -> Self {
-        Self { api, clock }
+    pub fn new(api: AgentApi, store: WatchdogStore, clock: Arc<dyn Clock>) -> Self {
+        Self { api, store, clock }
     }
 
     /// Reconcile recent unarchived threads and exact native spawn edges.
@@ -535,6 +554,7 @@ impl CodexDiscovery {
     pub async fn reconcile(
         &self,
         codex_roots: &[PathBuf],
+        codex_path_mappings: &[WorktreePathMapping],
         worktree_mappings: &[WorktreePathMapping],
     ) -> CodexDiscoveryReport {
         let mut report = RuntimeDiscoveryReport::default();
@@ -587,6 +607,7 @@ impl CodexDiscovery {
             };
             self.reconcile_codex_threads(
                 &threads,
+                codex_path_mappings,
                 worktree_mappings,
                 &mut report,
                 &mut mains,
@@ -600,6 +621,7 @@ impl CodexDiscovery {
     async fn reconcile_codex_threads(
         &self,
         threads: &[watchdog_codex::CodexThread],
+        codex_path_mappings: &[WorktreePathMapping],
         worktree_mappings: &[WorktreePathMapping],
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
@@ -619,6 +641,218 @@ impl CodexDiscovery {
             self.reconcile_codex_child(thread, worktree_mappings, report, mains, children)
                 .await;
         }
+        for thread in threads {
+            self.reconcile_codex_rollout(thread, codex_path_mappings, report)
+                .await;
+        }
+    }
+
+    async fn reconcile_codex_rollout(
+        &self,
+        thread: &watchdog_codex::CodexThread,
+        path_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        let Some((root, relative, path_key)) =
+            projected_runtime_file(thread.rollout_path(), path_mappings)
+        else {
+            report.warn();
+            return;
+        };
+        let Ok(path_key) = BoundedText::new("rollout_path_key", path_key) else {
+            report.warn();
+            return;
+        };
+        let reader = IncrementalReader::new(
+            ReadBudget::new(
+                MAX_CODEX_ROLLOUT_BATCH_BYTES,
+                watchdog_codex::MAX_ROLLOUT_RECORD_BYTES,
+                MAX_CODEX_ROLLOUT_RECORDS,
+            )
+            .unwrap_or_else(|_| unreachable!("static Codex rollout budget is valid")),
+        );
+        let Ok(parser) = watchdog_codex::CodexRolloutParser::new(thread.cli_version()) else {
+            report.warn();
+            return;
+        };
+        let Ok(saved) = self.store.file_cursor(&path_key).await else {
+            report.warn();
+            return;
+        };
+        let Some(saved) = saved else {
+            match reader.cursor_at_end(&root, &relative, CODEX_ROLLOUT_PARSER_VERSION) {
+                Ok(cursor) => {
+                    if self
+                        .persist_codex_cursor(&path_key, &cursor, None)
+                        .await
+                        .is_err()
+                    {
+                        report.warn();
+                    }
+                }
+                Err(_) => report.warn(),
+            }
+            return;
+        };
+        self.tail_codex_rollout(
+            thread, report, &root, &relative, &path_key, reader, &parser, &saved,
+        )
+        .await;
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments are the explicit bounded source capabilities and durable cursor"
+    )]
+    async fn tail_codex_rollout(
+        &self,
+        thread: &watchdog_codex::CodexThread,
+        report: &mut RuntimeDiscoveryReport,
+        root: &CapabilityRoot,
+        relative: &Path,
+        path_key: &BoundedText<4_096>,
+        reader: IncrementalReader,
+        parser: &watchdog_codex::CodexRolloutParser,
+        saved: &FileCursorRecord,
+    ) {
+        let mut cursor = FileCursor::resume_from_complete(
+            FileIdentity::new(saved.device_id(), saved.inode()),
+            saved.complete_record_offset(),
+            CODEX_ROLLOUT_PARSER_VERSION,
+        );
+        let mut last_observation_id = saved.last_observation_id();
+        let mut complete_offset = cursor.complete_offset();
+        for _ in 0..MAX_CODEX_ROLLOUT_BATCHES {
+            let Ok(outcome) = reader.read(root, relative, &cursor) else {
+                report.warn();
+                return;
+            };
+            let ReadOutcome::Records(batch) = outcome else {
+                report.warn();
+                match reader.cursor_at_end(root, relative, CODEX_ROLLOUT_PARSER_VERSION) {
+                    Ok(new_cursor) => {
+                        let _ = self
+                            .persist_codex_cursor(path_key, &new_cursor, last_observation_id)
+                            .await;
+                    }
+                    Err(_) => report.warn(),
+                }
+                return;
+            };
+            for record in batch.records() {
+                complete_offset = complete_offset
+                    .saturating_add(u64::try_from(record.len()).unwrap_or(u64::MAX))
+                    .saturating_add(1);
+                let event_key = format!("{}:{complete_offset}", thread.subject().native_id());
+                let result = self
+                    .ingest_codex_rollout_record(thread, parser, record, &event_key, report)
+                    .await;
+                let Ok(observation_id) = result else {
+                    report.warn();
+                    return;
+                };
+                if let Some(observation_id) = observation_id {
+                    last_observation_id = Some(observation_id);
+                }
+            }
+            cursor = batch.cursor().clone();
+            if self
+                .persist_codex_cursor(path_key, &cursor, last_observation_id)
+                .await
+                .is_err()
+            {
+                report.warn();
+                return;
+            }
+            if !batch.continuation_required() {
+                return;
+            }
+        }
+    }
+
+    async fn ingest_codex_rollout_record(
+        &self,
+        thread: &watchdog_codex::CodexThread,
+        parser: &watchdog_codex::CodexRolloutParser,
+        record: &[u8],
+        event_key: &str,
+        report: &mut RuntimeDiscoveryReport,
+    ) -> Result<Option<ObservationId>, ()> {
+        match parser.parse_record(record, Some(thread.subject()), event_key, self.clock.now()) {
+            Ok(evidence) => {
+                let observation_id = evidence.observation().observation_id();
+                self.api
+                    .ingest_native_observation(evidence.observation().clone())
+                    .await
+                    .map_err(|_| ())?;
+                Ok(Some(observation_id))
+            }
+            Err(error) => {
+                report.warn();
+                Ok(self
+                    .emit_codex_compatibility_warning(
+                        thread,
+                        event_key,
+                        error.compatibility_warning(),
+                    )
+                    .await)
+            }
+        }
+    }
+
+    async fn persist_codex_cursor(
+        &self,
+        path_key: &BoundedText<4_096>,
+        cursor: &FileCursor,
+        last_observation_id: Option<ObservationId>,
+    ) -> Result<(), ()> {
+        let parser_version = BoundedText::new(
+            "parser_version",
+            format!("codex-rollout-v{}", cursor.parser_version()),
+        )
+        .map_err(|_| ())?;
+        let record = FileCursorRecord::new(
+            path_key.clone(),
+            cursor.identity().device(),
+            cursor.identity().inode(),
+            cursor.complete_offset(),
+            cursor.complete_offset(),
+            parser_version,
+            last_observation_id,
+        )
+        .map_err(|_| ())?;
+        self.store.save_file_cursor(&record).await.map_err(|_| ())
+    }
+
+    async fn emit_codex_compatibility_warning(
+        &self,
+        thread: &watchdog_codex::CodexThread,
+        event_key: &str,
+        warning: watchdog_domain::CompatibilityWarning,
+    ) -> Option<ObservationId> {
+        let source = ObservationSource::new(
+            AdapterIdentity::new(RuntimeKind::CodexCli, thread.cli_version()).ok()?,
+            "rollout:compatibility",
+            EvidenceTrust::Corroborating,
+            None,
+        )
+        .ok()?;
+        let observation_id =
+            ObservationId::from_native(RuntimeKind::CodexCli, "rollout-compatibility", event_key)
+                .ok()?;
+        let observation = ObservationEnvelope::new(
+            observation_id,
+            thread.subject().clone(),
+            self.clock.now(),
+            source,
+            ObservationPayload::Compatibility(warning),
+        )
+        .ok()?;
+        self.api
+            .ingest_native_observation(observation)
+            .await
+            .ok()
+            .map(|_| observation_id)
     }
 
     async fn reconcile_codex_main(
@@ -716,6 +950,26 @@ impl CodexDiscovery {
             report.child_sessions = report.child_sessions.saturating_add(1);
         }
     }
+}
+
+fn projected_runtime_file(
+    native_path: &Path,
+    mappings: &[WorktreePathMapping],
+) -> Option<(CapabilityRoot, PathBuf, String)> {
+    for mapping in mappings {
+        let Ok(relative) = native_path.strip_prefix(mapping.native_root()) else {
+            continue;
+        };
+        if mapping.project_native_path(native_path).is_none() {
+            continue;
+        }
+        let Ok(root) = CapabilityRoot::new(mapping.mounted_root()) else {
+            continue;
+        };
+        let path_key = format!("codex:{}", native_path.display());
+        return Some((root, relative.to_path_buf(), path_key));
+    }
+    None
 }
 
 impl std::fmt::Debug for CodexDiscovery {

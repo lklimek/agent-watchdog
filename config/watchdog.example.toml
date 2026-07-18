@@ -2,15 +2,28 @@
 allowed_worktree_roots = ["/monitored/worktrees"]
 # One runtime-native host prefix for each mounted root above, in the same order.
 native_worktree_roots = ["/home/example/git"]
+# Runtime-native roots correspond positionally to their narrow read-only mounts.
+# They are needed because state databases retain host paths that do not exist in
+# the container. Edit these examples to match the bind-mount sources.
+native_claude_roots = [
+  "/home/example/.claude/projects",
+  "/home/example/.claude/teams",
+  "/home/example/.claude/tasks",
+]
 claude_roots = [
   "/monitored/claude/projects",
   "/monitored/claude/teams",
   "/monitored/claude/tasks",
 ]
+native_codex_roots = [
+  "/home/example/.codex",
+  "/home/example/.codex/sessions",
+]
 codex_roots = [
   "/monitored/codex/state",
   "/monitored/codex/sessions",
 ]
+native_companion_roots = ["/home/example/path/to/companion-state"]
 companion_roots = ["/monitored/companion"]
 exclusions = []
 

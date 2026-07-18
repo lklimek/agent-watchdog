@@ -69,7 +69,20 @@ enrichment, and termination policy. Adapter roots and
 persist in their state, in the same order. For example, map host
 `/home/example/git` to mounted `/monitored/worktrees`; the service validates
 native paths through this projection while retaining the host path for the UI
-and notifications. Keep `automation_enabled = false` while validating a new
+and notifications. The `native_claude_roots`, `native_codex_roots`, and
+`native_companion_roots` arrays likewise correspond positionally to their
+mounted adapter roots. These exact mappings let the server follow native file
+paths recorded in runtime state without mounting a home directory. A missing or
+escaping target is ignored and degrades only that adapter.
+
+Codex rollout ingestion places a durable cursor at EOF when a file is first
+discovered, then parses only bounded, complete records appended afterward. This
+avoids loading retained transcripts. Cursor replacement, truncation, oversized
+records, and schema drift never cause an implicit scan from byte zero. File
+discontinuities degrade adapter health, while incompatible records additionally
+place an actionable `UPGRADE` warning on the affected session.
+
+Keep `automation_enabled = false` while validating a new
 installation. Main sessions are excluded from automated termination regardless
 of this switch.
 
