@@ -1,6 +1,6 @@
 # Current runtime and native-state spike
 
-Status: metadata verified; isolated live exercises deferred to adapter milestones
+Status: metadata verified; isolated live exercises require dedicated credentials
 
 Date: 2026-07-17
 
@@ -66,6 +66,22 @@ priority, while native files stay version-guarded, read-only, and optional.
 Live creation of throwaway Claude, Codex, and Companion children remains an
 explicit adapter compatibility test; automated tests never inspect existing
 user sessions.
+
+## 2026-07-18 live-exercise isolation result
+
+The installed versions were rechecked as Claude Code 2.1.214 and Codex CLI
+0.144.5; the inspected Companion manifest remains 1.0.6. No existing runtime
+session or transcript was opened.
+
+The current Codex CLI offers `--ephemeral`, but that mode deliberately writes no
+session files and therefore cannot verify automatic disk discovery. Its
+`--ignore-user-config` option still uses the runtime state root for
+authentication. No dedicated throwaway credentials/runtime account were
+provided for Codex, Claude, or Companion, and borrowing the operator's existing
+state would violate the live-test isolation rule. The live matrix is therefore
+recorded as **not run**, not passed. It may run only in a disposable runtime
+account/container with dedicated credentials and dedicated native roots; absence
+of that environment must never be worked around by reading real user state.
 
 ## Primary sources
 

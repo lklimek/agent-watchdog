@@ -99,6 +99,65 @@ completed together in 5.67 seconds on the reference host. This gate exercises
 restart idempotency and durable lane reconstruction; interruption at every
 termination-saga stage remains a separate safety test.
 
+## Production container steady-state and burst gates
+
+The current production image was exercised on 2026-07-18 with the complete
+Axum/SQLite/discovery/process-monitor service, not the bare capacity probe:
+
+- source implementation commit: `ec3258a` (with documentation checkpoint
+  `96c4e89`);
+- image: `agent-watchdog:perf`, image ID
+  `sha256:079446c29393d8c1ae43ff0b7a10591ff7bafd6c0b0b8217d7d23344741a7dcf`;
+- host: Linux 7.0.0-27-generic x86_64;
+- isolated synthetic roots only; no user runtime state was mounted;
+- read-only root filesystem, non-root UID/GID, all capabilities dropped,
+  `no-new-privileges`, host PID namespace, and a 512-PID limit;
+- 50 main sessions and 450 correlated children, populated through the
+  authenticated production Claude hook endpoint.
+
+The representative terminal-lifecycle burst sent 450 `SubagentStop` and 50
+`SessionEnd` events with 32 concurrent HTTP workers. Each duration covers the
+complete authenticated HTTP request and durable ingestion response:
+
+| Burst measurement | Result |
+|---|---:|
+| Events accepted | 500 / 500 (HTTP 204) |
+| Total wall time | 425.025 ms |
+| Request latency p50 / p95 / p99 | 19.996 / 50.362 / 65.732 ms |
+| Maximum request latency | 168.636 ms |
+| Post-burst authenticated health | HTTP 200, ready, 25.519 ms |
+| Post-burst 50-card/450-child dashboard API | HTTP 200, 22.698 ms |
+
+An additional semantically identical 500-event pass used distinct fixture IDs
+while continuously requesting the authenticated rendered `/ui` endpoint. All
+500 events returned HTTP 204 with 45.732 ms p99 latency; all 21 concurrent UI
+requests returned HTTP 200 with 49.480 ms p99/maximum latency. This directly
+checks the rendered UI responsiveness portion of the gate rather than relying
+only on its JSON read model.
+
+After the burst left all 500 sessions terminal, `docker stats` sampled the
+whole container for exactly 600 wall-clock seconds. The first reading was
+discarded; 2,400 subsequent readings contributed to the average. CPU values
+use Docker's two-decimal percentage precision, so `0.000%` below means every
+reported sample was below the display threshold rather than claiming literally
+zero instructions executed.
+
+| Steady-state measurement | Result | Gate |
+|---|---:|---:|
+| Elapsed time | 600 s | 600 s |
+| Samples | 2,400 | — |
+| Average CPU | 0.000% of one core (reported) | < 10% |
+| Maximum sampled CPU | 0.000% (reported) | — |
+| Maximum sampled container memory | 30.050 MiB | < 256 MiB RSS |
+| Final authenticated health | HTTP 200, ready, 27.951 ms | responsive |
+| Final 50-card dashboard API | HTTP 200, 28.410 ms | responsive |
+
+Five-minute runtime reconciliations ran during the window with no warnings or
+errors. Container memory is a conservative cgroup-wide measurement that includes
+the service RSS and container overhead. Exact commands, security settings, raw
+figures, and interpretation are preserved in
+`/data/artifacts/agent-watchdog/2026-07-18/qa/container-capacity.md`.
+
 ## Slow-consumer gate
 
 The dashboard suite fills the bounded SSE broadcast channel and verifies that a

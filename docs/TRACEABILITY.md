@@ -97,7 +97,7 @@ not accepted deferrals.
 | FR-OPS-001 | T-OPS-001–003 | Hardened multi-stage image, Traefik-only Compose, non-root/read-only context | Automated contract and live Compose evidence |
 | FR-OPS-002 | T-OPS-001 | Exact read-only mounts, host PID namespace, no Docker socket/home/root mount | Automated contract |
 | FR-OPS-003 | T-OPS-008 | 50-main/500-session production-service load and restart test | Explicit load target passed |
-| FR-OPS-004 | T-EVD-006 | Event-driven workers, bounded queues/scans/records, degradation health | Automated; ten-minute CPU and burst p99 pending |
+| FR-OPS-004 | T-EVD-006 | Event-driven workers, bounded queues/scans/records, degradation health; isolated 500-session container gate | Automated; ten-minute CPU averaged 0.000% at Docker precision and burst p99 was 65.732 ms |
 | FR-OPS-005 | T-OPS-004, T-OPS-005 | Component health registry, isolated adapter degradation, critical readiness failure | Automated |
 | FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests | Automated; final log inspection pending |
 | FR-OPS-007 | T-OPS-007 | Health/log interface only; no metrics route or exporter | Automated route/Compose inspection |
@@ -129,7 +129,7 @@ not accepted deferrals.
 |---|---|---|
 | T-LOAD-001, T-LOAD-005 | 50 mains/500 total sessions and ten reopen/reconcile cycles in `server/tests/load.rs` | Passed explicit release target; termination-stage restart coverage remains in `server/tests/termination.rs` |
 | T-LOAD-002 | Huge sparse transcript incremental-read test | Automated |
-| T-LOAD-003 | Watcher saturation tests and a 12,000-file live Compose burst | Passed; representative burst p99 still pending |
+| T-LOAD-003 | Watcher saturation tests, a 12,000-file live Compose burst, and 500-event production-hook burst | Passed; hook burst p99 65.732 ms and service remained ready |
 | T-LOAD-004 | Lagging SSE, durable inbox, and hanging one-attempt webhook tests | Automated |
 | T-LIVE-CLAUDE-001/002 | No real user state may be inspected | **Pending isolated live QA** |
 | T-LIVE-CODEX-001/002 | No real user state may be inspected | **Pending isolated live QA** |
@@ -137,6 +137,6 @@ not accepted deferrals.
 
 ## Open closure work
 
-1. Complete the isolated live-runtime matrix, ten-minute steady-state CPU,
-   representative burst p99, dependency/security gates, final browser rerun,
+1. Complete the isolated live-runtime matrix if a dedicated credentialed runtime
+   environment is available, dependency/security gates, final browser rerun,
    deferred knowledge-transfer audit, and final macOS build-only check.
