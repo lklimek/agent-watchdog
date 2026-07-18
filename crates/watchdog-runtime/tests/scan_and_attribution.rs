@@ -33,6 +33,47 @@ fn directory_scan_stops_at_the_entry_budget() {
 }
 
 #[test]
+fn directory_scan_returns_regular_files_without_following_symlinks() {
+    let root = tempfile::tempdir().expect("temporary root should exist");
+    fs::create_dir(root.path().join("project")).expect("project directory should exist");
+    fs::write(root.path().join("project/session.jsonl"), b"{}\n")
+        .expect("fixture transcript should exist");
+    std::os::unix::fs::symlink(
+        root.path().join("project/session.jsonl"),
+        root.path().join("project/alias.jsonl"),
+    )
+    .expect("fixture symlink should exist");
+    let capability = CapabilityRoot::new(root.path()).expect("root should be accepted");
+    let scanner =
+        DirectoryScanner::new(ScanBudget::new(4, 8, 1_024).expect("scan budget should be valid"));
+
+    let result = scanner
+        .scan(&capability, Path::new(""))
+        .expect("bounded scan should complete");
+
+    assert_eq!(result.files().len(), 1);
+    assert!(result.files()[0].ends_with("project/session.jsonl"));
+}
+
+#[test]
+fn exact_entry_budget_can_finish_empty_child_directories() {
+    let root = tempfile::tempdir().expect("temporary root should exist");
+    for name in ["a", "b"] {
+        fs::create_dir(root.path().join(name)).expect("fixture directory should exist");
+    }
+    let capability = CapabilityRoot::new(root.path()).expect("root should be accepted");
+    let scanner =
+        DirectoryScanner::new(ScanBudget::new(4, 2, 1_024).expect("scan budget should be valid"));
+
+    let result = scanner
+        .scan(&capability, Path::new(""))
+        .expect("exact bounded scan should complete");
+
+    assert_eq!(result.directories().len(), 2);
+    assert_eq!(result.uncertainty(), None);
+}
+
+#[test]
 fn one_owner_receives_any_worktree_change() {
     let root = tempfile::tempdir().expect("temporary worktree should exist");
     let owner = child("one");

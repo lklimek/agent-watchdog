@@ -94,6 +94,8 @@ impl DirectoryScanner {
         let started = Instant::now();
         let mut queue = VecDeque::from([(relative.to_path_buf(), 0_usize)]);
         let mut directories = Vec::new();
+        let mut files = Vec::new();
+        let mut entry_count = 0_usize;
         let mut path_bytes = 0_usize;
         let mut uncertainty = None;
 
@@ -107,25 +109,32 @@ impl DirectoryScanner {
                 continue;
             };
             let fd_path = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
-            let Ok(entries) = fs::read_dir(fd_path) else {
+            let Ok(mut entries) = fs::read_dir(fd_path) else {
                 uncertainty.get_or_insert(ScanUncertainty::PathRace);
                 continue;
             };
-            let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+            let remaining = self.budget.max_entries.saturating_sub(entry_count);
+            if remaining == 0 {
+                if entries.next().is_some() {
+                    uncertainty.get_or_insert(ScanUncertainty::EntryBudget);
+                    break;
+                }
+                continue;
+            }
+            let mut entries = entries
+                .filter_map(Result::ok)
+                .take(remaining.saturating_add(1))
+                .collect::<Vec<_>>();
+            let entry_budget_exhausted = entries.len() > remaining;
+            entries.truncate(remaining);
             entries.sort_by_key(fs::DirEntry::file_name);
             for entry in entries {
-                if directories.len() >= self.budget.max_entries {
-                    uncertainty.get_or_insert(ScanUncertainty::EntryBudget);
-                    return Ok(ScanResult {
-                        directories,
-                        uncertainty,
-                    });
-                }
+                entry_count = entry_count.saturating_add(1);
                 let Ok(file_type) = entry.file_type() else {
                     uncertainty.get_or_insert(ScanUncertainty::PathRace);
                     continue;
                 };
-                if !file_type.is_dir() || file_type.is_symlink() {
+                if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
                     continue;
                 }
                 let child = directory.join(entry.file_name());
@@ -134,20 +143,30 @@ impl DirectoryScanner {
                     uncertainty.get_or_insert(ScanUncertainty::PathByteBudget);
                     return Ok(ScanResult {
                         directories,
+                        files,
                         uncertainty,
                     });
                 }
                 path_bytes = path_bytes.saturating_add(child_bytes);
-                directories.push(root.absolute(&child));
-                if depth.saturating_add(1) < self.budget.max_depth {
-                    queue.push_back((child, depth.saturating_add(1)));
+                if file_type.is_file() {
+                    files.push(root.absolute(&child));
                 } else {
-                    uncertainty.get_or_insert(ScanUncertainty::DepthBudget);
+                    directories.push(root.absolute(&child));
+                    if depth.saturating_add(1) < self.budget.max_depth {
+                        queue.push_back((child, depth.saturating_add(1)));
+                    } else {
+                        uncertainty.get_or_insert(ScanUncertainty::DepthBudget);
+                    }
                 }
+            }
+            if entry_budget_exhausted {
+                uncertainty.get_or_insert(ScanUncertainty::EntryBudget);
+                break;
             }
         }
         Ok(ScanResult {
             directories,
+            files,
             uncertainty,
         })
     }
@@ -157,6 +176,7 @@ impl DirectoryScanner {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ScanResult {
     directories: Vec<PathBuf>,
+    files: Vec<PathBuf>,
     uncertainty: Option<ScanUncertainty>,
 }
 
@@ -165,6 +185,7 @@ impl std::fmt::Debug for ScanResult {
         formatter
             .debug_struct("ScanResult")
             .field("directory_count", &self.directories.len())
+            .field("file_count", &self.files.len())
             .field("uncertainty", &self.uncertainty)
             .finish()
     }
@@ -175,6 +196,12 @@ impl ScanResult {
     #[must_use]
     pub fn directories(&self) -> &[PathBuf] {
         &self.directories
+    }
+
+    /// Concrete in-root regular files discovered under the budget.
+    #[must_use]
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
     }
 
     /// First condition requiring another bounded reconciliation pass.
