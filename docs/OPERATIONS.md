@@ -63,10 +63,15 @@ subnet is known. The allowlist uses the connection source address observed by
 Traefik; it does not trust client-supplied forwarded headers.
 
 The mounted TOML controls adapter roots, exclusions, thresholds, GitHub
-enrichment, and termination policy. Its paths are container paths from the
-tracked example, not host paths. Keep `automation_enabled = false` while
-validating a new installation. Main sessions are excluded from automated
-termination regardless of this switch.
+enrichment, and termination policy. Adapter roots and
+`allowed_worktree_roots` are container paths from the tracked example.
+`native_worktree_roots` contains the corresponding host prefixes that runtimes
+persist in their state, in the same order. For example, map host
+`/home/example/git` to mounted `/monitored/worktrees`; the service validates
+native paths through this projection while retaining the host path for the UI
+and notifications. Keep `automation_enabled = false` while validating a new
+installation. Main sessions are excluded from automated termination regardless
+of this switch.
 
 ## Validate and start
 

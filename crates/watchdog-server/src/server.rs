@@ -24,10 +24,10 @@ use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
 
 use crate::config::{ConfigManager, RuntimeConfig};
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscoveryReport, ClaudeTeamDiscovery,
+    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CompanionDiscovery,
     DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService, HumanNotifier,
-    NotificationEndpoints, SystemClock, TerminationConfig, WebhookEndpoint, dashboard_router,
-    health_router, mcp_router,
+    NotificationEndpoints, RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint,
+    dashboard_router, health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
@@ -181,9 +181,9 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         .merge(mcp_router(api.clone(), bootstrap.bearer_auth.clone()));
 
     let (reconcile_tx, reconcile_rx) = mpsc::channel(1);
-    let discovery_worker = spawn_discovery_worker(
+    let discovery_worker = start_discovery(
         config.clone(),
-        ClaudeTeamDiscovery::new(api.clone()),
+        api.clone(),
         store.clone(),
         Arc::clone(&clock),
         health.clone(),
@@ -221,9 +221,29 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     result
 }
 
+fn start_discovery(
+    config: ConfigManager,
+    api: AgentApi,
+    store: WatchdogStore,
+    clock: Arc<SystemClock>,
+    health: HealthService,
+    requested: mpsc::Receiver<()>,
+) -> JoinHandle<()> {
+    spawn_discovery_worker(
+        config,
+        ClaudeTeamDiscovery::new(api.clone()),
+        CompanionDiscovery::new(api, clock.clone()),
+        store,
+        clock,
+        health,
+        requested,
+    )
+}
+
 fn spawn_discovery_worker(
     config: ConfigManager,
     claude: ClaudeTeamDiscovery,
+    companion: CompanionDiscovery,
     store: WatchdogStore,
     clock: Arc<SystemClock>,
     health: HealthService,
@@ -242,42 +262,58 @@ fn spawn_discovery_worker(
                 }
             }
             let current = config.current();
-            if !current.adapters().claude() {
-                continue;
-            }
-            let report = claude
-                .reconcile(current.claude_roots(), current.allowed_worktree_roots())
+            if current.adapters().claude() {
+                let report = claude
+                    .reconcile(current.claude_roots(), current.worktree_mappings())
+                    .await;
+                record_discovery_health(
+                    &store,
+                    &clock,
+                    &health,
+                    RuntimeKind::ClaudeCode,
+                    watchdog_claude::TESTED_CLAUDE_VERSION,
+                    report,
+                )
                 .await;
-            record_claude_discovery_health(&store, &clock, &health, report).await;
+            }
+            if current.adapters().companion() {
+                let report = companion
+                    .reconcile(current.companion_roots(), current.worktree_mappings())
+                    .await;
+                record_discovery_health(
+                    &store,
+                    &clock,
+                    &health,
+                    RuntimeKind::CodexCompanion,
+                    watchdog_companion::TESTED_COMPANION_VERSION,
+                    report,
+                )
+                .await;
+            }
         }
     })
 }
 
-async fn record_claude_discovery_health(
+async fn record_discovery_health(
     store: &WatchdogStore,
     clock: &SystemClock,
     health: &HealthService,
-    report: ClaudeDiscoveryReport,
+    runtime: RuntimeKind,
+    tested_version: &'static str,
+    report: RuntimeDiscoveryReport,
 ) {
     let now = clock.now().wall_time();
     let (status, component, message) = if report.is_degraded() {
         (
             AdapterHealthStatus::Degraded,
             ComponentStatus::Degraded,
-            Some("Some Claude team records could not be reconciled safely"),
+            Some("Some runtime records could not be reconciled safely"),
         )
     } else {
         (AdapterHealthStatus::Healthy, ComponentStatus::Healthy, None)
     };
-    health.record(
-        ComponentId::Adapter(RuntimeKind::ClaudeCode),
-        component,
-        message,
-    );
-    let Ok(adapter) = AdapterIdentity::new(
-        RuntimeKind::ClaudeCode,
-        watchdog_claude::TESTED_CLAUDE_VERSION,
-    ) else {
+    health.record(ComponentId::Adapter(runtime), component, message);
+    let Ok(adapter) = AdapterIdentity::new(runtime, tested_version) else {
         return;
     };
     let record = AdapterHealthRecord {
@@ -286,7 +322,7 @@ async fn record_claude_discovery_health(
         last_success: Some(now),
         last_error: report.is_degraded().then_some(now),
         affected_scope: if report.is_degraded() {
-            BoundedText::new("affected_scope", "configured Claude roots").ok()
+            BoundedText::new("affected_scope", "configured runtime roots").ok()
         } else {
             None
         },
@@ -295,19 +331,19 @@ async fn record_claude_discovery_health(
     };
     if store.save_adapter_health(&record).await.is_err() {
         health.record(
-            ComponentId::Adapter(RuntimeKind::ClaudeCode),
+            ComponentId::Adapter(runtime),
             ComponentStatus::Degraded,
-            Some("Claude discovery health could not be persisted"),
+            Some("Runtime discovery health could not be persisted"),
         );
         tracing::warn!(
             event = "adapter.health_persist_failed",
-            runtime = RuntimeKind::ClaudeCode.as_str(),
+            runtime = runtime.as_str(),
             "Adapter health persistence failed"
         );
     } else {
         tracing::info!(
             event = "adapter.reconciled",
-            runtime = RuntimeKind::ClaudeCode.as_str(),
+            runtime = runtime.as_str(),
             main_sessions = report.main_sessions(),
             child_sessions = report.child_sessions(),
             warnings = report.warning_count(),

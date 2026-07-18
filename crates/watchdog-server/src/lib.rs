@@ -28,7 +28,10 @@ pub use dashboard::{
     DashboardScope, DashboardService, DashboardSnapshot, DashboardSort, DashboardWarning,
     dashboard_router,
 };
-pub use discovery::{ClaudeDiscoveryReport, ClaudeTeamDiscovery};
+pub use discovery::{
+    ClaudeDiscoveryReport, ClaudeTeamDiscovery, CompanionDiscovery, CompanionDiscoveryReport,
+    PathMappingError, RuntimeDiscoveryReport, WorktreePathMapping,
+};
 pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};
 pub use mcp::{WatchdogMcpService, WatchdogSessionManager, mcp_router};

@@ -11,6 +11,8 @@ use watchdog_domain::{
     BoundedText, DeadlinePolicy, DurationMs, PolicyError, ReducerPolicy, ReducerPolicyError,
 };
 
+use crate::{PathMappingError, WorktreePathMapping};
+
 const MAX_CONFIG_BYTES: u64 = 1_024 * 1_024;
 const MAX_RELOAD_ERROR_BYTES: usize = 1_024;
 
@@ -38,6 +40,7 @@ impl AdapterConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeConfig {
     allowed_worktree_roots: Vec<PathBuf>,
+    worktree_mappings: Vec<WorktreePathMapping>,
     claude_roots: Vec<PathBuf>,
     codex_roots: Vec<PathBuf>,
     companion_roots: Vec<PathBuf>,
@@ -55,6 +58,10 @@ pub(crate) struct RuntimeConfig {
 impl RuntimeConfig {
     pub(crate) fn allowed_worktree_roots(&self) -> &[PathBuf] {
         &self.allowed_worktree_roots
+    }
+
+    pub(crate) fn worktree_mappings(&self) -> &[WorktreePathMapping] {
+        &self.worktree_mappings
     }
 
     pub(crate) fn claude_roots(&self) -> &[PathBuf] {
@@ -209,7 +216,16 @@ struct RawConfig {
 
 impl RawConfig {
     fn validate(self) -> Result<RuntimeConfig, ConfigError> {
-        let allowed_worktree_roots = canonical_directories(self.paths.allowed_worktree_roots)?;
+        let worktree_mappings = worktree_mappings(
+            self.paths.native_worktree_roots,
+            self.paths.allowed_worktree_roots,
+        )?;
+        let mut allowed_worktree_roots = worktree_mappings
+            .iter()
+            .map(|mapping| mapping.mounted_root().to_owned())
+            .collect::<Vec<_>>();
+        allowed_worktree_roots.sort_unstable();
+        allowed_worktree_roots.dedup();
         if allowed_worktree_roots.is_empty() {
             return Err(ConfigError::MissingWorktreeRoot);
         }
@@ -247,6 +263,7 @@ impl RawConfig {
 
         Ok(RuntimeConfig {
             allowed_worktree_roots,
+            worktree_mappings,
             claude_roots,
             codex_roots,
             companion_roots,
@@ -271,6 +288,8 @@ impl RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawPaths {
     allowed_worktree_roots: Vec<PathBuf>,
+    #[serde(default)]
+    native_worktree_roots: Vec<PathBuf>,
     #[serde(default)]
     claude_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -373,6 +392,38 @@ fn canonical_directories(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, ConfigErro
     Ok(canonical)
 }
 
+fn worktree_mappings(
+    native_roots: Vec<PathBuf>,
+    mounted_roots: Vec<PathBuf>,
+) -> Result<Vec<WorktreePathMapping>, ConfigError> {
+    if mounted_roots.is_empty() {
+        return Err(ConfigError::MissingWorktreeRoot);
+    }
+    if mounted_roots.iter().any(|root| root == Path::new("/")) {
+        return Err(ConfigError::OverbroadDirectory);
+    }
+    let native_roots = if native_roots.is_empty() {
+        mounted_roots.clone()
+    } else {
+        native_roots
+    };
+    if native_roots.len() != mounted_roots.len() {
+        return Err(ConfigError::WorktreeMappingCount);
+    }
+    let mut mappings = native_roots
+        .into_iter()
+        .zip(mounted_roots)
+        .map(|(native, mounted)| WorktreePathMapping::new(native, mounted).map_err(Into::into))
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    mappings.sort_unstable_by(|left, right| {
+        left.native_root()
+            .cmp(right.native_root())
+            .then_with(|| left.mounted_root().cmp(right.mounted_root()))
+    });
+    mappings.dedup();
+    Ok(mappings)
+}
+
 fn seconds(value: u64) -> Result<DurationMs, ConfigError> {
     value
         .checked_mul(1_000)
@@ -392,6 +443,8 @@ pub(crate) enum ConfigError {
     InvalidToml,
     #[error("At least one allowed worktree root is required")]
     MissingWorktreeRoot,
+    #[error("Native and mounted worktree root counts must match")]
+    WorktreeMappingCount,
     #[error("Every enabled runtime adapter requires at least one state root")]
     MissingRuntimeRoot,
     #[error("Configured path is absent or not a directory")]
@@ -402,6 +455,8 @@ pub(crate) enum ConfigError {
     ExclusionOutsideRoots,
     #[error("Configured duration is too large")]
     DurationOverflow,
+    #[error(transparent)]
+    PathMapping(#[from] PathMappingError),
     #[error(transparent)]
     ReducerPolicy(#[from] ReducerPolicyError),
     #[error(transparent)]
@@ -427,6 +482,14 @@ mod tests {
         assert_eq!(
             config.allowed_worktree_roots(),
             [fixture.worktrees.as_path()]
+        );
+        assert_eq!(
+            config.worktree_mappings()[0].native_root(),
+            std::path::Path::new("/host/repositories")
+        );
+        assert_eq!(
+            config.worktree_mappings()[0].mounted_root(),
+            fixture.worktrees
         );
         assert_eq!(config.claude_roots(), [fixture.claude.as_path()]);
         assert!(config.adapters().claude());
@@ -525,9 +588,10 @@ mod tests {
 
         fn valid_toml(&self) -> String {
             format!(
-                r"
+                r#"
 [paths]
 allowed_worktree_roots = [{worktrees}]
+native_worktree_roots = ["/host/repositories"]
 claude_roots = [{claude}]
 codex_roots = [{codex}]
 companion_roots = [{companion}]
@@ -552,7 +616,7 @@ enabled = true
 [termination]
 automation_enabled = true
 sigkill_enabled = true
-",
+"#,
                 worktrees = toml_string(&self.worktrees),
                 claude = toml_string(&self.claude),
                 codex = toml_string(&self.codex),

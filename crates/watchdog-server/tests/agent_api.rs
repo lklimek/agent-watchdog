@@ -2,7 +2,11 @@
 
 use std::sync::Arc;
 
-use watchdog_domain::{DurationMs, RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs};
+use watchdog_domain::{
+    AdapterIdentity, Clock, DetailedState, DurationMs, EvidenceTrust, NativeSessionKey,
+    ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource, RuntimeKind,
+    SessionId, SessionKind, TimePoint, WallTimeMs,
+};
 use watchdog_server::{
     AgentApi, AgentApiError, CompletionOutcome, DiscoveredSession, RegisterSession, TransportKey,
 };
@@ -231,6 +235,85 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
             .len(),
         2
     );
+}
+
+#[tokio::test]
+async fn native_observation_ingestion_preserves_provenance_and_retry_idempotency() {
+    let (api, store, clock) = api_fixture().await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "native-job")
+        .expect("native identity should be valid");
+    api.discover_session(DiscoveredSession {
+        runtime: native.runtime(),
+        native_id: native.native_id().to_owned(),
+        kind: SessionKind::Main,
+        parent: None,
+        event_key: "companion:discover:native-job".to_owned(),
+        title: Some("Native job".to_owned()),
+        startup_directory: Some("/work/repository".to_owned()),
+    })
+    .await
+    .expect("session should be discovered before evidence arrives");
+
+    let observation_id =
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "state", "native-job:running")
+            .expect("observation identity should be valid");
+    let observation = native_state_observation(
+        &native,
+        observation_id,
+        clock.now(),
+        DetailedState::WaitingForTool,
+    );
+    let applied = api
+        .ingest_native_observation(observation)
+        .await
+        .expect("native evidence should apply");
+    assert_eq!(applied.snapshot.state(), DetailedState::WaitingForTool);
+
+    clock.advance(DurationMs::new(1_000));
+    let restarted = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should restart");
+    let duplicate = restarted
+        .ingest_native_observation(native_state_observation(
+            &native,
+            observation_id,
+            clock.now(),
+            DetailedState::WaitingForTool,
+        ))
+        .await
+        .expect("same native event should remain idempotent after restart");
+    assert_eq!(duplicate.snapshot.revision(), applied.snapshot.revision());
+
+    let stored = store
+        .observation(observation_id)
+        .await
+        .expect("observation query should succeed")
+        .expect("native observation should be durable");
+    assert_eq!(stored.source().adapter().version(), "1.0.6");
+    assert_eq!(stored.source().trust(), EvidenceTrust::Authoritative);
+}
+
+fn native_state_observation(
+    native: &NativeSessionKey,
+    id: ObservationId,
+    observed_at: TimePoint,
+    state: DetailedState,
+) -> ObservationEnvelope {
+    ObservationEnvelope::new(
+        id,
+        native.clone(),
+        observed_at,
+        ObservationSource::new(
+            AdapterIdentity::new(RuntimeKind::CodexCompanion, "1.0.6")
+                .expect("adapter should be valid"),
+            "state:summary",
+            EvidenceTrust::Authoritative,
+            None,
+        )
+        .expect("source should be valid"),
+        ObservationPayload::NativeState(state),
+    )
+    .expect("observation should be valid")
 }
 
 #[tokio::test]
