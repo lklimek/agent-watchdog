@@ -300,7 +300,10 @@ not a schema or reducer redesign.
 
 The watch service uses the `notify` Linux inotify backend. It watches only
 capability roots constructed from concrete read-only mounts and configured
-allowlisted prefixes.
+allowlisted prefixes. Existing directories receive non-recursive watches under
+the global cap. A directory create/remove/rename event triggers one bounded
+registry rebuild so newly created session directories become observable;
+ordinary file appends only schedule targeted reconciliation.
 
 Each file cursor records device/inode identity, byte offset, last complete record
 boundary, parser version, and last observation ID. Appends read from the saved
@@ -314,9 +317,12 @@ Periodic low-frequency reconciliation catches missed events; it is scoped to
 known runtime roots and active sessions, never a full home-directory crawl.
 
 Worktree changes refresh a child only when ownership is unambiguous. With one
-child on a worktree, any in-root change is attributable. With multiple children,
-the system requires process/file-descriptor or native-operation evidence. If it
-cannot attribute the change, no child's clock is refreshed.
+child on a worktree, any in-root change is attributable, including changes in
+nested directories. The most-specific registered worktree prefix wins. With
+multiple children, the system requires process/file-descriptor or
+native-operation evidence. If it cannot attribute the change, no child's clock
+is refreshed. One coalesced inotify batch emits at most one progress observation
+per child and never exposes the changed path in logs or stored evidence.
 
 ## 9. Process evidence and CPU activity
 

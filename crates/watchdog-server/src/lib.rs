@@ -6,6 +6,7 @@ mod clock;
 mod config;
 mod dashboard;
 mod discovery;
+mod filesystem_activity;
 mod github;
 mod health;
 mod mcp;
@@ -35,6 +36,9 @@ pub use discovery::{
     ClaudeDiscoveryReport, ClaudeTeamDiscovery, CodexDiscovery, CodexDiscoveryReport,
     CompanionDiscovery, CompanionDiscoveryReport, PathMappingError, RuntimeDiscoveryReport,
     WorktreePathMapping,
+};
+pub use filesystem_activity::{
+    FilesystemActivityError, FilesystemActivityReconciler, FilesystemActivityReport,
 };
 pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};

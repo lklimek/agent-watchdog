@@ -165,6 +165,9 @@ impl WatchService {
 pub enum WatchSignal {
     /// Adapter target IDs affected by one or more coalesced paths.
     Targets(Vec<WatchTargetId>),
+    /// A directory was created, removed, or renamed; bounded watch discovery
+    /// must run again after reconciling the affected targets.
+    TopologyChanged(Vec<WatchTargetId>),
     /// Watch coverage is uncertain; all active targets need bounded reconciliation.
     ReconcileAll(WatchUncertainty),
 }
@@ -237,7 +240,18 @@ fn handle_event(
     if affected.is_empty() {
         return;
     }
-    match sender.try_send(WatchSignal::Targets(affected.into_iter().collect())) {
+    let affected = affected.into_iter().collect();
+    let signal = if matches!(
+        event.kind,
+        EventKind::Create(notify::event::CreateKind::Folder)
+            | EventKind::Remove(notify::event::RemoveKind::Folder)
+            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    ) {
+        WatchSignal::TopologyChanged(affected)
+    } else {
+        WatchSignal::Targets(affected)
+    };
+    match sender.try_send(signal) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => queue_saturated.store(true, Ordering::Release),
         Err(TrySendError::Disconnected(_)) => backend_degraded.store(true, Ordering::Release),
@@ -267,10 +281,10 @@ mod tests {
 
     use notify::{
         Event, EventKind,
-        event::{AccessKind, Flag},
+        event::{AccessKind, CreateKind, Flag},
     };
 
-    use super::{TargetMap, WatchTargetId, handle_event};
+    use super::{TargetMap, WatchSignal, WatchTargetId, handle_event};
 
     #[test]
     fn kernel_rescan_flag_bypasses_the_bounded_event_queue() {
@@ -319,5 +333,31 @@ mod tests {
         assert!(!queue_saturated.load(Ordering::Acquire));
         assert!(!backend_degraded.load(Ordering::Acquire));
         assert!(!kernel_rescan.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn directory_creation_requests_bounded_watch_rediscovery() {
+        let path = PathBuf::from("/watched/new-session");
+        let parent = PathBuf::from("/watched");
+        let target = WatchTargetId::new(1).expect("fixture target should be valid");
+        let targets: TargetMap = Arc::new(RwLock::new(BTreeMap::from([(
+            parent,
+            BTreeSet::from([target]),
+        )])));
+        let (sender, receiver) = sync_channel(1);
+
+        handle_event(
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(path),
+            &targets,
+            &sender,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(
+            receiver.recv().expect("topology signal should be queued"),
+            WatchSignal::TopologyChanged(vec![target])
+        );
     }
 }
