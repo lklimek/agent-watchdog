@@ -310,6 +310,21 @@ parsing. The adapter opens native SQLite read-only and tolerates absent WAL/SHM;
 failure falls back to JSONL/process evidence and adds `UPGRADE` when the format is
 unrecognized. It never migrates, locks for writing, or repairs Codex state.
 
+Optional official lifecycle hooks post to `/hooks/codex` through the
+trusted-source Traefik route and application Bearer authentication. The endpoint
+accepts at most 64 KiB, derives an idempotency key from the request bytes, and
+retains only typed session/subagent lifecycle evidence. Hook paths remain
+untrusted until independently capability-validated, and prompt/result fields are
+discarded.
+
+App-server remains parser-ready for deployments where the operator explicitly
+runs Codex through a shared app-server transport. It is not a v1 automatic
+discovery dependency: the current WebSocket transport is experimental, and an
+independent app-server process is not a passive observer of unrelated local CLI
+processes. Automatic discovery therefore continues to use bounded local state,
+rollout metadata, and process evidence without requiring users to change how
+they launch Codex.
+
 SQLite bootstrap selects only unarchived threads with native recency in the
 preceding 24 hours, under a 1,000-row cap, then preserves exact spawn edges.
 This is deliberately a bounded false-positive-tolerant heuristic, not a claim

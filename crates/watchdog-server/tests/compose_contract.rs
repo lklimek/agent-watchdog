@@ -78,6 +78,8 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
     .expect("read Traefik routing policy");
     assert!(dynamic.contains("watchdog-claude-hooks:"));
     assert!(dynamic.contains("rule: Path(`/hooks/claude`)"));
+    assert!(dynamic.contains("watchdog-codex-hooks:"));
+    assert!(dynamic.contains("rule: Path(`/hooks/codex`)"));
     let hook_route = dynamic
         .split("watchdog-claude-hooks:")
         .nth(1)
@@ -87,6 +89,15 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
         .expect("web route should follow hook route");
     assert!(hook_route.contains("watchdog-trusted"));
     assert!(!hook_route.contains("watchdog-basic-auth"));
+    let codex_hook_route = dynamic
+        .split("watchdog-codex-hooks:")
+        .nth(1)
+        .expect("Codex hook route should exist")
+        .split("watchdog-web:")
+        .next()
+        .expect("web route should follow Codex hook route");
+    assert!(codex_hook_route.contains("watchdog-trusted"));
+    assert!(!codex_hook_route.contains("watchdog-basic-auth"));
 }
 
 fn service_block<'a>(compose: &'a str, service: &str, next: &str) -> &'a str {
