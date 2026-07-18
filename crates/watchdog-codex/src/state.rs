@@ -6,10 +6,12 @@ use std::{
 
 use sqlx::{
     Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
 };
 use thiserror::Error;
-use watchdog_domain::{BoundedText, DomainInputError, NativeSessionKey, RuntimeKind, SessionKind};
+use watchdog_domain::{
+    BoundedText, DomainInputError, NativeSessionKey, RuntimeKind, SessionKind, WallTimeMs,
+};
 
 const MAX_THREADS: u32 = 1_000;
 
@@ -46,12 +48,10 @@ impl CodexStateReader {
     /// Returns [`CodexStateError`] for invalid limits, schema drift, corrupt
     /// bounded fields, or read failure.
     pub async fn discover_threads(&self, limit: u32) -> Result<Vec<CodexThread>, CodexStateError> {
-        if limit == 0 || limit > MAX_THREADS {
-            return Err(CodexStateError::InvalidLimit);
-        }
+        validate_limit(limit)?;
         let rows = sqlx::query(
             "SELECT t.id, t.rollout_path, t.cwd, t.title, t.archived, t.cli_version, \
-                    t.agent_nickname, t.agent_role, e.parent_thread_id \
+                    t.agent_nickname, t.agent_role, t.recency_at_ms, e.parent_thread_id \
              FROM threads AS t \
              LEFT JOIN thread_spawn_edges AS e ON e.child_thread_id = t.id \
              ORDER BY t.recency_at_ms DESC, t.id DESC LIMIT ?",
@@ -60,53 +60,39 @@ impl CodexStateReader {
         .fetch_all(&self.pool)
         .await
         .map_err(|_| CodexStateError::Schema)?;
-        rows.into_iter()
-            .map(|row| {
-                let id: String = row.try_get("id").map_err(|_| CodexStateError::Schema)?;
-                let parent = row
-                    .try_get::<Option<String>, _>("parent_thread_id")
-                    .map_err(|_| CodexStateError::Schema)?
-                    .as_deref()
-                    .map(native_key)
-                    .transpose()?;
-                Ok(CodexThread {
-                    subject: native_key(&id)?,
-                    parent,
-                    cwd: PathBuf::from(
-                        row.try_get::<String, _>("cwd")
-                            .map_err(|_| CodexStateError::Schema)?,
-                    ),
-                    rollout_path: PathBuf::from(
-                        row.try_get::<String, _>("rollout_path")
-                            .map_err(|_| CodexStateError::Schema)?,
-                    ),
-                    title: BoundedText::new(
-                        "thread_title",
-                        row.try_get::<String, _>("title")
-                            .map_err(|_| CodexStateError::Schema)?,
-                    )?,
-                    archived: row
-                        .try_get::<i64, _>("archived")
-                        .map_err(|_| CodexStateError::Schema)?
-                        != 0,
-                    cli_version: BoundedText::new(
-                        "cli_version",
-                        row.try_get::<String, _>("cli_version")
-                            .map_err(|_| CodexStateError::Schema)?,
-                    )?,
-                    agent_nickname: optional_text(
-                        row.try_get::<Option<String>, _>("agent_nickname")
-                            .map_err(|_| CodexStateError::Schema)?,
-                        "agent_nickname",
-                    )?,
-                    agent_role: optional_text(
-                        row.try_get::<Option<String>, _>("agent_role")
-                            .map_err(|_| CodexStateError::Schema)?,
-                        "agent_role",
-                    )?,
-                })
-            })
-            .collect()
+        decode_rows(&rows)
+    }
+
+    /// Load unarchived threads whose native recency is at or after a cutoff.
+    ///
+    /// This bounded bootstrap heuristic avoids treating all retained Codex
+    /// history as active. Exact hook/app-server/process evidence can retain or
+    /// add older sessions independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodexStateError`] for invalid limits, schema drift, corrupt
+    /// bounded fields, or read failure.
+    pub async fn discover_recent_threads(
+        &self,
+        cutoff: WallTimeMs,
+        limit: u32,
+    ) -> Result<Vec<CodexThread>, CodexStateError> {
+        validate_limit(limit)?;
+        let rows = sqlx::query(
+            "SELECT t.id, t.rollout_path, t.cwd, t.title, t.archived, t.cli_version, \
+                    t.agent_nickname, t.agent_role, t.recency_at_ms, e.parent_thread_id \
+             FROM threads AS t \
+             LEFT JOIN thread_spawn_edges AS e ON e.child_thread_id = t.id \
+             WHERE t.archived = 0 AND t.recency_at_ms >= ? \
+             ORDER BY t.recency_at_ms DESC, t.id DESC LIMIT ?",
+        )
+        .bind(cutoff.value())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| CodexStateError::Schema)?;
+        decode_rows(&rows)
     }
 }
 
@@ -121,6 +107,7 @@ pub struct CodexThread {
     cli_version: BoundedText<128>,
     agent_nickname: Option<BoundedText<256>>,
     agent_role: Option<BoundedText<256>>,
+    recency_at: WallTimeMs,
 }
 
 impl CodexThread {
@@ -187,6 +174,74 @@ impl CodexThread {
     pub fn agent_role(&self) -> Option<&str> {
         self.agent_role.as_ref().map(BoundedText::as_str)
     }
+
+    /// Native recency marker used only for bounded bootstrap selection.
+    #[must_use]
+    pub const fn recency_at(&self) -> WallTimeMs {
+        self.recency_at
+    }
+}
+
+fn validate_limit(limit: u32) -> Result<(), CodexStateError> {
+    if limit == 0 || limit > MAX_THREADS {
+        Err(CodexStateError::InvalidLimit)
+    } else {
+        Ok(())
+    }
+}
+
+fn decode_rows(rows: &[SqliteRow]) -> Result<Vec<CodexThread>, CodexStateError> {
+    rows.iter().map(decode_row).collect()
+}
+
+fn decode_row(row: &SqliteRow) -> Result<CodexThread, CodexStateError> {
+    let id: String = row.try_get("id").map_err(|_| CodexStateError::Schema)?;
+    let parent = row
+        .try_get::<Option<String>, _>("parent_thread_id")
+        .map_err(|_| CodexStateError::Schema)?
+        .as_deref()
+        .map(native_key)
+        .transpose()?;
+    Ok(CodexThread {
+        subject: native_key(&id)?,
+        parent,
+        cwd: PathBuf::from(
+            row.try_get::<String, _>("cwd")
+                .map_err(|_| CodexStateError::Schema)?,
+        ),
+        rollout_path: PathBuf::from(
+            row.try_get::<String, _>("rollout_path")
+                .map_err(|_| CodexStateError::Schema)?,
+        ),
+        title: BoundedText::new(
+            "thread_title",
+            row.try_get::<String, _>("title")
+                .map_err(|_| CodexStateError::Schema)?,
+        )?,
+        archived: row
+            .try_get::<i64, _>("archived")
+            .map_err(|_| CodexStateError::Schema)?
+            != 0,
+        cli_version: BoundedText::new(
+            "cli_version",
+            row.try_get::<String, _>("cli_version")
+                .map_err(|_| CodexStateError::Schema)?,
+        )?,
+        agent_nickname: optional_text(
+            row.try_get::<Option<String>, _>("agent_nickname")
+                .map_err(|_| CodexStateError::Schema)?,
+            "agent_nickname",
+        )?,
+        agent_role: optional_text(
+            row.try_get::<Option<String>, _>("agent_role")
+                .map_err(|_| CodexStateError::Schema)?,
+            "agent_role",
+        )?,
+        recency_at: WallTimeMs::new(
+            row.try_get::<i64, _>("recency_at_ms")
+                .map_err(|_| CodexStateError::Schema)?,
+        ),
+    })
 }
 
 impl fmt::Debug for CodexThread {

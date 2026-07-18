@@ -311,6 +311,10 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
         .execute(&pool)
         .await
         .expect("edge fixture should insert");
+    sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, archived, cli_version, recency_at_ms) VALUES ('archived-1', '/state/archived.jsonl', 1, 1, 'cli', 'openai', '/work/old', 'Archived', '{}', 'default', 1, '0.144.5', 30)")
+        .execute(&pool)
+        .await
+        .expect("archived fixture should insert");
     pool.close().await;
 
     let reader = CodexStateReader::open(&path)
@@ -321,7 +325,7 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
         .await
         .expect("current schema should parse");
 
-    assert_eq!(batch.len(), 2);
+    assert_eq!(batch.len(), 3);
     let child = batch
         .iter()
         .find(|thread| thread.subject().native_id() == "child-1")
@@ -332,4 +336,16 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
         "main-1"
     );
     assert_eq!(child.cwd().to_str(), Some("/work/wt"));
+
+    let recent = reader
+        .discover_recent_threads(WallTimeMs::new(10), 10)
+        .await
+        .expect("recent unarchived state should parse");
+    assert_eq!(recent.len(), 2);
+    assert!(recent.iter().all(|thread| !thread.archived()));
+    assert!(
+        recent
+            .iter()
+            .all(|thread| thread.recency_at().value() >= 10)
+    );
 }
