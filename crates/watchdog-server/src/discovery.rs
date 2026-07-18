@@ -375,9 +375,19 @@ impl CompanionDiscovery {
                     continue;
                 };
                 for job in snapshot.jobs() {
+                    let detail = read_companion_detail(&root, relative, &parser, job, &mut report);
+                    let Ok(reconciled) = parser.reconcile(Some(job), detail.as_ref()) else {
+                        report.warn();
+                        continue;
+                    };
+                    if reconciled.consistency()
+                        == watchdog_companion::CompanionConsistency::Conflicted
+                    {
+                        report.warn();
+                    }
                     self.reconcile_companion_job(
                         &parser,
-                        job,
+                        &reconciled,
                         worktree_mappings,
                         &mut report,
                         &mut mains,
@@ -393,13 +403,14 @@ impl CompanionDiscovery {
     async fn reconcile_companion_job(
         &self,
         parser: &watchdog_companion::CompanionParser,
-        job: &watchdog_companion::CompanionJob,
+        reconciled: &watchdog_companion::ReconciledCompanionJob,
         worktree_mappings: &[WorktreePathMapping],
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
     ) {
-        let Some(parent) = job.parent() else {
+        let reconciled_job = reconciled.job();
+        let Some(parent) = reconciled.parent() else {
             report.warn();
             return;
         };
@@ -430,20 +441,23 @@ impl CompanionDiscovery {
             report.main_sessions = report.main_sessions.saturating_add(1);
         }
 
-        let child_id = SessionId::from_native(job.subject());
-        let startup_directory =
-            validated_directory(Some(job.workspace_root()), worktree_mappings, report);
+        let child_id = SessionId::from_native(reconciled.subject());
+        let startup_directory = validated_directory(
+            Some(reconciled_job.workspace_root()),
+            worktree_mappings,
+            report,
+        );
         if let Err(error) = self
             .api
             .discover_session(DiscoveredSession {
                 runtime: RuntimeKind::CodexCompanion,
-                native_id: job.subject().native_id().to_owned(),
+                native_id: reconciled.subject().native_id().to_owned(),
                 kind: SessionKind::Child,
                 parent: Some(parent_id),
                 event_key: discovery_key("companion-job", child_id),
                 adapter_version: watchdog_companion::TESTED_COMPANION_VERSION.to_owned(),
                 evidence_source: "companion:state-summary".to_owned(),
-                title: job.title().map(ToOwned::to_owned),
+                title: reconciled_job.title().map(ToOwned::to_owned),
                 startup_directory,
             })
             .await
@@ -452,12 +466,8 @@ impl CompanionDiscovery {
             report.warn();
             return;
         }
-        let Ok(reconciled) = parser.reconcile(Some(job), None) else {
-            report.warn();
-            return;
-        };
-        let event_key = companion_event_key(child_id, job);
-        let Ok(observation) = parser.observation(&reconciled, &event_key, self.clock.now()) else {
+        let event_key = companion_event_key(child_id, reconciled_job);
+        let Ok(observation) = parser.observation(reconciled, &event_key, self.clock.now()) else {
             report.warn();
             return;
         };
@@ -467,7 +477,7 @@ impl CompanionDiscovery {
             return;
         }
         #[cfg(target_os = "linux")]
-        self.ingest_companion_process(job).await;
+        self.ingest_companion_process(reconciled_job).await;
         if children.insert(child_id) {
             report.child_sessions = report.child_sessions.saturating_add(1);
         }
@@ -528,6 +538,41 @@ impl std::fmt::Debug for CompanionDiscovery {
         formatter
             .debug_struct("CompanionDiscovery")
             .finish_non_exhaustive()
+    }
+}
+
+fn read_companion_detail(
+    root: &CapabilityRoot,
+    workspace_relative: &Path,
+    parser: &watchdog_companion::CompanionParser,
+    summary: &watchdog_companion::CompanionJob,
+    report: &mut RuntimeDiscoveryReport,
+) -> Option<watchdog_companion::CompanionJob> {
+    let native_id = summary.subject().native_id();
+    if native_id.is_empty()
+        || !native_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        report.warn();
+        return None;
+    }
+    let detail_path = workspace_relative
+        .join("jobs")
+        .join(format!("{native_id}.json"));
+    let bytes = match read_bounded_file(root, &detail_path, watchdog_companion::MAX_DETAIL_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return None,
+        Err(()) => {
+            report.warn();
+            return None;
+        }
+    };
+    if let Ok(detail) = parser.parse_detail(&bytes) {
+        Some(detail)
+    } else {
+        report.warn();
+        None
     }
 }
 
