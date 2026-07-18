@@ -632,6 +632,100 @@ fn write_companion_detail(workspace_state: &std::path::Path) {
 }
 
 #[tokio::test]
+async fn codex_rollout_metadata_discovers_live_hierarchy_without_sqlite_visibility() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let rollout_root = fixture.path().join("codex-rollouts");
+    let mounted_worktrees = fixture.path().join("worktrees");
+    for directory in [
+        &rollout_root,
+        &mounted_worktrees,
+        &mounted_worktrees.join("main"),
+        &mounted_worktrees.join("child"),
+    ] {
+        fs::create_dir(directory).expect("fixture directory should be created");
+    }
+    create_rollout_metadata_fixtures(&rollout_root);
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should follow epoch")
+            .as_millis(),
+    )
+    .expect("current time should fit");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(now_ms),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = CodexDiscovery::new(api, store.clone(), clock.clone());
+    let mapping = WorktreePathMapping::new("/host/repositories", mounted_worktrees)
+        .expect("path mapping should be valid");
+    let rollout_mapping = WorktreePathMapping::new("/state", &rollout_root)
+        .expect("rollout path mapping should be valid");
+
+    let report = discovery
+        .reconcile(
+            std::slice::from_ref(&rollout_root),
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&mapping),
+        )
+        .await;
+    assert_eq!(report.main_sessions(), 1);
+    assert_eq!(report.child_sessions(), 1);
+    assert_eq!(report.warning_count(), 0);
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].root, mains[0].root);
+    let child_metadata = store
+        .session_metadata(children[0].session)
+        .await
+        .expect("metadata should query")
+        .expect("metadata should exist");
+    assert_eq!(child_metadata.title(), Some("reviewer"));
+    assert_eq!(
+        child_metadata.startup_directory(),
+        Some("/host/repositories/child")
+    );
+
+    append_rollout_activity(&rollout_root.join("rollout-child.jsonl"));
+    clock.advance(DurationMs::new(1_000));
+    let appended = discovery
+        .reconcile(
+            std::slice::from_ref(&rollout_root),
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&mapping),
+        )
+        .await;
+    assert_eq!(appended.warning_count(), 0);
+    let child_snapshot = store
+        .snapshot(children[0].session)
+        .await
+        .expect("child snapshot should query")
+        .expect("child snapshot should exist");
+    assert_eq!(
+        child_snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .last_progress_summary(),
+        Some("Codex rollout activity")
+    );
+}
+
+#[tokio::test]
 async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let state_root = fixture.path().join("codex-state");
@@ -746,6 +840,19 @@ fn create_rollout_fixtures(rollout_root: &std::path::Path) {
         )
         .expect("rollout fixture should be written");
     }
+}
+
+fn create_rollout_metadata_fixtures(rollout_root: &std::path::Path) {
+    fs::write(
+        rollout_root.join("rollout-main.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-main\",\"cwd\":\"/host/repositories/main\",\"agent_nickname\":\"Main\",\"source\":{}}}\n",
+    )
+    .expect("main rollout fixture should be written");
+    fs::write(
+        rollout_root.join("rollout-child.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-child\",\"parent_thread_id\":\"codex-main\",\"cwd\":\"/host/repositories/child\",\"agent_nickname\":\"reviewer\",\"source\":{\"subagent\":{}}}}\n",
+    )
+    .expect("child rollout fixture should be written");
 }
 
 fn assert_repository_metadata(metadata: &watchdog_store::SessionMetadataRecord) {
