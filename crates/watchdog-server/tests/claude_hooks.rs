@@ -1,16 +1,18 @@
 //! Authenticated official Claude lifecycle-hook ingestion acceptance tests.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
 use tower::ServiceExt as _;
-use watchdog_domain::{DetailedState, SessionKind, TimePoint, WallTimeMs};
+use watchdog_domain::{Clock, DetailedState, SessionKind, TimePoint, WallTimeMs};
 use watchdog_server::{AgentApi, BearerAuthenticator, ClaudeHookService, claude_hook_router};
 use watchdog_store::WatchdogStore;
-use watchdog_testkit::FakeClock;
 
 #[tokio::test]
 async fn bearer_hook_ingestion_creates_exact_hierarchy_without_retaining_body_content() {
@@ -18,10 +20,7 @@ async fn bearer_hook_ingestion_creates_exact_hierarchy_without_retaining_body_co
     let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
         .await
         .expect("store should open");
-    let clock = Arc::new(FakeClock::new(TimePoint::new(
-        WallTimeMs::new(10_000),
-        5_000,
-    )));
+    let clock = Arc::new(AdvancingClock::default());
     let api = AgentApi::new(store.clone(), clock.clone())
         .await
         .expect("API should initialize");
@@ -95,6 +94,21 @@ async fn bearer_hook_ingestion_creates_exact_hierarchy_without_retaining_body_co
             .observations
             > after_main.observations
     );
+}
+
+#[derive(Debug, Default)]
+struct AdvancingClock {
+    next: AtomicU64,
+}
+
+impl Clock for AdvancingClock {
+    fn now(&self) -> TimePoint {
+        let sequence = self.next.fetch_add(1, Ordering::Relaxed);
+        TimePoint::new(
+            WallTimeMs::new(10_000 + i64::try_from(sequence).expect("test time should fit")),
+            5_000 + sequence,
+        )
+    }
 }
 
 async fn assert_hook_http_boundaries(router: &axum::Router) {

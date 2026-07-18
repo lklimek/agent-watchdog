@@ -10,7 +10,7 @@ use axum::{
     routing::post,
 };
 use uuid::Uuid;
-use watchdog_domain::{Clock, RuntimeKind, SessionId, SessionKind};
+use watchdog_domain::{Clock, ObservationEnvelope, RuntimeKind, SessionId, SessionKind};
 
 use crate::{AgentApi, BearerAuthenticator, DiscoveredSession};
 
@@ -74,8 +74,19 @@ impl ClaudeHookService {
             })
             .await
             .map_err(|_| ClaudeHookHttpError::Unavailable)?;
+        // Discovery itself commits a Starting observation. Stamp the native
+        // state afterwards so a real advancing monotonic clock cannot make the
+        // hook look older than the session it just created.
+        let native_state = ObservationEnvelope::new(
+            evidence.observation().observation_id(),
+            evidence.subject().clone(),
+            self.clock.now(),
+            evidence.observation().source().clone(),
+            evidence.observation().payload().clone(),
+        )
+        .map_err(|_| ClaudeHookHttpError::Unavailable)?;
         self.api
-            .ingest_native_observation(evidence.observation().clone())
+            .ingest_native_observation(native_state)
             .await
             .map_err(|_| ClaudeHookHttpError::Unavailable)?;
         Ok(())
