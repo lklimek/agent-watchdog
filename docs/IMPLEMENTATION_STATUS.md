@@ -9,7 +9,8 @@ remain normative.
 
 - Working branch: `feat/implementation`.
 - Latest implementation commit before this handoff refresh:
-  `ec3258a feat(mcp): complete parent alert diagnostics`.
+  `ec3258a feat(mcp): complete parent alert diagnostics`; latest committed
+  documentation checkpoint: `96c4e89 docs: refresh functional closure checkpoint`.
 - No implementation commits in this phase have been pushed. Pushing remains an
   explicit user decision; never push implicitly or directly to `main`.
 - The implementation worktree was clean immediately after `ec3258a`; the
@@ -100,6 +101,14 @@ remain normative.
   dashboard 32–35 ms, high-water RSS 13.2–17.0 MiB, and ten restart cycles. See
   `docs/spikes/capacity.md` for exact commands and budgets.
 - Explicit hanging-webhook test: passed in 5.04 seconds.
+- Isolated production-container capacity gates passed with 50 mains/450 children:
+  500 authenticated lifecycle events at concurrency 32 had 65.732 ms p99 and
+  168.636 ms maximum latency; the server remained ready. A subsequent exact
+  600-second no-change run averaged 0.000% CPU at Docker's two-decimal precision
+  and reached 30.050 MiB maximum sampled container memory. A second distinct
+  500-event pass kept all 21 concurrent rendered-UI requests at HTTP 200 with
+  49.480 ms p99/maximum latency. See
+  `docs/spikes/capacity.md` and the durable 2026-07-18 QA artifact.
 - Watcher saturation, complete termination suite, huge sparse transcript cursor,
   and server Compose-contract tests passed.
 - Supported Compose image rebuilt from the checkpoint source. Both containers
@@ -115,12 +124,12 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
   /home/ubuntu/.codex/claudius/scripts/cargo-cached.sh <cargo arguments>
 ```
 
-## Reusable QA environment
+## QA environments and evidence
 
-- Compose environment: `/data/tmp/agent-watchdog-compose-qa/.env`.
-- Scratch Playwright config/test:
-  `/data/tmp/agent-watchdog-compose-qa/playwright.config.mjs` and
-  `/data/tmp/agent-watchdog-compose-qa/dashboard.spec.mjs`.
+- The earlier Compose/Playwright scratch environment beneath
+  `/data/tmp/agent-watchdog-compose-qa` did not survive the host reboot. Its
+  durable screenshots/results remain under the artifact path below; recreate
+  fresh scratch configuration for the final browser rerun.
 - Durable screenshots/results:
   `/data/artifacts/agent-watchdog/2026-07-17/qa/`.
 - Local image: `ghcr.io/lklimek/agent-watchdog:qa`.
@@ -129,24 +138,35 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
   adapter. Claude, Companion, health, UI, and MCP continue. This is useful
   failure-containment evidence, not a product defect.
 - Termination automation is disabled in the QA TOML.
+- The 2026-07-18 capacity environment uses only synthetic roots beneath
+  `/data/tmp/agent-watchdog-perf`, image `agent-watchdog:perf`, and port 18081.
+  Its durable report is
+  `/data/artifacts/agent-watchdog/2026-07-18/qa/container-capacity.md`.
+  Both exact QA containers were stopped and removed after evidence capture; the
+  image, database, and synthetic fixtures remain for a reproducible rerun.
+- Installed runtime versions were rechecked without opening user state. Codex
+  `--ephemeral` cannot exercise disk discovery, while a persisted exercise
+  requires a dedicated authenticated runtime root. With no isolated credentials
+  provided, the Claude/Codex/Companion live matrix is explicitly **not run** and
+  remains a release limitation rather than being silently exercised against
+  operator sessions.
 
 ## Remaining Phase 10 work
 
-1. Complete explicitly isolated live-runtime tests for current Claude, Codex CLI,
-   and Companion versions. Never inspect existing user sessions.
-2. Measure the remaining release budgets: ten-minute steady-state CPU and a
-   representative production burst p99. Record exact environment/results.
-3. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
+1. Run the explicitly isolated live-runtime matrix only if a disposable
+   credentialed runtime environment is supplied. Never inspect existing user
+   sessions; otherwise retain the recorded not-run release limitation.
+2. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
    Compose config/security checks, browser QA, explicit load/slow-peer tests, and
    any supported live matrix tests.
-4. Perform fresh security/self-review and independent review; fix all critical or
+3. Perform fresh security/self-review and independent review; fix all critical or
    high findings.
-5. Only during final QA, read
+4. Only during final QA, read
    `/data/artifacts/claudius/2026-07-17/watchdog-knowledge-transfer.html`,
    interpret it in the context of `https://github.com/lklimek/claudius`, and
    audit the implementation against every applicable pitfall. Do not read it
    earlier.
-6. Do the deferred macOS build-only check at the end without adding unsupported
+5. Do the deferred macOS build-only check at the end without adding unsupported
    deployment features.
-7. Update final version matrix, known limitations, release evidence, TODOs, and
+6. Update final version matrix, known limitations, release evidence, TODOs, and
    lessons learned; then stop for the user's explicit push decision.
