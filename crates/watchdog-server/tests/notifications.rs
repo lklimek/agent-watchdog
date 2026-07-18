@@ -1,6 +1,12 @@
 //! Concise one-attempt human notification acceptance tests.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -10,7 +16,10 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use watchdog_domain::{RuntimeKind, SessionKind, TimePoint, WallTimeMs};
+use tokio::{sync::Notify, time::timeout};
+use watchdog_domain::{
+    NativeSessionKey, RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
+};
 use watchdog_server::{
     AgentApi, HumanNotification, HumanNotifier, HumanOutboxDispatcher, NotificationConfigError,
     NotificationEndpoints, RegisterSession, TransportKey, WaitingKind, WebhookEndpoint,
@@ -187,6 +196,104 @@ async fn durable_dispatcher_delivers_each_human_channel_once_and_acknowledges_it
             .len(),
         1
     );
+    server.abort();
+}
+
+#[derive(Clone, Default)]
+struct HangingWebhook {
+    attempts: Arc<AtomicUsize>,
+    started: Arc<Notify>,
+}
+
+#[tokio::test]
+#[ignore = "release slow-peer gate; exercises the production five-second timeout"]
+async fn hanging_webhook_times_out_once_without_blocking_agent_ingestion() {
+    let hanging = HangingWebhook::default();
+    let app = Router::new()
+        .route(
+            "/hang",
+            post(|State(hanging): State<HangingWebhook>| async move {
+                hanging.attempts.fetch_add(1, Ordering::Relaxed);
+                hanging.started.notify_one();
+                std::future::pending::<StatusCode>().await
+            }),
+        )
+        .with_state(hanging.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("address should be available");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let (store, clock, event_id) = notifier_fixture().await;
+    let notifier = HumanNotifier::new(
+        store.clone(),
+        clock.clone(),
+        NotificationEndpoints::new(
+            None,
+            Some(
+                WebhookEndpoint::new(format!("http://{address}/hang"))
+                    .expect("endpoint should be valid"),
+            ),
+        ),
+    )
+    .expect("notifier should initialize");
+    let dispatcher = HumanOutboxDispatcher::new(store.clone(), clock.clone(), notifier.clone());
+    let delivery = tokio::spawn(async move { dispatcher.deliver_pending(10).await });
+
+    timeout(Duration::from_secs(1), hanging.started.notified())
+        .await
+        .expect("webhook request should start");
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("agent API should remain available");
+    let transport = TransportKey::new("slow-webhook-main").expect("transport should be valid");
+    let native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "notification-main")
+        .expect("native identity should be valid");
+    let session_id = SessionId::from_native(&native);
+    api.bind_discovered_main(&transport, session_id)
+        .await
+        .expect("existing main should bind");
+    timeout(
+        Duration::from_secs(1),
+        api.report_progress(
+            &transport,
+            session_id,
+            "progress-during-hanging-webhook",
+            "Agent ingestion remained responsive".to_owned(),
+            None,
+        ),
+    )
+    .await
+    .expect("webhook must not block ingestion")
+    .expect("progress should persist");
+
+    assert_eq!(
+        timeout(Duration::from_secs(7), delivery)
+            .await
+            .expect("production timeout should terminate delivery")
+            .expect("delivery task should not panic")
+            .expect("timeout audit and acknowledgement should persist"),
+        2,
+        "disabled Home Assistant and timed-out webhook rows should be terminal"
+    );
+    assert_eq!(hanging.attempts.load(Ordering::Relaxed), 1);
+    let attempts = store
+        .notification_attempts(event_id, 10)
+        .await
+        .expect("attempts should load");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].channel, NotificationChannel::Webhook);
+    assert_eq!(attempts[0].outcome, NotificationOutcome::TimedOut);
+    let restarted_dispatcher = HumanOutboxDispatcher::new(store, clock, notifier);
+    assert_eq!(
+        restarted_dispatcher
+            .deliver_pending(10)
+            .await
+            .expect("restart should preserve the one-attempt audit"),
+        0
+    );
+    assert_eq!(hanging.attempts.load(Ordering::Relaxed), 1);
     server.abort();
 }
 
