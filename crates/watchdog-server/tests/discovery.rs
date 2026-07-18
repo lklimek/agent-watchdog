@@ -454,26 +454,13 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         fs::create_dir(directory).expect("fixture directory should be created");
     }
     let state_path = workspace_state.join("state.json");
-    fs::write(
-        &state_path,
-        serde_json::to_vec(&json!({
-            "version": 1,
-            "jobs": [{
-                "id": "companion-job",
-                "sessionId": "claude-parent",
-                "workspaceRoot": "/host/repositories/job",
-                "title": "Review persistence",
-                "status": "running",
-                "phase": "verifying",
-                "pid": std::process::id(),
-                "updatedAt": "2026-07-18T10:00:00Z"
-            }]
-        }))
-        .expect("fixture JSON should serialize"),
-    )
-    .expect("summary should be written");
+    write_companion_summary(&state_path);
     fs::write(malformed_state.join("state.json"), b"{partial")
         .expect("malformed summary should be written");
+    let jobs = workspace_state.join("jobs");
+    fs::create_dir(&jobs).expect("job directory should be created");
+    let log_path = jobs.join("companion-job.log");
+    fs::write(&log_path, b"existing private output\n").expect("job log should be written");
 
     let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
         .await
@@ -485,7 +472,7 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
     let api = AgentApi::new(store.clone(), clock.clone())
         .await
         .expect("API should initialize");
-    let discovery = CompanionDiscovery::new(api, clock.clone());
+    let discovery = CompanionDiscovery::new(api, store.clone(), clock.clone());
     let mapping = WorktreePathMapping::new("/host/repositories", mounted_worktrees)
         .expect("path mapping should be valid");
 
@@ -542,6 +529,79 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         .expect("metadata should exist");
     assert_eq!(metadata.title(), Some("Detailed persistence review"));
     assert_eq!(metadata.startup_directory(), Some("/host/repositories/job"));
+
+    assert_companion_log_activity(
+        &discovery,
+        &store,
+        &clock,
+        &companion_root,
+        &mapping,
+        &log_path,
+        children[0].session,
+    )
+    .await;
+}
+
+fn write_companion_summary(path: &Path) {
+    fs::write(
+        path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "jobs": [{
+                "id": "companion-job",
+                "sessionId": "claude-parent",
+                "workspaceRoot": "/host/repositories/job",
+                "title": "Review persistence",
+                "status": "running",
+                "phase": "verifying",
+                "pid": std::process::id(),
+                "updatedAt": "2026-07-18T10:00:00Z"
+            }]
+        }))
+        .expect("fixture JSON should serialize"),
+    )
+    .expect("summary should be written");
+}
+
+async fn assert_companion_log_activity(
+    discovery: &CompanionDiscovery,
+    store: &WatchdogStore,
+    clock: &FakeClock,
+    companion_root: &PathBuf,
+    mapping: &WorktreePathMapping,
+    log_path: &Path,
+    session: watchdog_domain::SessionIdentity,
+) {
+    let before_log = load_snapshot(store, session)
+        .await
+        .reducer_snapshot()
+        .expect("reducer snapshot should be retained")
+        .last_activity();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .expect("job log should reopen")
+        .write_all(b"SECRET_COMPANION_OUTPUT\n")
+        .expect("job log should append");
+    clock.advance(DurationMs::new(1_000));
+    let report = discovery
+        .reconcile(
+            std::slice::from_ref(companion_root),
+            std::slice::from_ref(mapping),
+        )
+        .await;
+    assert_eq!(report.warning_count(), 1);
+    let after_log = load_snapshot(store, session)
+        .await
+        .reducer_snapshot()
+        .expect("reducer snapshot should be retained")
+        .clone();
+    assert!(after_log.last_activity().monotonic_ms() > before_log.monotonic_ms());
+    assert_eq!(
+        after_log.last_progress_summary(),
+        Some("Codex Companion log activity")
+    );
+    assert!(!format!("{after_log:?}").contains("SECRET_COMPANION_OUTPUT"));
 }
 
 fn update_companion_summary(path: &std::path::Path) {
@@ -553,7 +613,7 @@ fn update_companion_summary(path: &std::path::Path) {
 
 fn write_companion_detail(workspace_state: &std::path::Path) {
     let jobs = workspace_state.join("jobs");
-    fs::create_dir(&jobs).expect("detail directory should be created");
+    fs::create_dir_all(&jobs).expect("detail directory should exist");
     fs::write(
         jobs.join("companion-job.json"),
         serde_json::to_vec(&json!({
