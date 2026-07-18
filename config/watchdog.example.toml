@@ -1,0 +1,33 @@
+[paths]
+allowed_worktree_roots = ["/monitored/worktrees"]
+claude_roots = [
+  "/monitored/claude/projects",
+  "/monitored/claude/teams",
+  "/monitored/claude/tasks",
+]
+codex_roots = [
+  "/monitored/codex/state",
+  "/monitored/codex/sessions",
+]
+companion_roots = ["/monitored/companion"]
+exclusions = []
+
+[thresholds]
+suspect_after_seconds = 300
+stalled_after_seconds = 900
+reminder_every_seconds = 300
+terminate_after_stalled_seconds = 3600
+warning_grace_seconds = 600
+action_grace_seconds = 600
+
+[adapters]
+claude = true
+codex = true
+companion = true
+
+[github]
+enabled = true
+
+[termination]
+automation_enabled = true
+sigkill_enabled = true

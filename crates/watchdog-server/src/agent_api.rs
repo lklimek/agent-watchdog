@@ -177,6 +177,7 @@ struct AgentApiInner {
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
     event_sequence: Arc<EventSequence>,
+    policy: RwLock<ReducerPolicy>,
     scopes: ScopeRegistry,
     lanes: AsyncRwLock<HashMap<SessionId, Arc<Mutex<SessionCoordinator>>>>,
 }
@@ -201,16 +202,51 @@ impl AgentApi {
     /// Returns [`AgentApiError`] when the store cannot provide a safe event
     /// sequence.
     pub async fn new(store: WatchdogStore, clock: Arc<dyn Clock>) -> Result<Self, AgentApiError> {
+        Self::with_policy(store, clock, ReducerPolicy::default()).await
+    }
+
+    /// Construct the agent API with an explicit immutable policy snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] when the store cannot provide a safe event
+    /// sequence.
+    pub async fn with_policy(
+        store: WatchdogStore,
+        clock: Arc<dyn Clock>,
+        policy: ReducerPolicy,
+    ) -> Result<Self, AgentApiError> {
         let event_sequence = Arc::new(EventSequence::from_store(&store).await?);
         Ok(Self {
             inner: Arc::new(AgentApiInner {
                 store,
                 clock,
                 event_sequence,
+                policy: RwLock::new(policy),
                 scopes: ScopeRegistry::default(),
                 lanes: AsyncRwLock::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Apply reloaded reducer thresholds to existing and future session lanes.
+    pub async fn update_policy(&self, policy: ReducerPolicy) {
+        *self
+            .inner
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        let lanes = self
+            .inner
+            .lanes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for lane in lanes {
+            lane.lock().await.set_policy(policy);
+        }
     }
 
     /// Register/enrich a session and bind a main registration's transport once.
@@ -668,7 +704,11 @@ impl AgentApi {
         let lane = Arc::new(Mutex::new(SessionCoordinator::new(
             self.inner.store.clone(),
             snapshot,
-            ReducerPolicy::default(),
+            *self
+                .inner
+                .policy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             Arc::clone(&self.inner.event_sequence),
             [OutboxDestination::ParentInbox, OutboxDestination::Sse],
         )));

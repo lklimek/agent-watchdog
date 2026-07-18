@@ -1,0 +1,8 @@
+.git
+.github
+.env
+config/traefik-users
+config/watchdog.toml
+target
+tools/spikes/target
+/data

@@ -45,9 +45,11 @@ the host's 1.92 default.
 
 ## Decision
 
-Add `rust-toolchain.toml` with `channel = "stable"` and exact workspace
-dependency versions. Disable defaults where practical and justify features in
-the workspace manifest.
+Pin `rust-toolchain.toml` to the current stable release observed at
+implementation start (`1.96.0`) and use exact workspace dependency versions.
+Disable defaults where practical and justify features in the workspace
+manifest. A floating `stable` channel was rejected before the deployment slice
+because it made the container silently install Rust 1.97.1 during a later build.
 
 The Phase 0 Rust crate now has a lockfile. `cargo audit` loaded 1,166 RustSec
 advisories and found no vulnerability in its 88-package graph. `cargo-deny`
@@ -83,6 +85,14 @@ for this graph alongside the existing permissive policy. Watcher supervision
 and periodic reconciliation remain required because stable `notify` 8.x lacks
 several unreleased 9.x Linux churn fixes; the project does not select a release
 candidate for production.
+
+## Phase 9 server review
+
+The runnable server selected exact `toml 1.1.3`, `tracing 0.1.44`, and
+`tracing-subscriber 0.3.23` versions with parsing/Serde and structured JSON
+logging features only. Their registry metadata, enabled feature trees,
+licenses, and current RustSec state were reviewed before inclusion. The
+production lockfile audit covered 316 dependencies with no vulnerability.
 
 ## Primary sources
 

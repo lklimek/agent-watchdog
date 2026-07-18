@@ -10,6 +10,9 @@ pub enum BearerAuthError {
     /// Unbounded credentials waste memory and make request handling less robust.
     #[error("Bearer token exceeds {MAX_AUTHORIZATION_BYTES} bytes")]
     TooLong,
+    /// Bearer credentials must be representable in an HTTP header.
+    #[error("Bearer token contains invalid HTTP-header characters")]
+    InvalidCharacters,
 }
 
 /// Invalid shared Basic-auth configuration.
@@ -49,6 +52,9 @@ impl BearerAuthenticator {
         }
         if token.len() > MAX_AUTHORIZATION_BYTES - PREFIX.len() {
             return Err(BearerAuthError::TooLong);
+        }
+        if !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+            return Err(BearerAuthError::InvalidCharacters);
         }
         Ok(Self {
             token: SecretText::new(token),

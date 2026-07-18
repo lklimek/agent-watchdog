@@ -179,4 +179,9 @@ impl SessionCoordinator {
     pub const fn snapshot(&self) -> &SessionSnapshot {
         &self.snapshot
     }
+
+    /// Replace timer thresholds for subsequent reducer inputs.
+    pub const fn set_policy(&mut self, policy: ReducerPolicy) {
+        self.policy = policy;
+    }
 }
