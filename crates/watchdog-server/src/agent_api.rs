@@ -7,16 +7,17 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, ChildSessionId, Clock, DeadlineCommand, DetailedState,
-    DomainEvent, DomainInputError, EvidenceTrust, MainSessionId, NativeSessionKey,
+    AdapterIdentity, BoundedText, ChildSessionId, Clock, CorrelationBasis, DeadlineCommand,
+    DetailedState, DomainEvent, DomainInputError, EvidenceTrust, MainSessionId, NativeSessionKey,
     ObservationEnvelope, ObservationError, ObservationId, ObservationPayload, ObservationSource,
-    ReducerPolicy, RuntimeKind, SessionId, SessionIdentity, SessionKind, SessionSnapshot,
-    TimePoint,
+    ProcessIdentity, ReducerPolicy, RuntimeKind, SessionId, SessionIdentity, SessionKind,
+    SessionSnapshot, TimePoint, WallTimeMs,
 };
 use watchdog_runtime::{CoordinatorError, EventSequence, SessionCoordinator};
 use watchdog_store::{
-    AdapterHealthRecord, ApplyResult, InboxOffsetRecord, OutboxDestination, RelationRecord,
-    SessionMetadataRecord, StoreError, StoredSessionRecord, WatchdogStore,
+    ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, ApplyResult, InboxOffsetRecord,
+    OutboxDestination, RelationRecord, SessionMetadataRecord, StoreError, StoredSessionRecord,
+    WatchdogStore,
 };
 
 const MAX_TREE_SESSIONS: u32 = 1_000;
@@ -106,6 +107,15 @@ enum RegistrationProvenance {
     },
 }
 
+impl RegistrationProvenance {
+    const fn correlation_basis(&self) -> CorrelationBasis {
+        match self {
+            Self::Mcp => CorrelationBasis::McpRegistration,
+            Self::Native { .. } => CorrelationBasis::ExactNative,
+        }
+    }
+}
+
 /// Agent-reported waiting class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitingKind {
@@ -152,6 +162,53 @@ pub struct AgentEventView {
     pub event: DomainEvent,
     /// Current full session evidence, including PID, CPU, conflicts, and warning.
     pub session: SessionView,
+    /// Bounded parent-facing evidence assembled without transcript retrieval.
+    pub diagnostics: AgentDiagnosticView,
+}
+
+/// Freshest bounded evidence needed to investigate a child alert.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentDiagnosticView {
+    /// Latest verified PID identity, including PID-reuse defenses.
+    pub process_identity: Option<ProcessIdentity>,
+    /// Latest bounded process deltas and their observation times.
+    pub process_activity: Vec<ActivitySampleRecord>,
+    /// Provenance shared by the retained process delta samples.
+    pub process_activity_provenance: Option<ObservationSource>,
+    /// Trusted signal timestamps used by the current decision.
+    pub signal_times: AgentSignalTimes,
+    /// Latest bounded progress or active-operation summary.
+    pub active_operation: Option<String>,
+    /// Actionable material source-conflict summaries.
+    pub source_conflicts: Vec<String>,
+    /// Selected parent relation and its retained evidence.
+    pub correlation: Option<AgentCorrelationView>,
+    /// Bounded deterministic checks the parent can perform next.
+    pub suggested_checks: Vec<String>,
+}
+
+/// Trusted timestamps included in parent diagnostics.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct AgentSignalTimes {
+    /// Latest accepted reducer input.
+    pub updated_at: TimePoint,
+    /// Latest trustworthy progress signal.
+    pub last_activity: TimePoint,
+    /// Latest trustworthy state/progress transition, when present.
+    pub last_trusted_transition: Option<TimePoint>,
+    /// Latest retained process delta sample, when present.
+    pub latest_process_sample: Option<WallTimeMs>,
+}
+
+/// Selected hierarchy evidence rendered explicitly for parent agents.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentCorrelationView {
+    /// Strongest basis represented by the selected relation.
+    pub basis: CorrelationBasis,
+    /// Bounded source fingerprint supporting the selection.
+    pub evidence: String,
+    /// Trust assigned to the relation source.
+    pub trust: EvidenceTrust,
 }
 
 /// Durable parent event page independent from MCP transport replay.
@@ -979,16 +1036,34 @@ impl AgentApi {
             .last()
             .map_or(cursor, |event| event.id().value());
         let mut events = Vec::with_capacity(domain_events.len());
+        let mut views = HashMap::<SessionId, (SessionView, AgentDiagnosticView)>::new();
+        let correlations = self.selected_correlations(root).await?;
         for event in domain_events {
-            let record = self
-                .inner
-                .store
-                .session_by_id(event.subject().session_id())
-                .await?
-                .ok_or(AgentApiError::SessionNotFound)?;
+            let subject = event.subject().session_id();
+            let (session, diagnostics) = if let Some(cached) = views.get(&subject) {
+                cached.clone()
+            } else {
+                let record = self
+                    .inner
+                    .store
+                    .session_by_id(subject)
+                    .await?
+                    .ok_or(AgentApiError::SessionNotFound)?;
+                let session = self.view_for_record(&record).await?;
+                let correlation = match record.session {
+                    SessionIdentity::Main(_) => None,
+                    SessionIdentity::Child(child) => correlations.get(&child).cloned(),
+                };
+                let diagnostics = self
+                    .diagnostics_for(&record, &session.snapshot, correlation)
+                    .await?;
+                views.insert(subject, (session.clone(), diagnostics.clone()));
+                (session, diagnostics)
+            };
             events.push(AgentEventView {
-                session: self.view_for_record(&record).await?,
                 event,
+                session,
+                diagnostics,
             });
         }
         Ok(EventPage {
@@ -1140,6 +1215,81 @@ impl AgentApi {
         })
     }
 
+    async fn diagnostics_for(
+        &self,
+        record: &StoredSessionRecord,
+        snapshot: &SessionSnapshot,
+        correlation: Option<AgentCorrelationView>,
+    ) -> Result<AgentDiagnosticView, AgentApiError> {
+        let process_activity = self
+            .inner
+            .store
+            .recent_activity(record.session, 8)
+            .await?
+            .into_iter()
+            .filter(|sample| {
+                matches!(
+                    sample.evidence,
+                    ActivityEvidence::ProcessCpu { .. } | ActivityEvidence::ProcessIo { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        let process_activity_provenance = if process_activity.is_empty() {
+            None
+        } else {
+            Some(ObservationSource::new(
+                AdapterIdentity::new(record.native.runtime(), "linux-procfs-v1")?,
+                "process:tree-delta",
+                EvidenceTrust::Corroborating,
+                None,
+            )?)
+        };
+        let source_conflicts = snapshot
+            .source_conflict()
+            .then(|| "Authoritative runtime and agent sources currently disagree".to_owned());
+        let suggested_checks = suggested_checks(snapshot, &process_activity);
+        Ok(AgentDiagnosticView {
+            process_identity: snapshot.process_identity().cloned(),
+            process_activity_provenance,
+            signal_times: AgentSignalTimes {
+                updated_at: snapshot.updated_at(),
+                last_activity: snapshot.last_activity(),
+                last_trusted_transition: snapshot.last_trusted_transition(),
+                latest_process_sample: process_activity.first().map(|sample| sample.observed_at),
+            },
+            active_operation: snapshot.last_progress_summary().map(ToOwned::to_owned),
+            source_conflicts: source_conflicts.into_iter().collect(),
+            correlation,
+            suggested_checks,
+            process_activity,
+        })
+    }
+
+    async fn selected_correlations(
+        &self,
+        root: MainSessionId,
+    ) -> Result<HashMap<ChildSessionId, AgentCorrelationView>, AgentApiError> {
+        let relations = self
+            .inner
+            .store
+            .relations_for_root(root, MAX_TREE_SESSIONS)
+            .await?
+            .into_iter()
+            .filter(|relation| relation.selected)
+            .map(|relation| {
+                (
+                    relation.child,
+                    AgentCorrelationView {
+                        basis: relation.basis,
+                        evidence: relation.provenance.fingerprint().to_owned(),
+                        trust: relation.provenance.trust(),
+                    },
+                )
+            })
+            .collect();
+        Ok(relations)
+    }
+
     async fn save_relation(
         &self,
         child: &StoredSessionRecord,
@@ -1159,6 +1309,7 @@ impl AgentApi {
                 parent: parent.session,
                 root: child.root,
                 selected: true,
+                basis: provenance.correlation_basis(),
                 provenance: source,
                 valid_from: now.wall_time(),
                 valid_until: None,
@@ -1323,6 +1474,36 @@ fn progress_text(
         |operation| format!("{operation}: {summary}"),
     );
     Ok(BoundedText::new("progress", value)?)
+}
+
+fn suggested_checks(
+    snapshot: &SessionSnapshot,
+    process_activity: &[ActivitySampleRecord],
+) -> Vec<String> {
+    let mut checks = vec!["Ask the child agent for its current status and active operation".into()];
+    if snapshot.process_identity().is_some() {
+        checks.push("Verify the reported PID still has the same start time and executable".into());
+    } else {
+        checks.push("Confirm that the child process is still running and discoverable".into());
+    }
+    if process_activity.iter().any(|sample| {
+        matches!(
+            sample.evidence,
+            ActivityEvidence::ProcessCpu {
+                user_ticks: 0,
+                system_ticks: 0,
+                child_user_ticks: 0,
+                child_system_ticks: 0,
+            }
+        )
+    }) {
+        checks
+            .push("Inspect whether the child is blocked on a tool or long-running command".into());
+    }
+    if snapshot.source_conflict() {
+        checks.push("Reconcile the conflicting runtime and agent status sources".into());
+    }
+    checks
 }
 
 fn validate_event_key(event_key: &str) -> Result<(), AgentApiError> {

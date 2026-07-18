@@ -11,7 +11,7 @@ use watchdog_domain::{
 use watchdog_process::{
     ActivityStrength, LinuxProcessSampler, ProcessActivity, ProcessTreeSnapshot,
 };
-use watchdog_store::{StoreError, WatchdogStore};
+use watchdog_store::{ActivityEvidence, ActivitySampleRecord, StoreError, WatchdogStore};
 
 use crate::{AgentApi, AgentApiError};
 
@@ -158,6 +158,14 @@ impl ProcessMonitor {
                 report.warning_count = report.warning_count.saturating_add(1);
                 continue;
             }
+            if self
+                .save_diagnostic(session.session, &activity)
+                .await
+                .is_err()
+            {
+                report.warning_count = report.warning_count.saturating_add(1);
+                continue;
+            }
             let Some(summary) = activity_summary(&activity) else {
                 continue;
             };
@@ -175,6 +183,26 @@ impl ProcessMonitor {
             }
         }
         Ok(report)
+    }
+
+    async fn save_diagnostic(
+        &self,
+        session: watchdog_domain::SessionIdentity,
+        activity: &ProcessActivity,
+    ) -> Result<(), StoreError> {
+        let cpu = activity.cpu();
+        self.store
+            .save_latest_activity(&ActivitySampleRecord {
+                session,
+                observed_at: self.clock.now().wall_time(),
+                evidence: ActivityEvidence::ProcessCpu {
+                    user_ticks: cpu.user_ticks(),
+                    system_ticks: cpu.system_ticks(),
+                    child_user_ticks: cpu.children_user_ticks(),
+                    child_system_ticks: cpu.children_system_ticks(),
+                },
+            })
+            .await
     }
 
     fn replace_previous(
@@ -368,6 +396,19 @@ mod tests {
                 .last_progress_summary(),
             Some("All four CPU times grew versus the previous process snapshot")
         );
+        let activity = store
+            .recent_activity(session.session, 10)
+            .await
+            .expect("process diagnostics should query");
+        assert!(activity.iter().any(|sample| matches!(
+            sample.evidence,
+            watchdog_store::ActivityEvidence::ProcessCpu {
+                user_ticks: 1,
+                system_ticks: 1,
+                child_user_ticks: 1,
+                child_system_ticks: 1,
+            }
+        )));
     }
 
     fn tree(root: ProcessIdentity, cpu: CpuCounters) -> ProcessTreeSnapshot {

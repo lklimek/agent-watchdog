@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, ChildSessionId, EventId, MainSessionId, ObservationId,
-    ObservationSource, ProcessIdentity, SessionIdentity, TerminationActionOutcome,
+    AdapterIdentity, BoundedText, ChildSessionId, CorrelationBasis, EventId, MainSessionId,
+    ObservationId, ObservationSource, ProcessIdentity, SessionIdentity, TerminationActionOutcome,
     TerminationBlocker, TerminationGate, TerminationStage, WallTimeMs,
 };
 
@@ -207,12 +207,19 @@ pub struct RelationRecord {
     pub root: MainSessionId,
     /// Whether this candidate currently owns the relation.
     pub selected: bool,
+    /// Strongest bounded correlation basis represented by the evidence.
+    #[serde(default = "legacy_relation_basis")]
+    pub basis: CorrelationBasis,
     /// Evidence supporting the relation.
     pub provenance: ObservationSource,
     /// Inclusive validity start.
     pub valid_from: WallTimeMs,
     /// Exclusive validity end, when superseded.
     pub valid_until: Option<WallTimeMs>,
+}
+
+const fn legacy_relation_basis() -> CorrelationBasis {
+    CorrelationBasis::WeakHeuristic
 }
 
 /// Attributable activity evidence retained for restart diagnostics.

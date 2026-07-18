@@ -170,6 +170,12 @@ impl SessionSnapshot {
         self.last_activity
     }
 
+    /// Most recent trustworthy state or progress transition.
+    #[must_use]
+    pub const fn last_trusted_transition(&self) -> Option<TimePoint> {
+        self.last_trusted_transition
+    }
+
     /// Whether material sources currently disagree.
     #[must_use]
     pub const fn source_conflict(&self) -> bool {

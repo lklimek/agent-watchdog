@@ -48,8 +48,6 @@ const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
 const NOTIFICATION_DELIVERY_LIMIT: u32 = 128;
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
 const TIMER_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(target_os = "linux")]
-const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Initialize structured JSON tracing using `RUST_LOG` or a safe info default.
 ///
@@ -193,9 +191,10 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
     let notification_worker = spawn_notification_worker(notification_dispatcher, health.clone());
-    let timer_worker = spawn_timer_worker(api.clone(), health.clone());
     #[cfg(target_os = "linux")]
-    let process_worker = spawn_process_worker(linux_monitors.process, health.clone());
+    let timer_worker = spawn_timer_worker(api.clone(), health.clone(), linux_monitors.process);
+    #[cfg(not(target_os = "linux"))]
+    let timer_worker = spawn_timer_worker(api.clone(), health.clone());
     #[cfg(target_os = "linux")]
     let termination_worker =
         spawn_termination_worker(linux_monitors.termination, config.clone(), health.clone());
@@ -223,8 +222,6 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     if let Some(worker) = github_worker {
         worker.abort();
     }
-    #[cfg(target_os = "linux")]
-    process_worker.abort();
     #[cfg(target_os = "linux")]
     termination_worker.abort();
     reload_worker.abort();
@@ -516,12 +513,18 @@ fn spawn_notification_worker(
     })
 }
 
-fn spawn_timer_worker(api: AgentApi, health: HealthService) -> JoinHandle<()> {
+fn spawn_timer_worker(
+    api: AgentApi,
+    health: HealthService,
+    #[cfg(target_os = "linux")] process_monitor: ProcessMonitor,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(TIMER_RECONCILIATION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            #[cfg(target_os = "linux")]
+            reconcile_process_before_timers(&process_monitor, &health).await;
             if let Ok(report) = api.reconcile_timers().await {
                 health.record(ComponentId::Reducer, ComponentStatus::Healthy, None);
                 if report.changed_sessions() > 0 {
@@ -586,53 +589,46 @@ fn initialize_process_monitor(
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_process_worker(monitor: ProcessMonitor, health: HealthService) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(PROCESS_SAMPLE_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            match monitor.reconcile().await {
-                Ok(report) if report.warning_count() == 0 => {
-                    health.record(ComponentId::ProcessSampler, ComponentStatus::Healthy, None);
-                    if report.progressed_sessions() > 0 {
-                        tracing::info!(
-                            event = "process.reconciled",
-                            monitored_sessions = report.monitored_sessions(),
-                            progressed_sessions = report.progressed_sessions(),
-                            warnings = 0,
-                            "Process activity reconciliation completed"
-                        );
-                    }
-                }
-                Ok(report) => {
-                    health.record(
-                        ComponentId::ProcessSampler,
-                        ComponentStatus::Degraded,
-                        Some("Some verified process trees could not be sampled safely"),
-                    );
-                    tracing::warn!(
-                        event = "process.reconciled",
-                        monitored_sessions = report.monitored_sessions(),
-                        progressed_sessions = report.progressed_sessions(),
-                        warnings = report.warning_count(),
-                        "Process activity reconciliation was incomplete"
-                    );
-                }
-                Err(_) => {
-                    health.record(
-                        ComponentId::ProcessSampler,
-                        ComponentStatus::Failed,
-                        Some("Process activity reconciliation failed"),
-                    );
-                    tracing::error!(
-                        event = "process.reconcile_failed",
-                        "Process activity reconciliation failed"
-                    );
-                }
+async fn reconcile_process_before_timers(monitor: &ProcessMonitor, health: &HealthService) {
+    match monitor.reconcile().await {
+        Ok(report) if report.warning_count() == 0 => {
+            health.record(ComponentId::ProcessSampler, ComponentStatus::Healthy, None);
+            if report.progressed_sessions() > 0 {
+                tracing::info!(
+                    event = "process.reconciled",
+                    monitored_sessions = report.monitored_sessions(),
+                    progressed_sessions = report.progressed_sessions(),
+                    warnings = 0,
+                    "Process activity reconciliation completed"
+                );
             }
         }
-    })
+        Ok(report) => {
+            health.record(
+                ComponentId::ProcessSampler,
+                ComponentStatus::Degraded,
+                Some("Some verified process trees could not be sampled safely"),
+            );
+            tracing::warn!(
+                event = "process.reconciled",
+                monitored_sessions = report.monitored_sessions(),
+                progressed_sessions = report.progressed_sessions(),
+                warnings = report.warning_count(),
+                "Process activity reconciliation was incomplete"
+            );
+        }
+        Err(_) => {
+            health.record(
+                ComponentId::ProcessSampler,
+                ComponentStatus::Failed,
+                Some("Process activity reconciliation failed"),
+            );
+            tracing::error!(
+                event = "process.reconcile_failed",
+                "Process activity reconciliation failed"
+            );
+        }
+    }
 }
 
 fn start_discovery(

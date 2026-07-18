@@ -470,6 +470,39 @@ impl WatchdogStore {
         Ok(result.last_insert_rowid())
     }
 
+    /// Replace the latest diagnostic sample of one kind for a session.
+    ///
+    /// This keeps frequently sampled process diagnostics bounded without
+    /// retaining a time series that v1 does not expose.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the session is missing or the transaction fails.
+    pub async fn save_latest_activity(
+        &self,
+        record: &ActivitySampleRecord,
+    ) -> Result<(), StoreError> {
+        let payload = bounded_json(record, "activity sample")?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM activity_samples WHERE session_id = ? AND signal_kind = ?")
+            .bind(record.session.session_id().to_string())
+            .bind(record.evidence.kind())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "INSERT INTO activity_samples \
+             (session_id, observed_at_ms, signal_kind, sample_json) VALUES (?, ?, ?, ?)",
+        )
+        .bind(record.session.session_id().to_string())
+        .bind(record.observed_at.value())
+        .bind(record.evidence.kind())
+        .bind(payload)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Load recent activity newest first.
     ///
     /// # Errors

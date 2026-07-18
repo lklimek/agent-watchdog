@@ -682,6 +682,7 @@ async fn assert_relation_and_activity(
         parent: SessionIdentity::Main(root),
         root,
         selected: true,
+        basis: watchdog_domain::CorrelationBasis::ExactNative,
         provenance: observation_source(),
         valid_from: WallTimeMs::new(1_100),
         valid_until: None,
@@ -718,6 +719,27 @@ async fn assert_relation_and_activity(
             .await
             .expect("activity should load"),
         vec![activity]
+    );
+    let latest = ActivitySampleRecord {
+        session: SessionIdentity::Child(child),
+        observed_at: WallTimeMs::new(1_300),
+        evidence: ActivityEvidence::ProcessCpu {
+            user_ticks: 5,
+            system_ticks: 6,
+            child_user_ticks: 7,
+            child_system_ticks: 8,
+        },
+    };
+    store
+        .save_latest_activity(&latest)
+        .await
+        .expect("latest diagnostic should replace its prior signal kind");
+    assert_eq!(
+        store
+            .recent_activity(SessionIdentity::Child(child), 10)
+            .await
+            .expect("latest diagnostic should load"),
+        vec![latest]
     );
 }
 

@@ -65,6 +65,9 @@ Traefik; it does not trust client-supplied forwarded headers.
 The mounted TOML controls adapter roots, exclusions, thresholds, GitHub
 enrichment, and termination policy. Adapter roots and
 `allowed_worktree_roots` are container paths from the tracked example.
+In v1, a “standard location” is this tracked Compose/environment/TOML template
+after its `/home/example` values are replaced with concrete paths for the
+monitored user; it is not an implicit mount or a broad home-directory scan.
 `native_worktree_roots` contains the corresponding host prefixes that runtimes
 persist in their state, in the same order. For example, map host
 `/home/example/git` to mounted `/monitored/worktrees`; the service validates
@@ -244,6 +247,14 @@ Traefik is pinned by version and multi-platform digest. Do not replace the pin
 with `latest`. Agent Watchdog intentionally starts optimistically with runtime
 versions other than those tested; compatibility problems become `UPGRADE`
 warnings instead of silent startup refusal.
+
+On Linux, verified process trees are sampled immediately before each timer
+evaluation. The latest trustworthy CPU delta per session replaces the previous
+sample instead of creating a five-second history. Parent MCP events include
+that delta and its `linux-procfs-v1` provenance together with PID identity,
+trusted timestamps, active operation, conflicts, correlation evidence, and
+suggested checks. A neutral CPU delta is diagnostic evidence only and never
+proves a stall by itself.
 
 ## Manual history wipe
 

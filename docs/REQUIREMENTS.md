@@ -122,7 +122,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-DIS-005 | Correlation priority is exact native identifiers, then MCP registration, then heuristics. | Diagnostic logs record which basis won; heuristic confidence/evidence is logged but not shown by default. |
 | FR-DIS-006 | Heuristics may use process ancestry, cwd/worktree, timestamps, transcript references, and runtime metadata. | A session lacking exact parent metadata is correlated when evidence produces one best match; ambiguous matches remain unassigned or unknown. |
 | FR-DIS-007 | Configured root prefixes and paths discovered from active sessions are both watched. Agents may register additional allowlisted paths through MCP. | A registered path outside the configured prefix is rejected; an in-prefix path becomes observable. |
-| FR-DIS-008 | Built-in runtime state locations must support TOML overrides and additional allowlisted paths. | Default Claude/Codex installs work without path configuration; non-default paths can be added without rebuilding. |
+| FR-DIS-008 | V1 provides standard Claude/Codex/Companion Docker path templates plus TOML overrides and additional allowlisted mappings. | The supported Docker install resolves every standard or additional host path to a concrete read-only bind; operators may add matched native/mounted roots without rebuilding. |
 | FR-DIS-009 | Sessions with different startup directories or Git worktrees must remain distinct even when they share a repository. | Two concurrent worktrees appear as separate main sessions and cannot refresh each other’s agent-specific clocks. |
 
 ### 8.2 Evidence collection and performance
@@ -182,6 +182,7 @@ The v1 MCP tool set is:
 
 - `register_session`
 - `register_delegation`
+- `register_watch_path`
 - `report_progress`
 - `report_waiting`
 - `complete_session`

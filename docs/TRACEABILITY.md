@@ -22,7 +22,7 @@ not accepted deferrals.
 | FR-DIS-005 | T-DIS-003, T-DIS-005 | Deterministic correlation priority and retained relation evidence; `domain/tests/correlation.rs` | Automated |
 | FR-DIS-006 | T-DIS-003, T-DIS-004, T-DIS-011, T-DIS-012 | Correlation engine plus exact native Claude/Codex/Companion hierarchy parsers | Automated |
 | FR-DIS-007 | T-DIS-006, T-DIS-007 | Durable scoped `register_watch_path`, capability projection, prioritized watcher rebuild, and exact child ownership | Automated |
-| FR-DIS-008 | T-DIS-008 | TOML accepts multiple mapped runtime roots and reloads them; Compose requires explicit concrete host binds rather than implicit home discovery | **Partial** |
+| FR-DIS-008 | T-DIS-008 | Tracked standard path templates, explicit Compose binds, and tested coexistence of standard/additional native-to-mounted TOML mappings | Automated |
 | FR-DIS-009 | T-DIS-002 | Startup-directory/worktree metadata, root-scoped stores, dashboard cards, and ambiguity-safe worktree activity | Automated |
 | FR-EVD-001 | T-EVD-001 | Linux `WatchService`, targeted invalidation, server watcher supervisor | Automated |
 | FR-EVD-002 | T-EVD-001 | Durable incremental cursor and complete-record reader; huge sparse-file test | Automated |
@@ -45,7 +45,7 @@ not accepted deferrals.
 | FR-STA-004 | T-STA-002 | Adapter provenance plus global reducer fallback policy | Automated |
 | FR-STA-005 | T-STA-002 | Five-minute suspect and fifteen-minute stall defaults and fake-time tests | Automated |
 | FR-STA-006 | T-STA-007 | Authoritative failure and verified process disappearance reduce immediately | Automated |
-| FR-STA-007 | T-STA-008 | Snapshot has last transition, PID, operation summary, conflict, and times; explicit CPU deltas, correlation basis, and suggested checks are not yet bundled with an alert | **Partial** |
+| FR-STA-007 | T-STA-008 | Process sampling precedes timer evaluation; `AgentDiagnosticView` includes PID, latest CPU delta/provenance, trusted times, operation, conflicts, correlation, and suggested checks | Automated |
 | FR-STA-008 | T-STA-009 | Monotonic five-minute reminder reducer/outbox behavior | Automated |
 | FR-STA-009 | T-DIS-005, T-STA-010, T-STA-014 | Stable observation IDs, transactional store, durable event cursor, restart boundary | Automated |
 | FR-KILL-001 | T-KILL-001 | `ChildSessionId`-only safety/termination entry points and main rejection tests | Automated |
@@ -59,7 +59,7 @@ not accepted deferrals.
 | FR-MCP-002 | T-MCP-002, T-MCP-003 | One immutable main-tree scope per transport and cross-tree rejection | Automated |
 | FR-MCP-003 | T-MCP-004 | Twelve bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated |
 | FR-MCP-004 | T-DATA-003, T-MCP-005 | Transactional parent inbox and durable cursor across reconnect/restart | Automated |
-| FR-MCP-005 | T-MCP-006 | `AgentEventView` pairs events with current session evidence, but the FR-STA-007 diagnostic bundle is incomplete | **Partial** |
+| FR-MCP-005 | T-MCP-006 | Durable `AgentEventView` includes the explicit bounded FR-STA-007 diagnostic bundle without transcript retrieval | Automated |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |
 | FR-MCP-007 | T-MCP-008 | Actionable `UPGRADE` compatibility warning in snapshots, MCP, API, and UI | Automated |
 
@@ -137,14 +137,6 @@ not accepted deferrals.
 
 ## Open closure work
 
-1. Add an explicit bounded parent diagnostic bundle containing the latest PID,
-   process activity deltas/provenance, signal times, operation summary, source
-   conflicts, selected correlation basis/evidence, and actionable suggested
-   checks (FR-STA-007, FR-MCP-005, T-STA-008, T-MCP-006).
-2. Reconcile FR-DIS-008 wording with the supported Docker least-privilege model:
-   TOML supports additional roots, but Compose cannot safely mount an unknown
-   host path automatically. Either document standard-path environment defaults
-   that still resolve to concrete binds or obtain explicit scope approval.
-3. Complete the isolated live-runtime matrix, ten-minute steady-state CPU,
+1. Complete the isolated live-runtime matrix, ten-minute steady-state CPU,
    representative burst p99, dependency/security gates, final browser rerun,
    deferred knowledge-transfer audit, and final macOS build-only check.
