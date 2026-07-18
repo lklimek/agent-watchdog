@@ -17,6 +17,8 @@ Implementation follows the approved planning package:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Test specification](docs/TEST_SPECIFICATION.md)
 - [Development plan](docs/DEVELOPMENT_PLAN.md)
+- [V1 requirement traceability](docs/TRACEABILITY.md)
+- [Implementation checkpoint](docs/IMPLEMENTATION_STATUS.md)
 - [Contribution and quality gates](CONTRIBUTING.md)
 - [Linux Docker Compose operations](docs/OPERATIONS.md)
 
