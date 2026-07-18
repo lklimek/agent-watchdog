@@ -488,14 +488,15 @@ Any contrary observation cancels the saga. After grace:
 
 A five-second Linux worker loads only stored child sessions, batches selected
 relation evidence by root, samples a fresh PID/start-time/executable identity,
-and derives health gates from store, observation queue, filesystem watcher,
+and derives health gates from store, filesystem watcher and reconciliation,
 owning adapter, and process-sampler status. Watcher overflow or degraded watch
 coverage is treated as queue/evidence uncertainty and suspends destructive
-automation until watcher health recovers. Missing evidence suspends the saga
-without mutation. The worker and normal reducer lanes share one event allocator,
-preventing event-ID collisions, and each pass reads the current reloadable
-automation, grace, `SIGKILL`, and post-stall timing policy. Main sessions are
-excluded by the store query and by the `TerminationCandidate` type boundary.
+automation until a bounded reconciliation completes without a newer overflow.
+Missing evidence suspends the saga without mutation. The worker and normal
+reducer lanes share one event allocator, preventing event-ID collisions, and
+each pass reads the current reloadable automation, grace, `SIGKILL`, and
+post-stall timing policy. Main sessions are excluded by the store query and by
+the `TerminationCandidate` type boundary.
 
 If pidfd is unavailable, the fallback verifies PID start time and executable
 immediately before each signal. Signals are never constructed through a shell.
@@ -694,6 +695,10 @@ and suspend destructive automation for them. Best-effort evidence continues.
 
 The process sampler, database, reducer, and authorization layer are critical.
 Failure in any one makes readiness fail and all termination automation stop.
+Filesystem watcher coverage and its separately generation-guarded reconciliation
+health fail closed for termination without making the read-only server
+unavailable. Dashboard delivery has its own health component; successful UI/SSE
+delivery cannot overwrite ingestion or termination-safety health.
 
 Logs use structured fields and stable event names. They exclude auth headers,
 tokens, raw transcript content, command-line secrets, and unbounded paths/text.

@@ -216,8 +216,11 @@ impl TerminationMonitor {
         let mut health = TerminationHealth::healthy();
         for (component, termination_component) in [
             (ComponentId::Store, TerminationComponent::Store),
-            (ComponentId::ObservationQueue, TerminationComponent::Queue),
             (ComponentId::Watcher, TerminationComponent::Queue),
+            (
+                ComponentId::FilesystemReconciliation,
+                TerminationComponent::Queue,
+            ),
             (ComponentId::Adapter(runtime), TerminationComponent::Adapter),
             (ComponentId::ProcessSampler, TerminationComponent::Process),
         ] {
@@ -931,9 +934,9 @@ mod monitor_tests {
         let health = HealthService::new(clock.clone());
         for component in [
             ComponentId::Store,
-            ComponentId::ObservationQueue,
             ComponentId::ProcessSampler,
             ComponentId::Watcher,
+            ComponentId::FilesystemReconciliation,
         ] {
             health.record(component, ComponentStatus::Healthy, None);
         }

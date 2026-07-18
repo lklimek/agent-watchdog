@@ -169,6 +169,12 @@ Watchdog and inspect detailed health before treating the warning as resolved.
 `termination_automation` degradation means the child-only reconciliation pass
 failed safely; no new signal stage is attempted until the worker and all safety
 components are healthy again.
+`filesystem_reconciliation` degradation means watcher events were lost or the
+bounded activity queue was saturated. Monitoring continues and a full bounded
+runtime reconciliation is requested. Automated termination remains suspended
+until that reconciliation finishes without a newer filesystem uncertainty.
+`dashboard_delivery` is independent: a lagging or failed browser/SSE delivery
+cannot authorize or suspend process signals.
 
 ## Reload configuration
 
