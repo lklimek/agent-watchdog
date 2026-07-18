@@ -8,7 +8,8 @@ use watchdog_domain::{
     DomainEvent, EventId, ObservationEnvelope, ReducerInput, ReducerPolicy, SessionSnapshot, reduce,
 };
 use watchdog_store::{
-    ApplyObservation, ApplyResult, OutboxDestination, SnapshotUpdate, StoreError, WatchdogStore,
+    ApplyObservation, ApplyResult, OutboxDestination, RoutedEvent, SnapshotUpdate, StoreError,
+    WatchdogStore,
 };
 
 /// Process-wide monotonic event identity source shared by session coordinators.
@@ -77,6 +78,7 @@ pub struct SessionCoordinator {
     policy: ReducerPolicy,
     event_sequence: Arc<EventSequence>,
     destinations: Vec<OutboxDestination>,
+    last_tick: Option<ObservationEnvelope>,
 }
 
 impl SessionCoordinator {
@@ -95,6 +97,7 @@ impl SessionCoordinator {
             policy,
             event_sequence,
             destinations: destinations.into_iter().collect(),
+            last_tick: None,
         }
     }
 
@@ -135,8 +138,20 @@ impl SessionCoordinator {
         ) {
             return Err(CoordinatorError::InvalidInput);
         }
+        if let Some(previous) = &self.last_tick
+            && previous.observation_id() == observation.observation_id()
+        {
+            return if previous == &observation {
+                Ok(ApplyResult::Duplicate)
+            } else {
+                Err(CoordinatorError::InvalidInput)
+            };
+        }
         let input = ReducerInput::Tick(observation.observed_at());
-        self.apply_input(observation, input).await
+        let retained = observation.clone();
+        let result = self.apply_input(observation, input).await?;
+        self.last_tick = Some(retained);
+        Ok(result)
     }
 
     /// Persist a restart boundary that invalidates process-local monotonic
@@ -165,29 +180,35 @@ impl SessionCoordinator {
         observation: ObservationEnvelope,
         input: ReducerInput,
     ) -> Result<ApplyResult, CoordinatorError> {
+        let transient_noop_allowed = matches!(input, ReducerInput::Tick(_));
         let output = reduce(self.snapshot.clone(), input, self.policy);
+        if transient_noop_allowed
+            && output.snapshot() == &self.snapshot
+            && output.events().is_empty()
+        {
+            return Ok(ApplyResult::NoChange);
+        }
         let events = output
             .events()
             .iter()
             .cloned()
             .map(|kind| {
-                Ok(DomainEvent::new(
+                let event = DomainEvent::new(
                     self.event_sequence.allocate()?,
                     output.snapshot().root(),
                     output.snapshot().session(),
                     observation.observed_at().wall_time(),
                     kind,
+                );
+                Ok(RoutedEvent::new(
+                    event.clone(),
+                    delivery_destinations(&event, &self.destinations),
                 ))
             })
             .collect::<Result<Vec<_>, CoordinatorError>>()?;
         let snapshot_update =
             SnapshotUpdate::from_reducer(output.snapshot()).map_err(StoreError::from)?;
-        let apply = ApplyObservation::new(
-            observation,
-            snapshot_update,
-            events,
-            self.destinations.iter().copied(),
-        );
+        let apply = ApplyObservation::routed(observation, snapshot_update, events);
         let result = self.store.apply_observation(&apply).await?;
         if result == ApplyResult::Applied {
             self.snapshot = output.into_snapshot();
@@ -205,4 +226,37 @@ impl SessionCoordinator {
     pub const fn set_policy(&mut self, policy: ReducerPolicy) {
         self.policy = policy;
     }
+}
+
+fn delivery_destinations(
+    event: &DomainEvent,
+    baseline: &[OutboxDestination],
+) -> Vec<OutboxDestination> {
+    let mut destinations = baseline.to_vec();
+    if human_event(event) {
+        destinations.extend([
+            OutboxDestination::Browser,
+            OutboxDestination::HomeAssistant,
+            OutboxDestination::Webhook,
+        ]);
+    }
+    destinations.sort_unstable();
+    destinations.dedup();
+    destinations
+}
+
+fn human_event(event: &DomainEvent) -> bool {
+    if !matches!(event.subject(), watchdog_domain::SessionIdentity::Main(_)) {
+        return false;
+    }
+    matches!(
+        event.kind(),
+        watchdog_domain::DomainEventKind::AlertDue
+            | watchdog_domain::DomainEventKind::ReminderDue
+            | watchdog_domain::DomainEventKind::StateChanged {
+                to: watchdog_domain::DetailedState::Completed
+                    | watchdog_domain::DetailedState::WaitingForUser,
+                ..
+            }
+    )
 }

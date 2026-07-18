@@ -12,8 +12,8 @@ use axum::{
 use serde_json::{Value, json};
 use watchdog_domain::{RuntimeKind, SessionKind, TimePoint, WallTimeMs};
 use watchdog_server::{
-    AgentApi, HumanNotification, HumanNotifier, NotificationConfigError, NotificationEndpoints,
-    RegisterSession, TransportKey, WaitingKind, WebhookEndpoint,
+    AgentApi, HumanNotification, HumanNotifier, HumanOutboxDispatcher, NotificationConfigError,
+    NotificationEndpoints, RegisterSession, TransportKey, WaitingKind, WebhookEndpoint,
 };
 use watchdog_store::{NotificationChannel, NotificationOutcome, WatchdogStore};
 use watchdog_testkit::FakeClock;
@@ -125,6 +125,68 @@ async fn generic_webhook_receives_only_concise_human_fields_and_records_attempt(
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].channel, NotificationChannel::Webhook);
     assert_eq!(attempts[0].outcome, NotificationOutcome::Delivered);
+    server.abort();
+}
+
+#[tokio::test]
+async fn durable_dispatcher_delivers_each_human_channel_once_and_acknowledges_it() {
+    let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new()
+        .route(
+            "/notify",
+            post(
+                |State(received): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                    received
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(body);
+                    StatusCode::NO_CONTENT
+                },
+            ),
+        )
+        .with_state(received.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("address should be available");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let (store, clock, _) = notifier_fixture().await;
+    let notifier = HumanNotifier::new(
+        store.clone(),
+        clock.clone(),
+        NotificationEndpoints::new(
+            None,
+            Some(
+                WebhookEndpoint::new(format!("http://{address}/notify"))
+                    .expect("endpoint should be valid"),
+            ),
+        ),
+    )
+    .expect("notifier should initialize");
+    let dispatcher = HumanOutboxDispatcher::new(store.clone(), clock, notifier);
+
+    assert_eq!(
+        dispatcher
+            .deliver_pending(10)
+            .await
+            .expect("pending notification should deliver"),
+        2,
+        "configured webhook and disabled Home Assistant rows are both terminal"
+    );
+    assert_eq!(
+        dispatcher
+            .deliver_pending(10)
+            .await
+            .expect("second dispatch should be empty"),
+        0
+    );
+    assert_eq!(
+        received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
     server.abort();
 }
 

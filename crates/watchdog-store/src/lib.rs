@@ -194,8 +194,28 @@ impl OutboxDestination {
 pub struct ApplyObservation {
     observation: ObservationEnvelope,
     snapshot: SnapshotUpdate,
-    events: Vec<DomainEvent>,
+    events: Vec<RoutedEvent>,
+}
+
+/// One durable event paired with its exact fan-out destinations.
+#[derive(Clone, Debug)]
+pub struct RoutedEvent {
+    event: DomainEvent,
     destinations: Vec<OutboxDestination>,
+}
+
+impl RoutedEvent {
+    /// Pair one event with its bounded delivery routes.
+    #[must_use]
+    pub fn new(
+        event: DomainEvent,
+        destinations: impl IntoIterator<Item = OutboxDestination>,
+    ) -> Self {
+        Self {
+            event,
+            destinations: destinations.into_iter().collect(),
+        }
+    }
 }
 
 /// Atomic child-termination saga transition and delivery fan-out.
@@ -231,11 +251,28 @@ impl ApplyObservation {
         events: Vec<DomainEvent>,
         destinations: impl IntoIterator<Item = OutboxDestination>,
     ) -> Self {
+        let destinations = destinations.into_iter().collect::<Vec<_>>();
         Self {
             observation,
             snapshot,
-            events,
-            destinations: destinations.into_iter().collect(),
+            events: events
+                .into_iter()
+                .map(|event| RoutedEvent::new(event, destinations.iter().copied()))
+                .collect(),
+        }
+    }
+
+    /// Construct one atomic reducer/store unit with event-specific routes.
+    #[must_use]
+    pub fn routed(
+        observation: ObservationEnvelope,
+        snapshot: SnapshotUpdate,
+        events: impl IntoIterator<Item = RoutedEvent>,
+    ) -> Self {
+        Self {
+            observation,
+            snapshot,
+            events: events.into_iter().collect(),
         }
     }
 }
@@ -247,6 +284,8 @@ pub enum ApplyResult {
     Applied,
     /// The observation identity had already committed.
     Duplicate,
+    /// A transient internal evaluation produced no durable state change.
+    NoChange,
 }
 
 /// `SQLite` settings and migration status used by readiness checks.
@@ -397,7 +436,7 @@ impl WatchdogStore {
         }
         upsert_session(&mut transaction, apply).await?;
         upsert_snapshot(&mut transaction, &apply.snapshot).await?;
-        insert_events(&mut transaction, &apply.events, &apply.destinations).await?;
+        insert_routed_events(&mut transaction, &apply.events).await?;
         transaction.commit().await?;
         Ok(ApplyResult::Applied)
     }
@@ -796,11 +835,27 @@ async fn insert_events(
     Ok(())
 }
 
+async fn insert_routed_events(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    events: &[RoutedEvent],
+) -> Result<(), StoreError> {
+    for routed in events {
+        insert_events(
+            transaction,
+            std::slice::from_ref(&routed.event),
+            &routed.destinations,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn validate_apply(apply: &ApplyObservation) -> Result<(), StoreError> {
     let observed_session = watchdog_domain::SessionId::from_native(apply.observation.subject());
     if observed_session != apply.snapshot.session.session_id()
         || apply.events.iter().any(|event| {
-            event.root() != apply.snapshot.root || event.subject() != apply.snapshot.session
+            event.event.root() != apply.snapshot.root
+                || event.event.subject() != apply.snapshot.session
         })
     {
         return Err(StoreError::IdentityMismatch);

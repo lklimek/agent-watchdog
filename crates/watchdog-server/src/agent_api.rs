@@ -161,6 +161,27 @@ pub struct AgentHealthView {
     pub adapters: Vec<AdapterHealthRecord>,
 }
 
+/// Bounded result of one timer-reconciliation pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerReconciliationReport {
+    evaluated_sessions: usize,
+    changed_sessions: usize,
+}
+
+impl TimerReconciliationReport {
+    /// Number of retained sessions evaluated in this pass.
+    #[must_use]
+    pub const fn evaluated_sessions(self) -> usize {
+        self.evaluated_sessions
+    }
+
+    /// Number of sessions whose durable timer state changed.
+    #[must_use]
+    pub const fn changed_sessions(self) -> usize {
+        self.changed_sessions
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScopeRegistry {
     roots: RwLock<HashMap<TransportKey, MainSessionId>>,
@@ -298,6 +319,43 @@ impl AgentApi {
             lane.lock().await.apply_restarted(observation).await?;
         }
         Ok(())
+    }
+
+    /// Evaluate suspect, stall, and reminder timers for every retained session.
+    ///
+    /// No-op evaluations are kept entirely in memory and do not grow the
+    /// observation ledger. Main sessions are included here; the separate
+    /// termination API remains child-only by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] when retained sessions cannot be listed or a
+    /// due transition cannot be committed atomically.
+    pub async fn reconcile_timers(&self) -> Result<TimerReconciliationReport, AgentApiError> {
+        let mut sessions = self
+            .inner
+            .store
+            .sessions_by_kind(SessionKind::Main, MAX_TREE_SESSIONS)
+            .await?;
+        sessions.extend(
+            self.inner
+                .store
+                .sessions_by_kind(SessionKind::Child, MAX_TREE_SESSIONS)
+                .await?,
+        );
+        let now = self.inner.clock.now();
+        let mut changed_sessions = 0;
+        for record in &sessions {
+            let observation = scheduler_observation(record, now)?;
+            let lane = self.lane(record, now).await?;
+            if lane.lock().await.apply_tick(observation).await? == ApplyResult::Applied {
+                changed_sessions += 1;
+            }
+        }
+        Ok(TimerReconciliationReport {
+            evaluated_sessions: sessions.len(),
+            changed_sessions,
+        })
     }
 
     /// Persist one automatically discovered session independently from MCP
@@ -1001,6 +1059,30 @@ fn restart_observation(
         ObservationSource::new(
             AdapterIdentity::new(record.native.runtime(), "agent-watchdog-restart-v1")?,
             "server:restart",
+            EvidenceTrust::Authoritative,
+            None,
+        )?,
+        ObservationPayload::SchedulerTick,
+    )?)
+}
+
+fn scheduler_observation(
+    record: &StoredSessionRecord,
+    now: TimePoint,
+) -> Result<ObservationEnvelope, AgentApiError> {
+    let event_key = format!(
+        "{}:{}:{}",
+        record.session.session_id(),
+        now.wall_time().value(),
+        now.monotonic_ms()
+    );
+    Ok(ObservationEnvelope::new(
+        ObservationId::from_native(record.native.runtime(), "scheduler-tick", event_key)?,
+        record.native.clone(),
+        now,
+        ObservationSource::new(
+            AdapterIdentity::new(record.native.runtime(), "agent-watchdog-scheduler-v1")?,
+            "scheduler:tick",
             EvidenceTrust::Authoritative,
             None,
         )?,

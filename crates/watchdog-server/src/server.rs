@@ -28,15 +28,17 @@ use crate::process_monitor::ProcessMonitor;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
     CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService,
-    HumanNotifier, NotificationEndpoints, RuntimeDiscoveryReport, SystemClock, TerminationConfig,
-    WebhookEndpoint, dashboard_router, health_router, mcp_router,
+    HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints, RuntimeDiscoveryReport,
+    SystemClock, TerminationConfig, WebhookEndpoint, dashboard_router, health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
 const WATCH_TARGET_LIMIT: usize = 4_096;
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
+const NOTIFICATION_DELIVERY_LIMIT: u32 = 128;
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
+const TIMER_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -149,12 +151,12 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         dashboard.clone(),
         Arc::clone(&clock) as Arc<_>,
     );
-    let _notifier = HumanNotifier::new(
-        store.clone(),
-        Arc::clone(&clock) as Arc<_>,
+    let notification_dispatcher = initialize_notification_dispatcher(
+        &store,
+        &clock,
         bootstrap.notification_endpoints.clone(),
-    )
-    .map_err(|_| ServerError::NotificationConfiguration)?;
+    )?;
+    health.record(ComponentId::Notifications, ComponentStatus::Healthy, None);
     let _github = if current.github_enabled() {
         Some(
             GitHubEnricher::new(
@@ -192,6 +194,8 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         reconcile_tx,
     );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
+    let notification_worker = spawn_notification_worker(notification_dispatcher, health.clone());
+    let timer_worker = spawn_timer_worker(api.clone(), health.clone());
     #[cfg(target_os = "linux")]
     let process_worker = spawn_process_worker(process_monitor, health.clone());
     let reload_worker = spawn_reload_worker(config, api, health.clone())?;
@@ -212,12 +216,89 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     watcher_stop.store(true, Ordering::Release);
     discovery_worker.abort();
     dashboard_worker.abort();
+    notification_worker.abort();
+    timer_worker.abort();
     #[cfg(target_os = "linux")]
     process_worker.abort();
     reload_worker.abort();
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+fn initialize_notification_dispatcher(
+    store: &WatchdogStore,
+    clock: &Arc<SystemClock>,
+    endpoints: NotificationEndpoints,
+) -> Result<HumanOutboxDispatcher, ServerError> {
+    let notifier = HumanNotifier::new(store.clone(), Arc::clone(clock) as Arc<_>, endpoints)
+        .map_err(|_| ServerError::NotificationConfiguration)?;
+    Ok(HumanOutboxDispatcher::new(
+        store.clone(),
+        Arc::clone(clock) as Arc<_>,
+        notifier,
+    ))
+}
+
+fn spawn_notification_worker(
+    dispatcher: HumanOutboxDispatcher,
+    health: HealthService,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if dispatcher
+                .deliver_pending(NOTIFICATION_DELIVERY_LIMIT)
+                .await
+                .is_ok()
+            {
+                health.record(ComponentId::Notifications, ComponentStatus::Healthy, None);
+            } else {
+                health.record(
+                    ComponentId::Notifications,
+                    ComponentStatus::Degraded,
+                    Some("Human notification delivery is degraded"),
+                );
+                tracing::warn!(
+                    event = "notifications.delivery_failed",
+                    "Human notification delivery failed"
+                );
+            }
+        }
+    })
+}
+
+fn spawn_timer_worker(api: AgentApi, health: HealthService) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TIMER_RECONCILIATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Ok(report) = api.reconcile_timers().await {
+                health.record(ComponentId::Reducer, ComponentStatus::Healthy, None);
+                if report.changed_sessions() > 0 {
+                    tracing::info!(
+                        event = "scheduler.reconciled",
+                        evaluated_sessions = report.evaluated_sessions(),
+                        changed_sessions = report.changed_sessions(),
+                        "Session timer reconciliation completed"
+                    );
+                }
+            } else {
+                health.record(
+                    ComponentId::Reducer,
+                    ComponentStatus::Failed,
+                    Some("Session timer reconciliation failed"),
+                );
+                tracing::error!(
+                    event = "scheduler.reconcile_failed",
+                    "Session timer reconciliation failed"
+                );
+            }
+        }
+    })
 }
 
 async fn initialize_agent_api(

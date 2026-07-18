@@ -3,14 +3,19 @@ use std::{fmt, sync::Arc, time::Duration};
 use reqwest::{Client, Url, redirect, retry};
 use serde::Serialize;
 use thiserror::Error;
-use watchdog_domain::{BoundedText, Clock, DomainInputError, EventId};
+use watchdog_domain::{
+    BoundedText, Clock, DetailedState, DomainEvent, DomainEventKind, DomainInputError, EventId,
+    SessionIdentity, TerminationStage,
+};
 use watchdog_store::{
-    NotificationAttemptRecord, NotificationChannel, NotificationOutcome, StoreError, WatchdogStore,
+    NotificationAttemptRecord, NotificationChannel, NotificationOutcome, OutboxDestination,
+    PendingOutboxEntry, StoreError, WatchdogStore,
 };
 
 const MAX_WEBHOOK_URL_BYTES: usize = 4_096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTEMPT_LOOKBACK: u32 = 100;
 
 /// Human-facing event payload that intentionally excludes agent diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -201,6 +206,35 @@ impl HumanNotifier {
         Ok(deliveries)
     }
 
+    async fn deliver_channel(
+        &self,
+        event_id: EventId,
+        channel: NotificationChannel,
+        notification: &HumanNotification,
+    ) -> Result<Option<NotificationDelivery>, NotificationDeliveryError> {
+        let endpoint = match channel {
+            NotificationChannel::HomeAssistant => self.endpoints.home_assistant.as_ref(),
+            NotificationChannel::Webhook => self.endpoints.webhook.as_ref(),
+            NotificationChannel::Browser => None,
+        };
+        let Some(endpoint) = endpoint else {
+            return Ok(None);
+        };
+        let (outcome, message) = self.attempt(endpoint, notification).await;
+        self.store
+            .record_notification_attempt(&NotificationAttemptRecord {
+                event_id,
+                channel,
+                attempted_at: self.clock.now().wall_time(),
+                outcome,
+                message: message
+                    .map(|message| BoundedText::new("notification_result", message))
+                    .transpose()?,
+            })
+            .await?;
+        Ok(Some(NotificationDelivery { channel, outcome }))
+    }
+
     async fn attempt(
         &self,
         endpoint: &WebhookEndpoint,
@@ -233,6 +267,148 @@ impl HumanNotifier {
             ),
         }
     }
+}
+
+/// Durable one-shot delivery worker for Home Assistant and generic webhooks.
+#[derive(Clone)]
+pub struct HumanOutboxDispatcher {
+    store: WatchdogStore,
+    clock: Arc<dyn Clock>,
+    notifier: HumanNotifier,
+}
+
+impl HumanOutboxDispatcher {
+    /// Construct a dispatcher over the durable human-channel outbox.
+    #[must_use]
+    pub fn new(store: WatchdogStore, clock: Arc<dyn Clock>, notifier: HumanNotifier) -> Self {
+        Self {
+            store,
+            clock,
+            notifier,
+        }
+    }
+
+    /// Deliver and acknowledge a bounded batch for both webhook channels.
+    ///
+    /// An existing channel audit record suppresses delivery after restart.
+    /// Disabled channels are acknowledged without creating a network attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationDeliveryError`] for corrupt outbox payloads,
+    /// missing session projections, or audit/acknowledgement failures.
+    pub async fn deliver_pending(&self, limit: u32) -> Result<usize, NotificationDeliveryError> {
+        let mut delivered = 0;
+        for (destination, channel) in [
+            (
+                OutboxDestination::HomeAssistant,
+                NotificationChannel::HomeAssistant,
+            ),
+            (OutboxDestination::Webhook, NotificationChannel::Webhook),
+        ] {
+            for entry in self.store.pending_outbox_for(destination, limit).await? {
+                self.deliver_entry(&entry, channel).await?;
+                if self
+                    .store
+                    .acknowledge_outbox(entry.outbox_id(), self.clock.now().wall_time())
+                    .await?
+                {
+                    delivered += 1;
+                }
+            }
+        }
+        Ok(delivered)
+    }
+
+    async fn deliver_entry(
+        &self,
+        entry: &PendingOutboxEntry,
+        channel: NotificationChannel,
+    ) -> Result<(), NotificationDeliveryError> {
+        if self
+            .store
+            .notification_attempts(entry.event_id(), ATTEMPT_LOOKBACK)
+            .await?
+            .iter()
+            .any(|attempt| attempt.channel == channel)
+        {
+            return Ok(());
+        }
+        let event: DomainEvent = serde_json::from_slice(entry.payload())
+            .map_err(|_| NotificationDeliveryError::InvalidOutboxPayload)?;
+        let notification = self.notification_for(&event).await?;
+        self.notifier
+            .deliver_channel(entry.event_id(), channel, &notification)
+            .await?;
+        Ok(())
+    }
+
+    async fn notification_for(
+        &self,
+        event: &DomainEvent,
+    ) -> Result<HumanNotification, NotificationDeliveryError> {
+        let session = SessionIdentity::Main(event.root());
+        let record = self
+            .store
+            .session(session)
+            .await?
+            .ok_or(NotificationDeliveryError::MissingMainSession)?;
+        let metadata = self.store.session_metadata(session).await?;
+        let startup_directory = metadata
+            .as_ref()
+            .and_then(watchdog_store::SessionMetadataRecord::startup_directory)
+            .unwrap_or("(unknown startup directory)")
+            .to_owned();
+        let title = metadata
+            .as_ref()
+            .and_then(watchdog_store::SessionMetadataRecord::title)
+            .map_or_else(
+                || fallback_title(&startup_directory, record.native.native_id()),
+                ToOwned::to_owned,
+            );
+        HumanNotification::new(issue(event.kind()), title, startup_directory).map_err(Into::into)
+    }
+}
+
+impl fmt::Debug for HumanOutboxDispatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HumanOutboxDispatcher")
+            .finish_non_exhaustive()
+    }
+}
+
+fn issue(kind: &DomainEventKind) -> &'static str {
+    match kind {
+        DomainEventKind::StateChanged {
+            to: DetailedState::Completed,
+            ..
+        } => "Session completed",
+        DomainEventKind::StateChanged {
+            to: DetailedState::WaitingForUser,
+            ..
+        } => "Session is waiting for user",
+        DomainEventKind::AlertDue => "Session requires attention",
+        DomainEventKind::ReminderDue => "Session still requires attention",
+        DomainEventKind::TerminationChanged {
+            stage: TerminationStage::WarningGrace,
+            ..
+        } => "Sub-agent termination warning",
+        DomainEventKind::TerminationChanged {
+            stage: TerminationStage::Aborted,
+            ..
+        } => "Sub-agent termination aborted",
+        _ => "Session status changed",
+    }
+}
+
+fn fallback_title(startup_directory: &str, native_id: &str) -> String {
+    std::path::Path::new(startup_directory)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(native_id)
+        .to_owned()
 }
 
 impl fmt::Debug for HumanNotifier {
@@ -276,4 +452,10 @@ pub enum NotificationDeliveryError {
     /// The terminal one-shot audit record could not persist.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A durable outbox record was not a valid bounded domain event.
+    #[error("Human notification outbox payload is invalid")]
+    InvalidOutboxPayload,
+    /// The event's owning main-session projection is missing.
+    #[error("Human notification main session is missing")]
+    MissingMainSession,
 }

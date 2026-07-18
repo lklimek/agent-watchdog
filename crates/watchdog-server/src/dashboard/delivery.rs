@@ -42,10 +42,15 @@ impl DashboardOutboxDispatcher {
     ///
     /// Returns [`DashboardOutboxError`] when the snapshot or store operation fails.
     pub async fn deliver_pending(&self, limit: u32) -> Result<usize, DashboardOutboxError> {
-        let pending = self
+        let mut pending = self
             .store
             .pending_outbox_for(OutboxDestination::Sse, limit)
             .await?;
+        pending.extend(
+            self.store
+                .pending_outbox_for(OutboxDestination::Browser, limit)
+                .await?,
+        );
         if pending.is_empty() {
             return Ok(0);
         }

@@ -19,6 +19,8 @@ pub enum ComponentId {
     Watcher,
     /// Per-session observation admission queue.
     ObservationQueue,
+    /// Best-effort human webhook delivery.
+    Notifications,
 }
 
 impl ComponentId {
