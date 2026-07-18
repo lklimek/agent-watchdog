@@ -163,6 +163,8 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
             kind: SessionKind::Main,
             parent: None,
             event_key: "codex-state:discovered-main".to_owned(),
+            adapter_version: "0.144.5".to_owned(),
+            evidence_source: "codex:state-db".to_owned(),
             title: Some("Native title".to_owned()),
             startup_directory: Some("/work/repository".to_owned()),
         })
@@ -174,6 +176,8 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
         kind: SessionKind::Child,
         parent: Some(main.session.session_id()),
         event_key: "codex-state:discovered-child".to_owned(),
+        adapter_version: "0.144.5".to_owned(),
+        evidence_source: "codex:state-db".to_owned(),
         title: Some("Native child".to_owned()),
         startup_directory: Some("/work/repository-child".to_owned()),
     };
@@ -198,6 +202,8 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
             kind: SessionKind::Main,
             parent: None,
             event_key: "codex-state:discovered-main".to_owned(),
+            adapter_version: "0.144.5".to_owned(),
+            evidence_source: "codex:state-db".to_owned(),
             title: Some("Native title".to_owned()),
             startup_directory: Some("/work/repository".to_owned()),
         })
@@ -210,6 +216,8 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
             kind: SessionKind::Child,
             parent: Some(rediscovered_main.session.session_id()),
             event_key: "codex-state:discovered-child".to_owned(),
+            adapter_version: "0.144.5".to_owned(),
+            evidence_source: "codex:state-db".to_owned(),
             title: Some("Native child".to_owned()),
             startup_directory: Some("/work/repository-child".to_owned()),
         })
@@ -223,6 +231,7 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
         .expect("metadata should exist");
     assert_eq!(metadata.title(), Some("Native child"));
     assert_eq!(metadata.startup_directory(), Some("/work/repository-child"));
+    assert_native_discovery_provenance(&store, main.root, &child).await;
 
     let transport = TransportKey::new("discovered-parent-mcp").expect("valid transport");
     api.bind_discovered_main(&transport, main.session.session_id())
@@ -237,6 +246,40 @@ async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindab
     );
 }
 
+async fn assert_native_discovery_provenance(
+    store: &WatchdogStore,
+    root: watchdog_domain::MainSessionId,
+    child: &watchdog_server::SessionView,
+) {
+    let discovery_id = ObservationId::from_native(
+        RuntimeKind::CodexCli,
+        "native-discovery",
+        format!(
+            "{}:codex-state:discovered-child",
+            child.session.session_id()
+        ),
+    )
+    .expect("discovery observation ID should validate");
+    let discovery = store
+        .observation(discovery_id)
+        .await
+        .expect("discovery observation should load")
+        .expect("native discovery observation should persist");
+    assert_eq!(discovery.source().adapter().version(), "0.144.5");
+    assert_eq!(discovery.source().fingerprint(), "codex:state-db");
+    assert!(!discovery.source().fingerprint().starts_with("mcp:"));
+    let relations = store
+        .relations_for_root(root, 10)
+        .await
+        .expect("relations should load");
+    let selected = relations
+        .iter()
+        .find(|relation| relation.child.session_id() == child.session.session_id())
+        .expect("native child relation should persist");
+    assert_eq!(selected.provenance.adapter().version(), "0.144.5");
+    assert_eq!(selected.provenance.fingerprint(), "codex:state-db:relation");
+}
+
 #[tokio::test]
 async fn native_observation_ingestion_preserves_provenance_and_retry_idempotency() {
     let (api, store, clock) = api_fixture().await;
@@ -248,6 +291,8 @@ async fn native_observation_ingestion_preserves_provenance_and_retry_idempotency
         kind: SessionKind::Main,
         parent: None,
         event_key: "companion:discover:native-job".to_owned(),
+        adapter_version: "1.0.6".to_owned(),
+        evidence_source: "companion:state-summary".to_owned(),
         title: Some("Native job".to_owned()),
         startup_directory: Some("/work/repository".to_owned()),
     })
@@ -304,6 +349,8 @@ async fn restart_reconciliation_resets_process_local_monotonic_ordering() {
         kind: SessionKind::Main,
         parent: None,
         event_key: "restart-job:discovered".to_owned(),
+        adapter_version: "1.0.6".to_owned(),
+        evidence_source: "companion:state-summary".to_owned(),
         title: None,
         startup_directory: None,
     })

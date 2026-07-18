@@ -243,6 +243,8 @@ impl ClaudeTeamDiscovery {
                 kind: SessionKind::Main,
                 parent: None,
                 event_key: discovery_key("claude-team", main_id),
+                adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
+                evidence_source: "claude:team-config".to_owned(),
                 title: None,
                 startup_directory: main_directory,
             })
@@ -266,6 +268,8 @@ impl ClaudeTeamDiscovery {
                     kind: SessionKind::Child,
                     parent: Some(main_id),
                     event_key: discovery_key("claude-team", child_id),
+                    adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
+                    evidence_source: "claude:team-config".to_owned(),
                     title: Some(member.name().to_owned()),
                     startup_directory: child_directory,
                 })
@@ -390,6 +394,11 @@ impl CompanionDiscovery {
                 kind: SessionKind::Main,
                 parent: None,
                 event_key: discovery_key("companion-parent", parent_id),
+                adapter_version: format!(
+                    "companion-{}",
+                    watchdog_companion::TESTED_COMPANION_VERSION
+                ),
+                evidence_source: "companion:parent-summary".to_owned(),
                 title: None,
                 startup_directory: None,
             })
@@ -414,6 +423,8 @@ impl CompanionDiscovery {
                 kind: SessionKind::Child,
                 parent: Some(parent_id),
                 event_key: discovery_key("companion-job", child_id),
+                adapter_version: watchdog_companion::TESTED_COMPANION_VERSION.to_owned(),
+                evidence_source: "companion:state-summary".to_owned(),
                 title: job.title().map(ToOwned::to_owned),
                 startup_directory,
             })
@@ -617,9 +628,6 @@ impl CodexDiscovery {
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
     ) {
-        if thread.cli_version() != watchdog_codex::TESTED_CODEX_VERSION {
-            report.warn();
-        }
         let main_id = SessionId::from_native(thread.subject());
         let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
         if let Err(error) = self
@@ -630,6 +638,8 @@ impl CodexDiscovery {
                 kind: SessionKind::Main,
                 parent: None,
                 event_key: discovery_key("codex-state", main_id),
+                adapter_version: watchdog_codex::TESTED_CODEX_VERSION.to_owned(),
+                evidence_source: "codex:state-db".to_owned(),
                 title: Some(thread.title().to_owned()),
                 startup_directory,
             })
@@ -650,9 +660,6 @@ impl CodexDiscovery {
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
     ) {
-        if thread.cli_version() != watchdog_codex::TESTED_CODEX_VERSION {
-            report.warn();
-        }
         let Some(parent) = thread.parent() else {
             report.warn();
             return;
@@ -667,6 +674,8 @@ impl CodexDiscovery {
                     kind: SessionKind::Main,
                     parent: None,
                     event_key: discovery_key("codex-state-parent", parent_id),
+                    adapter_version: watchdog_codex::TESTED_CODEX_VERSION.to_owned(),
+                    evidence_source: "codex:state-db".to_owned(),
                     title: None,
                     startup_directory: None,
                 })
@@ -694,6 +703,8 @@ impl CodexDiscovery {
                 kind: SessionKind::Child,
                 parent: Some(parent_id),
                 event_key: discovery_key("codex-state", child_id),
+                adapter_version: watchdog_codex::TESTED_CODEX_VERSION.to_owned(),
+                evidence_source: "codex:state-db".to_owned(),
                 title: Some(title),
                 startup_directory,
             })
