@@ -598,7 +598,7 @@ fn start_discovery(
     let discoveries = RuntimeDiscoveries {
         claude: ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone()),
         codex: CodexDiscovery::new(api.clone(), store.clone(), clock.clone()),
-        companion: CompanionDiscovery::new(api, clock.clone()),
+        companion: CompanionDiscovery::new(api, store.clone(), clock.clone()),
     };
     spawn_discovery_worker(config, discoveries, store, clock, health, requested)
 }

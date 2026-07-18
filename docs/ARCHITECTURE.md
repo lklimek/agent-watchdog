@@ -316,6 +316,13 @@ PIDs, phase, and terminal errors. Summary and job files are independently parsed
 because they are not an atomic pair. Missing records after native pruning are not
 treated as failure without corroboration.
 
+For `jobs/<safe-job-id>.log`, Watchdog persists only device, inode, and byte
+offset. The first sighting starts at EOF; a later increase on the same file
+identity emits one content-free progress observation keyed by the new offset.
+Log contents are never read or retained. Replacement, truncation, and native
+pruning establish a neutral new baseline rather than inventing progress or
+failure.
+
 ### 7.4 OpenCode boundary
 
 No OpenCode crate ships in v1. The shared model already represents API-discovered

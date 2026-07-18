@@ -38,6 +38,7 @@ const CODEX_ROLLOUT_PARSER_VERSION: u32 = 1;
 const MAX_CODEX_ROLLOUT_BATCHES: usize = 4;
 const MAX_CODEX_ROLLOUT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CODEX_ROLLOUT_RECORDS: usize = 128;
+const COMPANION_LOG_CURSOR_VERSION: u32 = 1;
 
 /// Explicit projection from a runtime-native host prefix to its read-only
 /// mount inside the supported Docker container.
@@ -1272,14 +1273,15 @@ fn task_modified_ns(root: &CapabilityRoot, relative: &Path) -> Option<u128> {
 #[derive(Clone)]
 pub struct CompanionDiscovery {
     api: AgentApi,
+    store: WatchdogStore,
     clock: Arc<dyn Clock>,
 }
 
 impl CompanionDiscovery {
     /// Construct discovery over the shared durable ingestion service.
     #[must_use]
-    pub fn new(api: AgentApi, clock: Arc<dyn Clock>) -> Self {
-        Self { api, clock }
+    pub fn new(api: AgentApi, store: WatchdogStore, clock: Arc<dyn Clock>) -> Self {
+        Self { api, store, clock }
     }
 
     /// Scan bounded workspace summaries, tolerate absent/pruned detail files,
@@ -1351,15 +1353,26 @@ impl CompanionDiscovery {
                     {
                         report.warn();
                     }
-                    self.reconcile_companion_job(
-                        &parser,
-                        &reconciled,
-                        worktree_mappings,
-                        &mut report,
-                        &mut mains,
-                        &mut children,
-                    )
-                    .await;
+                    let reconciled_session = self
+                        .reconcile_companion_job(
+                            &parser,
+                            &reconciled,
+                            worktree_mappings,
+                            &mut report,
+                            &mut mains,
+                            &mut children,
+                        )
+                        .await;
+                    if reconciled_session {
+                        self.reconcile_companion_log(
+                            &root,
+                            relative,
+                            &parser,
+                            reconciled.job(),
+                            &mut report,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1374,11 +1387,11 @@ impl CompanionDiscovery {
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
-    ) {
+    ) -> bool {
         let reconciled_job = reconciled.job();
         let Some(parent) = reconciled.parent() else {
             report.warn();
-            return;
+            return false;
         };
         let parent_id = SessionId::from_native(parent);
         if let Err(error) = self
@@ -1401,7 +1414,7 @@ impl CompanionDiscovery {
         {
             log_reconcile_failure(RuntimeKind::CodexCompanion, "parent", &error);
             report.warn();
-            return;
+            return false;
         }
         if mains.insert(parent_id) {
             report.main_sessions = report.main_sessions.saturating_add(1);
@@ -1430,22 +1443,118 @@ impl CompanionDiscovery {
         {
             log_reconcile_failure(RuntimeKind::CodexCompanion, "child", &error);
             report.warn();
-            return;
+            return false;
         }
         let event_key = companion_event_key(child_id, reconciled_job);
         let Ok(observation) = parser.observation(reconciled, &event_key, self.clock.now()) else {
             report.warn();
-            return;
+            return false;
         };
         if let Err(error) = self.api.ingest_native_observation(observation).await {
             log_reconcile_failure(RuntimeKind::CodexCompanion, "child", &error);
             report.warn();
-            return;
+            return false;
         }
         #[cfg(target_os = "linux")]
         self.ingest_companion_process(reconciled_job).await;
         if children.insert(child_id) {
             report.child_sessions = report.child_sessions.saturating_add(1);
+        }
+        true
+    }
+
+    async fn reconcile_companion_log(
+        &self,
+        root: &CapabilityRoot,
+        workspace_relative: &Path,
+        parser: &watchdog_companion::CompanionParser,
+        job: &watchdog_companion::CompanionJob,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        let native_id = job.subject().native_id();
+        if !safe_native_filename(native_id) {
+            report.warn();
+            return;
+        }
+        let relative = workspace_relative
+            .join("jobs")
+            .join(format!("{native_id}.log"));
+        let Ok(path_key) = BoundedText::new(
+            "companion_log_path_key",
+            format!("companion-log:{}", root.path().join(&relative).display()),
+        ) else {
+            report.warn();
+            return;
+        };
+        let reader = IncrementalReader::new(
+            ReadBudget::new(1, 1, 1)
+                .unwrap_or_else(|_| unreachable!("static metadata-only cursor budget is valid")),
+        );
+        let Ok(current) = reader.cursor_at_end(root, &relative, COMPANION_LOG_CURSOR_VERSION)
+        else {
+            // Logs are optional and pruned by Companion. Absence is neutral.
+            return;
+        };
+        let Ok(saved) = self.store.file_cursor(&path_key).await else {
+            report.warn();
+            return;
+        };
+        let expected_version = format!("companion-log-v{COMPANION_LOG_CURSOR_VERSION}");
+        let appended = saved.as_ref().is_some_and(|saved| {
+            saved.parser_version().as_str() == expected_version
+                && saved.device_id() == current.identity().device()
+                && saved.inode() == current.identity().inode()
+                && current.read_offset() > saved.byte_offset()
+        });
+        let last_observation_id = if appended {
+            let event_key = format!(
+                "{}:{}:{}:{}",
+                SessionId::from_native(job.subject()),
+                current.identity().device(),
+                current.identity().inode(),
+                current.read_offset()
+            );
+            let Ok(observation) = parser.log_activity(job.subject(), &event_key, self.clock.now())
+            else {
+                report.warn();
+                return;
+            };
+            let observation_id = observation.observation_id();
+            if self
+                .api
+                .ingest_native_observation(observation)
+                .await
+                .is_err()
+            {
+                report.warn();
+                return;
+            }
+            Some(observation_id)
+        } else if saved.as_ref().is_some_and(|saved| {
+            saved.parser_version().as_str() == expected_version
+                && saved.device_id() == current.identity().device()
+                && saved.inode() == current.identity().inode()
+                && saved.byte_offset() == current.read_offset()
+        }) {
+            return;
+        } else {
+            None
+        };
+        let Ok(record) = FileCursorRecord::new(
+            path_key,
+            current.identity().device(),
+            current.identity().inode(),
+            current.read_offset(),
+            current.read_offset(),
+            BoundedText::new("parser_version", expected_version)
+                .unwrap_or_else(|_| unreachable!("static parser version is bounded")),
+            last_observation_id,
+        ) else {
+            report.warn();
+            return;
+        };
+        if self.store.save_file_cursor(&record).await.is_err() {
+            report.warn();
         }
     }
 
@@ -1515,11 +1624,7 @@ fn read_companion_detail(
     report: &mut RuntimeDiscoveryReport,
 ) -> Option<watchdog_companion::CompanionJob> {
     let native_id = summary.subject().native_id();
-    if native_id.is_empty()
-        || !native_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if !safe_native_filename(native_id) {
         report.warn();
         return None;
     }
@@ -1540,6 +1645,13 @@ fn read_companion_detail(
         report.warn();
         None
     }
+}
+
+fn safe_native_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Automatic bounded Codex thread/spawn-edge discovery from read-only state.
