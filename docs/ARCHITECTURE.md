@@ -259,6 +259,26 @@ Automatic discovery watches the mounted Claude projects, teams, tasks, and
 configured hook inbox. Hooks are enrichment, not a monitoring prerequisite. Team
 files are read-only and never used as a cancellation mechanism.
 
+For Claude Code 2.1.214, automatic project discovery accepts only the observed
+`<project>/<session-id>.jsonl` main layout and
+`<project>/<session-id>/subagents/agent-<agent-id>.jsonl` child layout. The path
+supplies the exact hierarchy and each parsed child record must agree with both
+the parent `sessionId` and `agentId`; disagreement becomes a source conflict.
+Only transcripts modified within the 24-hour bootstrap window are admitted.
+The first encounter reads at most one bounded 2 MiB/128-record prefix for cwd,
+branch, and native agent metadata, then durably initializes the activity cursor
+at EOF. Later passes never repeat that bootstrap and read at most four bounded
+append batches. Existing message/tool bodies are neither replayed nor retained.
+Known metadata-only records advance the cursor without inventing activity;
+unknown complete records add an actionable `UPGRADE` warning to the affected
+session. Optional subagent sidecars contribute only their bounded `agentType`.
+Team configs are reconciled before project transcripts. A root-level teammate
+transcript is rebound to the one active team member whose native `agentType` and
+cwd both match, preventing its independent transcript UUID from creating a
+duplicate main-session card. Ambiguous matches remain independent rather than
+guessing. Positive bindings are cached under the same 2,048-entry bound; after
+a restart, an unresolved teammate cursor performs one bounded prefix recheck.
+
 ### 7.2 Native Codex CLI
 
 Evidence precedence:
@@ -313,6 +333,9 @@ targeted reconciliation.
 
 Directory enumeration has depth, entry-count, byte, and time budgets. A budget
 breach creates a compatibility/health warning rather than expanding the scan.
+The enumerator bounds regular files and directories together before sorting and
+never follows symlink entries, so a large history cannot cause an unbounded
+directory allocation.
 Periodic low-frequency reconciliation catches missed events; it is scoped to
 known runtime roots and active sessions, never a full home-directory crawl.
 
@@ -716,7 +739,7 @@ documentation before code depends on them.
 
 | Runtime/tool | Observed version |
 |---|---:|
-| Claude Code | 2.1.212 |
+| Claude Code | 2.1.214 |
 | Native Codex CLI | 0.144.5 |
 | Codex Companion | 1.0.6 |
 | OpenCode | 1.17.15 (future adapter research only) |

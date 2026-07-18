@@ -15,11 +15,13 @@ use watchdog_domain::{
 
 /// Largest accepted official hook payload.
 pub const MAX_HOOK_BYTES: usize = 64 * 1_024;
+/// Largest accepted complete transcript record.
+pub const MAX_TRANSCRIPT_RECORD_BYTES: usize = 1_024 * 1_024;
 /// Largest accepted team configuration snapshot.
 pub const MAX_TEAM_CONFIG_BYTES: usize = 1_024 * 1_024;
 const MAX_TEAM_MEMBERS: usize = 256;
 /// Claude Code version used for the current adapter compatibility fixtures.
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.212";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.214";
 
 /// Parser for official Claude Code lifecycle hook input.
 #[derive(Clone, Debug)]
@@ -355,6 +357,8 @@ pub struct ClaudeTranscriptSignal {
     session_id: Option<BoundedText<512>>,
     agent_id: Option<BoundedText<512>>,
     cwd: Option<PathBuf>,
+    git_branch: Option<BoundedText<512>>,
+    agent_setting: Option<BoundedText<256>>,
     activity: bool,
 }
 
@@ -377,6 +381,18 @@ impl ClaudeTranscriptSignal {
         self.cwd.as_deref()
     }
 
+    /// Current branch copied from bounded transcript metadata.
+    #[must_use]
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Native agent setting when the record declares one.
+    #[must_use]
+    pub fn agent_setting(&self) -> Option<&str> {
+        self.agent_setting.as_ref().map(BoundedText::as_str)
+    }
+
     /// Whether this recognized record proves bounded transcript activity.
     #[must_use]
     pub const fn is_activity(&self) -> bool {
@@ -391,6 +407,8 @@ impl fmt::Debug for ClaudeTranscriptSignal {
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("has_cwd", &self.cwd.is_some())
+            .field("has_git_branch", &self.git_branch.is_some())
+            .field("has_agent_setting", &self.agent_setting.is_some())
             .field("activity", &self.activity)
             .finish()
     }
@@ -403,21 +421,22 @@ impl fmt::Debug for ClaudeTranscriptSignal {
 /// Returns [`ClaudeParseError`] for oversized, malformed, or unrecognized
 /// records so the caller can preserve its last trusted state.
 pub fn parse_transcript_record(input: &[u8]) -> Result<ClaudeTranscriptSignal, ClaudeParseError> {
-    if input.len() > MAX_HOOK_BYTES {
+    if input.len() > MAX_TRANSCRIPT_RECORD_BYTES {
         return Err(ClaudeParseError::InputTooLarge {
             actual_bytes: input.len(),
-            max_bytes: MAX_HOOK_BYTES,
+            max_bytes: MAX_TRANSCRIPT_RECORD_BYTES,
         });
     }
     let raw: RawTranscript =
         serde_json::from_slice(input).map_err(|_| ClaudeParseError::Malformed)?;
     let record_type = required(raw.record_type.as_deref(), "type")?;
-    if !matches!(
-        record_type,
-        "assistant" | "user" | "progress" | "system" | "queue-operation"
-    ) {
-        return Err(ClaudeParseError::UnsupportedRecord);
-    }
+    let activity = match record_type {
+        "assistant" | "user" | "progress" | "system" | "queue-operation" | "attachment" => true,
+        "agent-setting" | "file-history-snapshot" | "last-prompt" | "mode" | "permission-mode" => {
+            false
+        }
+        _ => return Err(ClaudeParseError::UnsupportedRecord),
+    };
     Ok(ClaudeTranscriptSignal {
         session_id: raw
             .session_id
@@ -430,7 +449,54 @@ pub fn parse_transcript_record(input: &[u8]) -> Result<ClaudeTranscriptSignal, C
             .map(|value| BoundedText::new("agent_id", value))
             .transpose()?,
         cwd: path(raw.cwd),
-        activity: true,
+        git_branch: raw
+            .git_branch
+            .filter(|value| !value.is_empty())
+            .map(|value| BoundedText::new("git_branch", value))
+            .transpose()?,
+        agent_setting: raw
+            .agent_setting
+            .filter(|value| !value.is_empty())
+            .map(|value| BoundedText::new("agent_setting", value))
+            .transpose()?,
+        activity,
+    })
+}
+
+/// Bounded metadata stored beside a Claude subagent transcript.
+#[derive(Clone, Debug)]
+pub struct ClaudeSubagentMetadata {
+    agent_type: Option<BoundedText<256>>,
+}
+
+impl ClaudeSubagentMetadata {
+    /// Native subagent type suitable for a session title.
+    #[must_use]
+    pub fn agent_type(&self) -> Option<&str> {
+        self.agent_type.as_ref().map(BoundedText::as_str)
+    }
+}
+
+/// Parse the metadata-only sidecar beside a subagent transcript.
+///
+/// # Errors
+///
+/// Returns [`ClaudeParseError`] for oversized, malformed, or unbounded input.
+pub fn parse_subagent_metadata(input: &[u8]) -> Result<ClaudeSubagentMetadata, ClaudeParseError> {
+    if input.len() > MAX_HOOK_BYTES {
+        return Err(ClaudeParseError::InputTooLarge {
+            actual_bytes: input.len(),
+            max_bytes: MAX_HOOK_BYTES,
+        });
+    }
+    let raw: RawSubagentMetadata =
+        serde_json::from_slice(input).map_err(|_| ClaudeParseError::Malformed)?;
+    Ok(ClaudeSubagentMetadata {
+        agent_type: raw
+            .agent_type
+            .filter(|value| !value.is_empty())
+            .map(|value| BoundedText::new("agent_type", value))
+            .transpose()?,
     })
 }
 
@@ -594,6 +660,16 @@ struct RawTranscript {
     #[serde(rename = "agentId", alias = "agent_id")]
     agent_id: Option<String>,
     cwd: Option<String>,
+    #[serde(rename = "gitBranch", alias = "git_branch")]
+    git_branch: Option<String>,
+    #[serde(rename = "agentSetting", alias = "agent_setting")]
+    agent_setting: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawSubagentMetadata {
+    #[serde(rename = "agentType", alias = "agent_type")]
+    agent_type: Option<String>,
 }
 
 #[derive(Deserialize)]

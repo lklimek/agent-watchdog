@@ -1,16 +1,18 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io::Read as _,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::UNIX_EPOCH,
 };
 
 use thiserror::Error;
 #[cfg(target_os = "linux")]
 use watchdog_domain::ProcessId;
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, Clock, DetailedState, EvidenceTrust, ObservationEnvelope,
-    ObservationId, ObservationPayload, ObservationSource, RuntimeKind, SessionId, SessionKind,
+    AdapterIdentity, BoundedText, Clock, DetailedState, EvidenceTrust, NativeSessionKey,
+    ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource, RuntimeKind,
+    SessionId, SessionKind,
 };
 use watchdog_runtime::{
     CapabilityRoot, DirectoryScanner, FileCursor, FileIdentity, IncrementalReader, ReadBudget,
@@ -23,6 +25,13 @@ use crate::{AgentApi, DiscoveredSession, GitHubEnricher, RepositoryMetadata};
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCAN_ENTRIES: usize = 2_048;
 const MAX_SCAN_PATH_BYTES: usize = 2 * 1_024 * 1_024;
+const CLAUDE_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const CLAUDE_TRANSCRIPT_PARSER_VERSION: u32 = 1;
+const MAX_CLAUDE_BOOTSTRAP_BATCHES: usize = 1;
+const MAX_CLAUDE_TRANSCRIPT_BATCHES: usize = 4;
+const MAX_CLAUDE_TRANSCRIPT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
+const MAX_CLAUDE_TRANSCRIPT_RECORDS: usize = 128;
+const MAX_CLAUDE_ALIAS_CACHE: usize = 2_048;
 const CODEX_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_CODEX_THREADS: u32 = 1_000;
 const CODEX_ROLLOUT_PARSER_VERSION: u32 = 1;
@@ -168,17 +177,184 @@ pub type CompanionDiscoveryReport = RuntimeDiscoveryReport;
 /// Native Codex reconciliation report.
 pub type CodexDiscoveryReport = RuntimeDiscoveryReport;
 
-/// Automatic Claude team discovery independent from optional MCP/hooks.
-#[derive(Clone, Debug)]
-pub struct ClaudeTeamDiscovery {
-    api: AgentApi,
+struct ClaudeTranscriptCandidate {
+    subject: NativeSessionKey,
+    parent: Option<NativeSessionKey>,
+    kind: SessionKind,
+    transcript_session: NativeSessionKey,
+    expected_agent: Option<NativeSessionKey>,
+    relative: PathBuf,
+    path_key: BoundedText<4_096>,
 }
 
-impl ClaudeTeamDiscovery {
+impl ClaudeTranscriptCandidate {
+    fn from_file(
+        root: &CapabilityRoot,
+        file: &Path,
+        path_mappings: &[WorktreePathMapping],
+    ) -> Option<Self> {
+        let relative = file.strip_prefix(root.path()).ok()?.to_path_buf();
+        if relative.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+            return None;
+        }
+        let components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if components.is_empty() || components.len() != relative.components().count() {
+            return None;
+        }
+        let stem = relative.file_stem()?.to_str()?;
+        let (subject, parent, kind, transcript_session, expected_agent) =
+            if components.len() == 4 && components[2] == "subagents" {
+                let child = stem.strip_prefix("agent-")?;
+                let parent = components[1];
+                let subject = NativeSessionKey::new(RuntimeKind::ClaudeCode, child).ok()?;
+                let parent = NativeSessionKey::new(RuntimeKind::ClaudeCode, parent).ok()?;
+                (
+                    subject.clone(),
+                    Some(parent.clone()),
+                    SessionKind::Child,
+                    parent,
+                    Some(subject),
+                )
+            } else if components.len() == 2 {
+                let subject = NativeSessionKey::new(RuntimeKind::ClaudeCode, stem).ok()?;
+                (subject.clone(), None, SessionKind::Main, subject, None)
+            } else {
+                return None;
+            };
+        let mapping = path_mappings
+            .iter()
+            .find(|mapping| mapping.mounted_root() == root.path())?;
+        let native_path = mapping.native_root().join(&relative);
+        let native_path = native_path.to_str()?;
+        let path_key =
+            BoundedText::new("transcript_path_key", format!("claude:{native_path}")).ok()?;
+        Some(Self {
+            subject,
+            parent,
+            kind,
+            transcript_session,
+            expected_agent,
+            relative,
+            path_key,
+        })
+    }
+
+    fn accepts(&self, signal: &watchdog_claude::ClaudeTranscriptSignal) -> bool {
+        signal
+            .session_id()
+            .is_none_or(|value| value == self.transcript_session.native_id())
+            && self.expected_agent.as_ref().is_none_or(|expected| {
+                signal
+                    .agent_id()
+                    .is_none_or(|value| value == expected.native_id())
+            })
+    }
+
+    fn bind_team_member(&mut self, alias: &ClaudeTeamTranscriptAlias) {
+        self.subject = alias.subject.clone();
+        self.parent = Some(alias.parent.clone());
+        self.kind = SessionKind::Child;
+    }
+}
+
+#[derive(Clone)]
+struct ClaudeTeamTranscriptAlias {
+    subject: NativeSessionKey,
+    parent: NativeSessionKey,
+    agent_type: String,
+    cwd: PathBuf,
+}
+
+#[derive(Default)]
+struct ClaudeTeamTranscriptAliases(Vec<ClaudeTeamTranscriptAlias>);
+
+impl ClaudeTeamTranscriptAliases {
+    fn extend(&mut self, team: &watchdog_claude::ClaudeTeam) {
+        self.0.extend(team.members().iter().filter_map(|member| {
+            Some(ClaudeTeamTranscriptAlias {
+                subject: member.subject().clone(),
+                parent: team.lead().clone(),
+                agent_type: member.agent_type()?.to_owned(),
+                cwd: member.cwd()?.to_path_buf(),
+            })
+        }));
+    }
+
+    fn resolve(&self, bootstrap: &ClaudeTranscriptBootstrap) -> Option<&ClaudeTeamTranscriptAlias> {
+        let title = bootstrap.title.as_deref()?;
+        let cwd = bootstrap.cwd.as_deref()?;
+        let mut candidates = self
+            .0
+            .iter()
+            .filter(|alias| alias.agent_type == title && alias.cwd == cwd);
+        let matched = candidates.next()?;
+        candidates.next().is_none().then_some(matched)
+    }
+}
+
+#[derive(Default)]
+struct ClaudeTranscriptBootstrap {
+    cwd: Option<PathBuf>,
+    branch: Option<String>,
+    title: Option<String>,
+    drifted: bool,
+}
+
+impl ClaudeTranscriptBootstrap {
+    fn merge(
+        &mut self,
+        candidate: &ClaudeTranscriptCandidate,
+        signal: &watchdog_claude::ClaudeTranscriptSignal,
+    ) {
+        if !candidate.accepts(signal) {
+            self.drifted = true;
+            return;
+        }
+        if self.cwd.is_none() {
+            self.cwd = signal.cwd().map(Path::to_path_buf);
+        }
+        if self.branch.is_none() {
+            self.branch = signal.git_branch().map(ToOwned::to_owned);
+        }
+        if self.title.is_none() {
+            self.title = signal.agent_setting().map(ToOwned::to_owned);
+        }
+    }
+}
+
+/// Automatic Claude session, subagent, and team discovery independent from optional MCP/hooks.
+#[derive(Clone)]
+pub struct ClaudeDiscovery {
+    api: AgentApi,
+    store: WatchdogStore,
+    clock: Arc<dyn Clock>,
+    alias_cache: Arc<Mutex<HashMap<String, ClaudeTeamTranscriptAlias>>>,
+}
+
+impl std::fmt::Debug for ClaudeDiscovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClaudeDiscovery")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClaudeDiscovery {
     /// Construct discovery over the shared durable ingestion service.
     #[must_use]
-    pub const fn new(api: AgentApi) -> Self {
-        Self { api }
+    pub fn new(api: AgentApi, store: WatchdogStore, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            api,
+            store,
+            clock,
+            alias_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Scan exact configured Claude roots without following symlinks, parse
@@ -187,6 +363,7 @@ impl ClaudeTeamDiscovery {
     pub async fn reconcile(
         &self,
         claude_roots: &[PathBuf],
+        claude_path_mappings: &[WorktreePathMapping],
         worktree_mappings: &[WorktreePathMapping],
     ) -> ClaudeDiscoveryReport {
         let mut report = RuntimeDiscoveryReport::default();
@@ -198,6 +375,7 @@ impl ClaudeTeamDiscovery {
             return report;
         };
         let scanner = DirectoryScanner::new(budget);
+        let mut scans = Vec::new();
         for configured_root in claude_roots {
             let Ok(root) = CapabilityRoot::new(configured_root) else {
                 report.warn();
@@ -210,6 +388,10 @@ impl ClaudeTeamDiscovery {
             if scan.uncertainty().is_some() {
                 report.warn();
             }
+            scans.push((root, scan));
+        }
+        let mut aliases = ClaudeTeamTranscriptAliases::default();
+        for (root, scan) in &scans {
             let candidates =
                 std::iter::once(root.path().to_owned()).chain(scan.directories().iter().cloned());
             for directory in candidates {
@@ -218,7 +400,7 @@ impl ClaudeTeamDiscovery {
                     continue;
                 };
                 let config = relative.join("config.json");
-                let bytes = match read_bounded_config(&root, &config) {
+                let bytes = match read_bounded_config(root, &config) {
                     Ok(Some(bytes)) => bytes,
                     Ok(None) => continue,
                     Err(()) => {
@@ -230,8 +412,28 @@ impl ClaudeTeamDiscovery {
                     report.warn();
                     continue;
                 };
+                aliases.extend(&team);
                 self.reconcile_team(
                     &team,
+                    worktree_mappings,
+                    &mut report,
+                    &mut mains,
+                    &mut children,
+                )
+                .await;
+            }
+        }
+        for (root, scan) in &scans {
+            for file in scan.files() {
+                let Some(candidate) =
+                    ClaudeTranscriptCandidate::from_file(root, file, claude_path_mappings)
+                else {
+                    continue;
+                };
+                self.reconcile_transcript(
+                    root,
+                    candidate,
+                    &aliases,
                     worktree_mappings,
                     &mut report,
                     &mut mains,
@@ -300,6 +502,556 @@ impl ClaudeTeamDiscovery {
             }
         }
     }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the adapter keeps capability and bounded reconciliation scopes explicit"
+    )]
+    async fn reconcile_transcript(
+        &self,
+        root: &CapabilityRoot,
+        candidate: ClaudeTranscriptCandidate,
+        aliases: &ClaudeTeamTranscriptAliases,
+        worktree_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+        mains: &mut BTreeSet<SessionId>,
+        children: &mut BTreeSet<SessionId>,
+    ) {
+        if !self.transcript_is_recent(root, &candidate, report) {
+            return;
+        }
+        let Ok((candidate, bootstrap)) = self
+            .prepare_transcript_candidate(root, candidate, aliases)
+            .await
+        else {
+            report.warn();
+            return;
+        };
+        let Ok(parent) = self
+            .ensure_transcript_parent(&candidate, mains, report)
+            .await
+        else {
+            report.warn();
+            return;
+        };
+        let session_id = SessionId::from_native(&candidate.subject);
+        let Ok(existing) = self.existing_metadata(session_id).await else {
+            report.warn();
+            return;
+        };
+        let title = if existing
+            .as_ref()
+            .and_then(|metadata| metadata.title())
+            .is_some()
+        {
+            None
+        } else if candidate.kind == SessionKind::Child {
+            Self::subagent_title(root, &candidate).or(bootstrap.title.clone())
+        } else {
+            bootstrap.title.clone()
+        };
+        let startup_directory = if existing
+            .as_ref()
+            .and_then(|metadata| metadata.startup_directory())
+            .is_some()
+        {
+            None
+        } else {
+            validated_directory(bootstrap.cwd.as_deref(), worktree_mappings, report)
+        };
+        let Ok(view) = self
+            .api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: candidate.subject.native_id().to_owned(),
+                kind: candidate.kind,
+                parent,
+                event_key: discovery_key("claude-transcript", session_id),
+                adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
+                evidence_source: "claude:transcript-path".to_owned(),
+                title,
+                startup_directory,
+            })
+            .await
+        else {
+            report.warn();
+            return;
+        };
+        if self
+            .api
+            .enrich_repository_metadata(
+                view.session,
+                RepositoryMetadata {
+                    branch: bootstrap.branch,
+                    ..RepositoryMetadata::default()
+                },
+            )
+            .await
+            .is_err()
+        {
+            report.warn();
+        }
+        if bootstrap.drifted {
+            report.warn();
+            let _ = self
+                .emit_claude_compatibility_warning(
+                    &candidate,
+                    "bootstrap",
+                    watchdog_claude::ClaudeParseError::UnsupportedRecord.compatibility_warning(),
+                )
+                .await;
+        }
+        self.reconcile_transcript_cursor(root, &candidate, report)
+            .await;
+        match candidate.kind {
+            SessionKind::Main if mains.insert(session_id) => {
+                report.main_sessions = report.main_sessions.saturating_add(1);
+            }
+            SessionKind::Child if children.insert(session_id) => {
+                report.child_sessions = report.child_sessions.saturating_add(1);
+            }
+            SessionKind::Main | SessionKind::Child => {}
+        }
+    }
+
+    async fn prepare_transcript_candidate(
+        &self,
+        root: &CapabilityRoot,
+        mut candidate: ClaudeTranscriptCandidate,
+        aliases: &ClaudeTeamTranscriptAliases,
+    ) -> Result<(ClaudeTranscriptCandidate, ClaudeTranscriptBootstrap), ()> {
+        let cached_alias = self.cached_alias(&candidate.path_key);
+        let cursor = self.store.file_cursor(&candidate.path_key).await;
+        let path_session_exists = self
+            .store
+            .session_by_id(SessionId::from_native(&candidate.transcript_session))
+            .await;
+        let bootstrap = match (cursor, path_session_exists) {
+            (Ok(None), Ok(_)) => Self::bootstrap_transcript(root, &candidate),
+            (Ok(Some(_)), Ok(path_session))
+                if candidate.kind == SessionKind::Main
+                    && cached_alias.is_none()
+                    && path_session.is_none()
+                    && !aliases.0.is_empty() =>
+            {
+                Self::bootstrap_transcript(root, &candidate)
+            }
+            (Ok(Some(_)), Ok(_)) => ClaudeTranscriptBootstrap::default(),
+            (Err(_), _) | (_, Err(_)) => return Err(()),
+        };
+        if candidate.kind == SessionKind::Main {
+            if let Some(alias) = cached_alias {
+                candidate.bind_team_member(&alias);
+            } else if let Some(alias) = aliases.resolve(&bootstrap) {
+                candidate.bind_team_member(alias);
+                self.cache_alias(&candidate.path_key, alias.clone());
+            }
+        }
+        Ok((candidate, bootstrap))
+    }
+
+    async fn ensure_transcript_parent(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        mains: &mut BTreeSet<SessionId>,
+        report: &mut RuntimeDiscoveryReport,
+    ) -> Result<Option<SessionId>, ()> {
+        let Some(parent_native) = candidate.parent.as_ref() else {
+            return Ok(None);
+        };
+        let parent_id = SessionId::from_native(parent_native);
+        if mains.contains(&parent_id) {
+            return Ok(Some(parent_id));
+        }
+        self.api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: parent_native.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: discovery_key("claude-transcript-parent", parent_id),
+                adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
+                evidence_source: "claude:transcript-path".to_owned(),
+                title: None,
+                startup_directory: None,
+            })
+            .await
+            .map_err(|_| ())?;
+        mains.insert(parent_id);
+        report.main_sessions = report.main_sessions.saturating_add(1);
+        Ok(Some(parent_id))
+    }
+
+    async fn existing_metadata(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<watchdog_store::SessionMetadataRecord>, ()> {
+        let Some(record) = self.store.session_by_id(session_id).await.map_err(|_| ())? else {
+            return Ok(None);
+        };
+        self.store
+            .session_metadata(record.session)
+            .await
+            .map_err(|_| ())
+    }
+
+    fn cached_alias(&self, path_key: &BoundedText<4_096>) -> Option<ClaudeTeamTranscriptAlias> {
+        self.alias_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path_key.as_str())
+            .cloned()
+    }
+
+    fn cache_alias(&self, path_key: &BoundedText<4_096>, alias: ClaudeTeamTranscriptAlias) {
+        let mut cache = self
+            .alias_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_CLAUDE_ALIAS_CACHE && !cache.contains_key(path_key.as_str()) {
+            cache.clear();
+        }
+        cache.insert(path_key.as_str().to_owned(), alias);
+    }
+
+    fn transcript_is_recent(
+        &self,
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+        report: &mut RuntimeDiscoveryReport,
+    ) -> bool {
+        let Ok(file) = root.open_file(&candidate.relative) else {
+            report.warn();
+            return false;
+        };
+        let Ok(modified) = file.metadata().and_then(|metadata| metadata.modified()) else {
+            report.warn();
+            return false;
+        };
+        let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) else {
+            report.warn();
+            return false;
+        };
+        let Ok(modified_ms) = i64::try_from(elapsed.as_millis()) else {
+            report.warn();
+            return false;
+        };
+        modified_ms
+            >= self
+                .clock
+                .now()
+                .wall_time()
+                .value()
+                .saturating_sub(CLAUDE_BOOTSTRAP_WINDOW_MS)
+    }
+
+    fn bootstrap_transcript(
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+    ) -> ClaudeTranscriptBootstrap {
+        let reader = claude_transcript_reader();
+        let Ok(mut cursor) =
+            reader.cursor_at_start(root, &candidate.relative, CLAUDE_TRANSCRIPT_PARSER_VERSION)
+        else {
+            return ClaudeTranscriptBootstrap {
+                drifted: true,
+                ..ClaudeTranscriptBootstrap::default()
+            };
+        };
+        let mut bootstrap = ClaudeTranscriptBootstrap::default();
+        for _ in 0..MAX_CLAUDE_BOOTSTRAP_BATCHES {
+            let Ok(ReadOutcome::Records(batch)) = reader.read(root, &candidate.relative, &cursor)
+            else {
+                bootstrap.drifted = true;
+                break;
+            };
+            for record in batch.records() {
+                match watchdog_claude::parse_transcript_record(record) {
+                    Ok(signal) => bootstrap.merge(candidate, &signal),
+                    Err(_) => bootstrap.drifted = true,
+                }
+            }
+            cursor = batch.cursor().clone();
+            if !batch.continuation_required() {
+                break;
+            }
+        }
+        bootstrap
+    }
+
+    fn subagent_title(
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+    ) -> Option<String> {
+        let sidecar = candidate.relative.with_extension("meta.json");
+        let Ok(Some(bytes)) = read_bounded_file(root, &sidecar, watchdog_claude::MAX_HOOK_BYTES)
+        else {
+            return None;
+        };
+        if let Ok(metadata) = watchdog_claude::parse_subagent_metadata(&bytes) {
+            metadata.agent_type().map(ToOwned::to_owned)
+        } else {
+            None
+        }
+    }
+
+    async fn reconcile_transcript_cursor(
+        &self,
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        let reader = claude_transcript_reader();
+        let Ok(saved) = self.store.file_cursor(&candidate.path_key).await else {
+            report.warn();
+            return;
+        };
+        let Some(saved) = saved else {
+            match reader.cursor_at_end(root, &candidate.relative, CLAUDE_TRANSCRIPT_PARSER_VERSION)
+            {
+                Ok(cursor) => {
+                    if self
+                        .persist_claude_cursor(&candidate.path_key, &cursor, None)
+                        .await
+                        .is_err()
+                    {
+                        report.warn();
+                    }
+                }
+                Err(_) => report.warn(),
+            }
+            return;
+        };
+        self.tail_claude_transcript(root, candidate, reader, &saved, report)
+            .await;
+    }
+
+    async fn tail_claude_transcript(
+        &self,
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+        reader: IncrementalReader,
+        saved: &FileCursorRecord,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        let mut cursor = FileCursor::resume_from_complete(
+            FileIdentity::new(saved.device_id(), saved.inode()),
+            saved.complete_record_offset(),
+            CLAUDE_TRANSCRIPT_PARSER_VERSION,
+        );
+        let mut last_observation_id = saved.last_observation_id();
+        let mut complete_offset = cursor.complete_offset();
+        for _ in 0..MAX_CLAUDE_TRANSCRIPT_BATCHES {
+            let Ok(outcome) = reader.read(root, &candidate.relative, &cursor) else {
+                report.warn();
+                return;
+            };
+            let ReadOutcome::Records(batch) = outcome else {
+                report.warn();
+                match reader.cursor_at_end(
+                    root,
+                    &candidate.relative,
+                    CLAUDE_TRANSCRIPT_PARSER_VERSION,
+                ) {
+                    Ok(new_cursor) => {
+                        let _ = self
+                            .persist_claude_cursor(
+                                &candidate.path_key,
+                                &new_cursor,
+                                last_observation_id,
+                            )
+                            .await;
+                    }
+                    Err(_) => report.warn(),
+                }
+                return;
+            };
+            for record in batch.records() {
+                complete_offset = complete_offset
+                    .saturating_add(u64::try_from(record.len()).unwrap_or(u64::MAX))
+                    .saturating_add(1);
+                let event_key = format!("{}:{complete_offset}", candidate.subject.native_id());
+                match self
+                    .ingest_claude_transcript_record(candidate, record, &event_key)
+                    .await
+                {
+                    Ok((Some(observation_id), warning)) => {
+                        last_observation_id = Some(observation_id);
+                        if warning {
+                            report.warn();
+                        }
+                    }
+                    Ok((None, warning)) => {
+                        if warning {
+                            report.warn();
+                        }
+                    }
+                    Err(()) => {
+                        report.warn();
+                        return;
+                    }
+                }
+            }
+            cursor = batch.cursor().clone();
+            if self
+                .persist_claude_cursor(&candidate.path_key, &cursor, last_observation_id)
+                .await
+                .is_err()
+            {
+                report.warn();
+                return;
+            }
+            if !batch.continuation_required() {
+                return;
+            }
+        }
+    }
+
+    async fn ingest_claude_transcript_record(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        record: &[u8],
+        event_key: &str,
+    ) -> Result<(Option<ObservationId>, bool), ()> {
+        let signal = match watchdog_claude::parse_transcript_record(record) {
+            Ok(signal) => signal,
+            Err(error) => {
+                return Ok((
+                    self.emit_claude_compatibility_warning(
+                        candidate,
+                        event_key,
+                        error.compatibility_warning(),
+                    )
+                    .await,
+                    true,
+                ));
+            }
+        };
+        if !candidate.accepts(&signal) {
+            let source = claude_transcript_source("transcript:identity-conflict")?;
+            let observation_id = ObservationId::from_native(
+                RuntimeKind::ClaudeCode,
+                "transcript-conflict",
+                event_key,
+            )
+            .map_err(|_| ())?;
+            let observation = ObservationEnvelope::new(
+                observation_id,
+                candidate.subject.clone(),
+                self.clock.now(),
+                source,
+                ObservationPayload::SourceConflict(
+                    BoundedText::new(
+                        "source_conflict",
+                        "Claude transcript identity conflicts with its native path",
+                    )
+                    .map_err(|_| ())?,
+                ),
+            )
+            .map_err(|_| ())?;
+            self.api
+                .ingest_native_observation(observation)
+                .await
+                .map_err(|_| ())?;
+            return Ok((Some(observation_id), true));
+        }
+        if !signal.is_activity() {
+            return Ok((None, false));
+        }
+        let observation_id =
+            ObservationId::from_native(RuntimeKind::ClaudeCode, "transcript", event_key)
+                .map_err(|_| ())?;
+        let observation = ObservationEnvelope::new(
+            observation_id,
+            candidate.subject.clone(),
+            self.clock.now(),
+            claude_transcript_source("transcript:jsonl")?,
+            ObservationPayload::Progress(
+                BoundedText::new("progress", "Claude transcript activity").map_err(|_| ())?,
+            ),
+        )
+        .map_err(|_| ())?;
+        self.api
+            .ingest_native_observation(observation)
+            .await
+            .map_err(|_| ())?;
+        Ok((Some(observation_id), false))
+    }
+
+    async fn persist_claude_cursor(
+        &self,
+        path_key: &BoundedText<4_096>,
+        cursor: &FileCursor,
+        last_observation_id: Option<ObservationId>,
+    ) -> Result<(), ()> {
+        let record = FileCursorRecord::new(
+            path_key.clone(),
+            cursor.identity().device(),
+            cursor.identity().inode(),
+            cursor.complete_offset(),
+            cursor.complete_offset(),
+            BoundedText::new(
+                "parser_version",
+                format!("claude-transcript-v{}", cursor.parser_version()),
+            )
+            .map_err(|_| ())?,
+            last_observation_id,
+        )
+        .map_err(|_| ())?;
+        self.store.save_file_cursor(&record).await.map_err(|_| ())
+    }
+
+    async fn emit_claude_compatibility_warning(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        event_key: &str,
+        warning: watchdog_domain::CompatibilityWarning,
+    ) -> Option<ObservationId> {
+        let observation_id = ObservationId::from_native(
+            RuntimeKind::ClaudeCode,
+            "transcript-compatibility",
+            format!("{}:{event_key}", candidate.subject.native_id()),
+        )
+        .ok()?;
+        let observation = ObservationEnvelope::new(
+            observation_id,
+            candidate.subject.clone(),
+            self.clock.now(),
+            claude_transcript_source("transcript:compatibility").ok()?,
+            ObservationPayload::Compatibility(warning),
+        )
+        .ok()?;
+        self.api
+            .ingest_native_observation(observation)
+            .await
+            .ok()
+            .map(|_| observation_id)
+    }
+}
+
+fn claude_transcript_reader() -> IncrementalReader {
+    IncrementalReader::new(
+        ReadBudget::new(
+            MAX_CLAUDE_TRANSCRIPT_BATCH_BYTES,
+            watchdog_claude::MAX_TRANSCRIPT_RECORD_BYTES,
+            MAX_CLAUDE_TRANSCRIPT_RECORDS,
+        )
+        .unwrap_or_else(|_| unreachable!("static Claude transcript budget is valid")),
+    )
+}
+
+fn claude_transcript_source(evidence: &'static str) -> Result<ObservationSource, ()> {
+    ObservationSource::new(
+        AdapterIdentity::new(
+            RuntimeKind::ClaudeCode,
+            watchdog_claude::TESTED_CLAUDE_VERSION,
+        )
+        .map_err(|_| ())?,
+        evidence,
+        EvidenceTrust::Corroborating,
+        None,
+    )
+    .map_err(|_| ())
 }
 
 /// Automatic Codex Companion job discovery from current per-workspace state.

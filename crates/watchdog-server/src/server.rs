@@ -29,7 +29,7 @@ use crate::process_monitor::ProcessMonitor;
 #[cfg(target_os = "linux")]
 use crate::termination::TerminationMonitor;
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
+    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, CodexDiscovery,
     CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler,
     GitHubEnricher, HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints,
     RepositoryMetadata, RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint,
@@ -596,7 +596,7 @@ fn start_discovery(
     requested: mpsc::Receiver<()>,
 ) -> JoinHandle<()> {
     let discoveries = RuntimeDiscoveries {
-        claude: ClaudeTeamDiscovery::new(api.clone()),
+        claude: ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone()),
         codex: CodexDiscovery::new(api.clone(), store.clone(), clock.clone()),
         companion: CompanionDiscovery::new(api, clock.clone()),
     };
@@ -604,7 +604,7 @@ fn start_discovery(
 }
 
 struct RuntimeDiscoveries {
-    claude: ClaudeTeamDiscovery,
+    claude: ClaudeDiscovery,
     codex: CodexDiscovery,
     companion: CompanionDiscovery,
 }
@@ -633,7 +633,11 @@ fn spawn_discovery_worker(
             if current.adapters().claude() {
                 let report = discoveries
                     .claude
-                    .reconcile(current.claude_roots(), current.worktree_mappings())
+                    .reconcile(
+                        current.claude_roots(),
+                        current.runtime_path_mappings(RuntimeKind::ClaudeCode),
+                        current.worktree_mappings(),
+                    )
                     .await;
                 record_discovery_health(
                     &store,
