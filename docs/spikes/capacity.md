@@ -99,6 +99,26 @@ completed together in 5.67 seconds on the reference host. This gate exercises
 restart idempotency and durable lane reconstruction; interruption at every
 termination-saga stage remains a separate safety test.
 
+## Slow-consumer gate
+
+The dashboard suite fills the bounded SSE broadcast channel and verifies that a
+lagging client receives `resync_required` while ingestion and later snapshots
+continue. An explicit notification test connects the production notifier to a
+webhook that accepts a request but never responds. While the five-second
+production timeout is active, a separate agent progress observation must commit
+within one second. The timed-out webhook is then audited and acknowledged once;
+restarting the dispatcher does not send it again.
+
+```text
+/home/ubuntu/.codex/claudius/scripts/cargo-cached.sh \
+  test -p watchdog-server --test notifications \
+  hanging_webhook_times_out_once_without_blocking_agent_ingestion \
+  -- --ignored
+```
+
+The reference run completed in 5.04 seconds, matching the intentional timeout
+without delaying agent ingestion.
+
 ## Architectural impact
 
 Keep a bounded observation channel and a single transactional reducer owner.
