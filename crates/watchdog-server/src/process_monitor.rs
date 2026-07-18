@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
 use thiserror::Error;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, Clock, EvidenceTrust, ObservationEnvelope, ObservationId,
-    ObservationPayload, ObservationSource, ProcessIdentity, SessionId, SessionKind,
+    ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, SessionId, SessionKind,
 };
 use watchdog_process::{
     ActivityStrength, LinuxProcessSampler, ProcessActivity, ProcessTreeSnapshot,
@@ -19,12 +19,25 @@ const MAX_SESSIONS_PER_KIND: u32 = 1_000;
 const PROCESS_ADAPTER_VERSION: &str = "linux-procfs-v1";
 
 trait ProcessTreeSampler: std::fmt::Debug + Send + Sync {
-    fn sample_tree(&self, root: &ProcessIdentity) -> Result<ProcessTreeSnapshot, ()>;
+    fn sample_trees(
+        &self,
+        roots: &[ProcessIdentity],
+    ) -> Result<BTreeMap<ProcessId, Result<ProcessTreeSnapshot, ()>>, ()>;
 }
 
 impl ProcessTreeSampler for LinuxProcessSampler {
-    fn sample_tree(&self, root: &ProcessIdentity) -> Result<ProcessTreeSnapshot, ()> {
-        LinuxProcessSampler::sample_tree(self, root).map_err(|_| ())
+    fn sample_trees(
+        &self,
+        roots: &[ProcessIdentity],
+    ) -> Result<BTreeMap<ProcessId, Result<ProcessTreeSnapshot, ()>>, ()> {
+        LinuxProcessSampler::sample_trees(self, roots)
+            .map(|trees| {
+                trees
+                    .into_iter()
+                    .map(|(pid, tree)| (pid, tree.map_err(|_| ())))
+                    .collect()
+            })
+            .map_err(|_| ())
     }
 }
 
@@ -104,6 +117,7 @@ impl ProcessMonitor {
                 .await?,
         );
         let mut report = ProcessMonitorReport::default();
+        let mut monitored = Vec::new();
         for session in sessions {
             let Some(snapshot) = self.store.snapshot(session.session).await? else {
                 report.warning_count = report.warning_count.saturating_add(1);
@@ -117,12 +131,26 @@ impl ProcessMonitor {
                 continue;
             };
             report.monitored_sessions = report.monitored_sessions.saturating_add(1);
-            let Ok(current) = self.sampler.sample_tree(identity) else {
+            monitored.push((session, identity.clone()));
+        }
+        let roots = monitored
+            .iter()
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Ok(report);
+        }
+        let trees = self
+            .sampler
+            .sample_trees(&roots)
+            .map_err(|()| ProcessMonitorError::Sampler)?;
+        for (session, identity) in monitored {
+            let Some(Ok(current)) = trees.get(&identity.pid()) else {
                 self.remove_previous(session.session.session_id());
                 report.warning_count = report.warning_count.saturating_add(1);
                 continue;
             };
-            let activity = self.replace_previous(session.session.session_id(), current);
+            let activity = self.replace_previous(session.session.session_id(), current.clone());
             let Some(activity) = activity else {
                 continue;
             };
@@ -255,12 +283,18 @@ mod tests {
     }
 
     impl ProcessTreeSampler for FakeSampler {
-        fn sample_tree(&self, _root: &ProcessIdentity) -> Result<ProcessTreeSnapshot, ()> {
-            self.snapshots
+        fn sample_trees(
+            &self,
+            roots: &[ProcessIdentity],
+        ) -> Result<BTreeMap<ProcessId, Result<ProcessTreeSnapshot, ()>>, ()> {
+            let snapshot = self
+                .snapshots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop_front()
-                .ok_or(())
+                .ok_or(())?;
+            assert_eq!(roots, [snapshot.root().clone()]);
+            Ok(BTreeMap::from([(snapshot.root().pid(), Ok(snapshot))]))
         }
     }
 

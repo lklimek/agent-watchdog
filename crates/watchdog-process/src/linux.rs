@@ -68,16 +68,42 @@ impl LinuxProcessSampler {
         &self,
         expected_root: &ProcessIdentity,
     ) -> Result<ProcessTreeSnapshot, ProcessReadError> {
-        let fresh_root = self.read_identity(expected_root.pid())?;
-        if &fresh_root != expected_root {
-            return Err(ProcessReadError::IdentityMismatch {
-                pid: expected_root.pid(),
-            });
-        }
+        let (stats, uncertainties) = self.enumerate_stats()?;
+        self.sample_tree_from_stats(expected_root, &stats, &uncertainties)
+    }
 
+    /// Sample multiple independently verified roots from one bounded process-table capture.
+    ///
+    /// Root executable/PID identities and per-process I/O remain freshly read,
+    /// but `/proc` directory enumeration and parent relationships are shared.
+    /// One root failure is isolated in its map entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessReadError`] when the shared process table cannot be enumerated.
+    pub fn sample_trees(
+        &self,
+        expected_roots: &[ProcessIdentity],
+    ) -> Result<BTreeMap<ProcessId, Result<ProcessTreeSnapshot, ProcessReadError>>, ProcessReadError>
+    {
+        let (stats, uncertainties) = self.enumerate_stats()?;
+        Ok(expected_roots
+            .iter()
+            .map(|root| {
+                (
+                    root.pid(),
+                    self.sample_tree_from_stats(root, &stats, &uncertainties),
+                )
+            })
+            .collect())
+    }
+
+    fn enumerate_stats(
+        self,
+    ) -> Result<(BTreeMap<ProcessId, ProcStat>, BTreeSet<SampleUncertainty>), ProcessReadError>
+    {
         let mut uncertainties = BTreeSet::new();
         let mut stats = BTreeMap::new();
-        stats.insert(expected_root.pid(), read_stat(expected_root.pid())?);
         let entries = fs::read_dir(PROC_ROOT).map_err(ProcessReadError::Enumerate)?;
         let mut inspected = 0_usize;
         for entry in entries {
@@ -105,8 +131,24 @@ impl LinuxProcessSampler {
                 stats.insert(pid, stat);
             }
         }
+        Ok((stats, uncertainties))
+    }
 
-        let selected = descendant_ids(expected_root.pid(), &stats);
+    fn sample_tree_from_stats(
+        self,
+        expected_root: &ProcessIdentity,
+        stats: &BTreeMap<ProcessId, ProcStat>,
+        shared_uncertainties: &BTreeSet<SampleUncertainty>,
+    ) -> Result<ProcessTreeSnapshot, ProcessReadError> {
+        let fresh_root = self.read_identity(expected_root.pid())?;
+        if &fresh_root != expected_root {
+            return Err(ProcessReadError::IdentityMismatch {
+                pid: expected_root.pid(),
+            });
+        }
+        let mut uncertainties = shared_uncertainties.clone();
+
+        let selected = descendant_ids(expected_root.pid(), stats);
         let mut samples = Vec::with_capacity(selected.len());
         for pid in selected {
             let Some(stat) = stats.get(&pid).copied() else {

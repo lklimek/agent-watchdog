@@ -344,8 +344,12 @@ Counter decrease, PID start-time change, missing process data, or process-tree
 ambiguity invalidates the comparison and creates uncertainty; it does not create
 synthetic inactivity.
 
-The server samples verified identities every five seconds. The first sample is
-a baseline. Later trustworthy CPU, I/O, or new-descendant growth emits a
+The server samples verified identities every five seconds. Each cycle captures
+the bounded `/proc` process table and parent relationships once, then derives
+every independently verified session tree from that shared capture; it does not
+walk `/proc` once per agent. Root executable identity and per-process I/O remain
+freshly checked, and one root failure is isolated from the others. The first
+sample is a baseline. Later trustworthy CPU, I/O, or new-descendant growth emits a
 corroborating progress observation; all-four-counter growth records the
 actionable summary “All four CPU times grew versus the previous process
 snapshot.” Neutral samples emit nothing. Any uncertainty degrades process
