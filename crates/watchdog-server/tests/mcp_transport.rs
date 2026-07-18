@@ -159,6 +159,7 @@ async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
     for expected in [
         "register_session",
         "register_delegation",
+        "register_watch_path",
         "report_progress",
         "report_waiting",
         "complete_session",

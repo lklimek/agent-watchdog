@@ -231,6 +231,27 @@ impl WatchdogMcpService {
         )
     }
 
+    #[tool(
+        description = "Register one additional allowlisted filesystem path for an in-scope session"
+    )]
+    async fn register_watch_path(
+        &self,
+        Parameters(params): Parameters<RegisterWatchPathParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let transport = transport_key(&context)?;
+        json_result(
+            self.api
+                .register_watch_path(
+                    &transport,
+                    parse_session_id(&params.session_id)?,
+                    &params.event_key,
+                    &params.path,
+                )
+                .await,
+        )
+    }
+
     #[tool(description = "Report bounded event-driven progress for one in-scope session")]
     async fn report_progress(
         &self,
@@ -422,6 +443,13 @@ struct RegisterDelegationParams {
     child_session_id: String,
     event_key: String,
     deadline_ms: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RegisterWatchPathParams {
+    session_id: String,
+    event_key: String,
+    path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]

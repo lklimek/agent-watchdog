@@ -17,8 +17,9 @@ use watchdog_store::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
     ApplyObservation, ApplyResult, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
     NotificationAttemptRecord, NotificationChannel, NotificationOutcome, OutboxDestination,
-    RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreCounts, TerminationGate,
-    TerminationSafetyRecord, TerminationSagaRecord, TerminationStage, WatchdogStore,
+    RegisteredWatchPathRecord, RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreCounts,
+    StoreError, TerminationGate, TerminationSafetyRecord, TerminationSagaRecord, TerminationStage,
+    WatchdogStore,
 };
 
 fn fixture(observation_key: &str, event_id: u64, revision: u64) -> ApplyObservation {
@@ -398,7 +399,7 @@ async fn initialization_enables_required_sqlite_pragmas_and_schema() {
     assert_eq!(health.journal_mode, "wal");
     assert!(health.foreign_keys);
     assert!(health.schema_version >= 1);
-    assert_eq!(health.application_table_count, 13);
+    assert_eq!(health.application_table_count, 14);
 }
 
 #[tokio::test]
@@ -434,6 +435,81 @@ async fn manual_wipe_removes_watchdog_data_without_touching_adjacent_files() {
         b"runtime-owned"
     );
     fs::remove_file(native_file).expect("native fixture should be removable");
+}
+
+#[tokio::test]
+async fn registered_watch_paths_are_durable_idempotent_and_event_keys_cannot_be_reused() {
+    let database = TestDatabase::new("registered-watch-paths");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("store should open");
+    let main = fixture("watch-main", 1, 1);
+    let root = MainSessionId::from(SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "session-1")
+            .expect("fixture main should be valid"),
+    ));
+    store
+        .apply_observation(&main)
+        .await
+        .expect("main should persist");
+    let (child_apply, child) = child_fixture(root, 2);
+    store
+        .apply_observation(&child_apply)
+        .await
+        .expect("child should persist");
+    let record = RegisteredWatchPathRecord::new(
+        SessionIdentity::Child(child),
+        root,
+        "watch-path-1",
+        "/host/worktrees/project-a",
+        WallTimeMs::new(2_000),
+    )
+    .expect("record should be valid");
+
+    assert!(store.save_registered_watch_path(&record).await.unwrap());
+    assert!(!store.save_registered_watch_path(&record).await.unwrap());
+    assert_eq!(
+        store.registered_watch_paths(10).await.unwrap(),
+        vec![record.clone()]
+    );
+    assert_eq!(
+        store
+            .registered_watch_paths_for(SessionIdentity::Child(child), 10)
+            .await
+            .unwrap(),
+        vec![record]
+    );
+
+    let conflicting = RegisteredWatchPathRecord::new(
+        SessionIdentity::Child(child),
+        root,
+        "watch-path-1",
+        "/host/worktrees/project-b",
+        WallTimeMs::new(2_001),
+    )
+    .expect("conflicting record should be structurally valid");
+    assert!(matches!(
+        store.save_registered_watch_path(&conflicting).await,
+        Err(StoreError::WatchPathIdentityConflict)
+    ));
+    let duplicate_path = RegisteredWatchPathRecord::new(
+        SessionIdentity::Child(child),
+        root,
+        "watch-path-2",
+        "/host/worktrees/project-a",
+        WallTimeMs::new(2_002),
+    )
+    .expect("duplicate path should be structurally valid");
+    assert!(matches!(
+        store.save_registered_watch_path(&duplicate_path).await,
+        Err(StoreError::WatchPathIdentityConflict)
+    ));
+
+    drop(store);
+    let reopened = WatchdogStore::open(database.path())
+        .await
+        .expect("store should reopen");
+    assert_eq!(reopened.registered_watch_paths(10).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

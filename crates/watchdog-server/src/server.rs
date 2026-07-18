@@ -28,6 +28,7 @@ use crate::config::{ConfigManager, RuntimeConfig};
 use crate::process_monitor::ProcessMonitor;
 #[cfg(target_os = "linux")]
 use crate::termination::TerminationMonitor;
+use crate::watch_paths::WatchPathRegistry;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, ClaudeHookService,
     CodexDiscovery, CodexHookService, CompanionDiscovery, DashboardOutboxDispatcher,
@@ -132,13 +133,12 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let current = config.current();
     let clock = Arc::new(SystemClock::new());
     let store = WatchdogStore::open(&bootstrap.database_path).await?;
+    let watch_paths = initialize_watch_paths(&store, &clock, &config).await?;
     let health = HealthService::new(Arc::clone(&clock) as Arc<_>);
-    health.record(ComponentId::Store, ComponentStatus::Healthy, None);
-    health.record(ComponentId::Authorization, ComponentStatus::Healthy, None);
 
     let api = initialize_agent_api(&store, &clock, &current).await?;
-    health.record(ComponentId::Reducer, ComponentStatus::Healthy, None);
-    record_adapter_health(&health, &current);
+    api.configure_watch_paths(watch_paths.clone());
+    record_initial_health(&health, &current);
 
     #[cfg(target_os = "linux")]
     let linux_monitors = initialize_linux_monitors(&api, &store, &clock, &health, &current)?;
@@ -189,6 +189,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         reconcile_tx,
         filesystem_activity_tx,
         filesystem_uncertainty_generation,
+        watch_paths,
     );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
     let notification_worker = spawn_notification_worker(notification_dispatcher, health.clone());
@@ -230,6 +231,13 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+fn record_initial_health(health: &HealthService, config: &RuntimeConfig) {
+    health.record(ComponentId::Store, ComponentStatus::Healthy, None);
+    health.record(ComponentId::Authorization, ComponentStatus::Healthy, None);
+    health.record(ComponentId::Reducer, ComponentStatus::Healthy, None);
+    record_adapter_health(health, config);
 }
 
 fn application_router(
@@ -552,6 +560,16 @@ async fn initialize_agent_api(
     .await?;
     api.mark_restarted().await?;
     Ok(api)
+}
+
+async fn initialize_watch_paths(
+    store: &WatchdogStore,
+    clock: &Arc<SystemClock>,
+    config: &ConfigManager,
+) -> Result<WatchPathRegistry, ServerError> {
+    WatchPathRegistry::load(store.clone(), Arc::clone(clock) as Arc<_>, config.clone())
+        .await
+        .map_err(|_| ServerError::WatchPathRegistry)
 }
 
 #[cfg(target_os = "linux")]
@@ -887,16 +905,20 @@ fn spawn_watcher_supervisor(
     reconcile: mpsc::Sender<()>,
     filesystem_activity: mpsc::Sender<Vec<PathBuf>>,
     filesystem_uncertainty_generation: Arc<AtomicU64>,
+    watch_paths: WatchPathRegistry,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut applied = config.current();
-        let mut watcher = build_watcher(&applied, &health);
+        let mut applied_watch_generation = watch_paths.generation();
+        let mut watcher = build_watcher(&applied, &health, &watch_paths);
         let _ = reconcile.try_send(());
         while !stop.load(Ordering::Acquire) {
             let candidate = config.current();
-            if !Arc::ptr_eq(&applied, &candidate) {
-                watcher = build_watcher(&candidate, &health);
+            let watch_generation = watch_paths.generation();
+            if !Arc::ptr_eq(&applied, &candidate) || applied_watch_generation != watch_generation {
+                watcher = build_watcher(&candidate, &health, &watch_paths);
                 applied = candidate;
+                applied_watch_generation = watch_generation;
                 let _ = reconcile.try_send(());
             }
             if let Some(signal) = watcher
@@ -923,7 +945,7 @@ fn spawn_watcher_supervisor(
                             &filesystem_activity,
                             &filesystem_uncertainty_generation,
                         );
-                        watcher = build_watcher(&applied, &health);
+                        watcher = build_watcher(&applied, &health, &watch_paths);
                     }
                     WatchSignal::ReconcileAll(_) => {
                         filesystem_uncertainty_generation.fetch_add(1, Ordering::AcqRel);
@@ -1021,7 +1043,11 @@ struct WatchRegistry {
     worktree_paths: BTreeMap<WatchTargetId, PathBuf>,
 }
 
-fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<WatchRegistry> {
+fn build_watcher(
+    config: &RuntimeConfig,
+    health: &HealthService,
+    registered: &WatchPathRegistry,
+) -> Option<WatchRegistry> {
     let Ok(mut watcher) = WatchService::new(WATCH_QUEUE_CAPACITY) else {
         health.record(
             ComponentId::Watcher,
@@ -1047,62 +1073,28 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
             .cloned()
             .map(|root| (root, false)),
     );
-    let exclusions = config.exclusions();
     let Ok(scan_budget) = ScanBudget::new(4, WATCH_TARGET_LIMIT, 4 * 1_024 * 1_024) else {
         return None;
     };
     let scanner = DirectoryScanner::new(scan_budget);
     let mut next_target = 1_u64;
-    let mut degraded = false;
     let mut worktree_paths = BTreeMap::new();
-    for (configured_root, is_worktree) in roots
-        .into_iter()
-        .filter(|(root, _)| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
-    {
-        let Ok(root) = CapabilityRoot::new(configured_root) else {
-            degraded = true;
-            continue;
-        };
-        let scan = scanner.scan(&root, Path::new("."));
-        let directories = if let Ok(scan) = scan {
-            degraded |= scan.uncertainty().is_some();
-            scan.directories().to_vec()
-        } else {
-            degraded = true;
-            Vec::new()
-        };
-        let candidates = std::iter::once(root.path().to_owned()).chain(directories);
-        for directory in candidates.filter(|directory| {
-            !exclusions
-                .iter()
-                .any(|excluded| directory.starts_with(excluded))
-        }) {
-            if usize::try_from(next_target).map_or(true, |target| target > WATCH_TARGET_LIMIT) {
-                degraded = true;
-                break;
-            }
-            let Ok(relative) = directory.strip_prefix(root.path()) else {
-                degraded = true;
-                continue;
-            };
-            let target = WatchTargetId::new(next_target);
-            next_target = next_target.saturating_add(1);
-            let Ok(target) = target else {
-                degraded = true;
-                continue;
-            };
-            if watcher.add_target(target, &root, relative).is_err() {
-                degraded = true;
-                continue;
-            }
-            if is_worktree
-                && let Some(native_path) =
-                    native_worktree_path(&directory, config.worktree_mappings())
-            {
-                worktree_paths.insert(target, native_path);
-            }
-        }
-    }
+    let mut degraded = add_registered_watch_paths(
+        &mut watcher,
+        config,
+        registered,
+        &mut next_target,
+        &mut worktree_paths,
+    );
+    add_configured_watch_paths(
+        &mut watcher,
+        config,
+        roots,
+        &scanner,
+        &mut next_target,
+        &mut worktree_paths,
+        &mut degraded,
+    );
     if degraded {
         health.record(
             ComponentId::Watcher,
@@ -1116,6 +1108,118 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
         service: watcher,
         worktree_paths,
     })
+}
+
+fn add_registered_watch_paths(
+    watcher: &mut WatchService,
+    config: &RuntimeConfig,
+    registered: &WatchPathRegistry,
+    next_target: &mut u64,
+    worktree_paths: &mut BTreeMap<WatchTargetId, PathBuf>,
+) -> bool {
+    let mut degraded = false;
+    match registered.projected_paths(config) {
+        Ok((paths, incomplete)) => {
+            degraded |= incomplete;
+            for (record, directory) in paths {
+                if usize::try_from(*next_target).map_or(true, |target| target > WATCH_TARGET_LIMIT)
+                {
+                    degraded = true;
+                    break;
+                }
+                let Some(mapping) = config
+                    .worktree_mappings()
+                    .iter()
+                    .filter(|mapping| directory.starts_with(mapping.mounted_root()))
+                    .max_by_key(|mapping| mapping.mounted_root().components().count())
+                else {
+                    degraded = true;
+                    continue;
+                };
+                let Ok(root) = CapabilityRoot::new(mapping.mounted_root()) else {
+                    degraded = true;
+                    continue;
+                };
+                let Ok(relative) = directory.strip_prefix(root.path()) else {
+                    degraded = true;
+                    continue;
+                };
+                let Ok(target) = WatchTargetId::new(*next_target) else {
+                    degraded = true;
+                    continue;
+                };
+                *next_target = (*next_target).saturating_add(1);
+                if watcher.add_target(target, &root, relative).is_err() {
+                    degraded = true;
+                    continue;
+                }
+                worktree_paths.insert(target, PathBuf::from(record.native_path()));
+            }
+        }
+        Err(_) => degraded = true,
+    }
+    degraded
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_configured_watch_paths(
+    watcher: &mut WatchService,
+    config: &RuntimeConfig,
+    roots: Vec<(PathBuf, bool)>,
+    scanner: &DirectoryScanner,
+    next_target: &mut u64,
+    worktree_paths: &mut BTreeMap<WatchTargetId, PathBuf>,
+    degraded: &mut bool,
+) {
+    let exclusions = config.exclusions();
+    for (configured_root, is_worktree) in roots
+        .into_iter()
+        .filter(|(root, _)| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
+    {
+        let Ok(root) = CapabilityRoot::new(configured_root) else {
+            *degraded = true;
+            continue;
+        };
+        let scan = scanner.scan(&root, Path::new("."));
+        let directories = if let Ok(scan) = scan {
+            *degraded |= scan.uncertainty().is_some();
+            scan.directories().to_vec()
+        } else {
+            *degraded = true;
+            Vec::new()
+        };
+        let candidates = std::iter::once(root.path().to_owned()).chain(directories);
+        for directory in candidates.filter(|directory| {
+            !exclusions
+                .iter()
+                .any(|excluded| directory.starts_with(excluded))
+        }) {
+            if usize::try_from(*next_target).map_or(true, |target| target > WATCH_TARGET_LIMIT) {
+                *degraded = true;
+                break;
+            }
+            let Ok(relative) = directory.strip_prefix(root.path()) else {
+                *degraded = true;
+                continue;
+            };
+            let target = WatchTargetId::new(*next_target);
+            *next_target = (*next_target).saturating_add(1);
+            let Ok(target) = target else {
+                *degraded = true;
+                continue;
+            };
+            if watcher.add_target(target, &root, relative).is_err() {
+                *degraded = true;
+                continue;
+            }
+            if is_worktree
+                && let Some(native_path) =
+                    native_worktree_path(&directory, config.worktree_mappings())
+            {
+                worktree_paths.insert(target, native_path);
+            }
+        }
+    }
 }
 
 fn native_worktree_path(
@@ -1276,6 +1380,9 @@ pub enum ServerError {
     /// Webhook client configuration failed.
     #[error("Human notification configuration is invalid")]
     NotificationConfiguration,
+    /// Durable agent watch-path state could not be restored safely.
+    #[error("Registered watch-path state is unavailable")]
+    WatchPathRegistry,
     /// GitHub enrichment client configuration failed.
     #[error("GitHub enrichment configuration is invalid")]
     GitHubConfiguration,
@@ -1306,6 +1413,7 @@ impl ServerError {
             Self::AgentApi(_) => "agent_api",
             Self::ProcessSampler => "process_sampler",
             Self::NotificationConfiguration => "notification_configuration",
+            Self::WatchPathRegistry => "watch_path_registry",
             Self::GitHubConfiguration => "github_configuration",
             Self::Signal => "signal",
             Self::Bind => "bind",

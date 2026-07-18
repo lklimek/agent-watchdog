@@ -6,8 +6,9 @@ mod repositories;
 pub use records::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
     DeadlineRecord, FileCursorRecord, InboxOffsetRecord, NotificationAttemptRecord,
-    NotificationChannel, NotificationOutcome, RecordInputError, RelationRecord,
-    SessionMetadataRecord, StoredSessionRecord, TerminationSafetyRecord, TerminationSagaRecord,
+    NotificationChannel, NotificationOutcome, RecordInputError, RegisteredWatchPathRecord,
+    RelationRecord, SessionMetadataRecord, StoredSessionRecord, TerminationSafetyRecord,
+    TerminationSagaRecord,
 };
 pub use watchdog_domain::{TerminationGate, TerminationStage};
 
@@ -587,6 +588,7 @@ impl WatchdogStore {
             "DELETE FROM deadlines",
             "DELETE FROM file_cursors",
             "DELETE FROM activity_samples",
+            "DELETE FROM registered_watch_paths",
             "DELETE FROM state_transitions",
             "DELETE FROM session_snapshots",
             "DELETE FROM observations",
@@ -702,6 +704,9 @@ pub enum StoreError {
     /// One idempotency key was reused for materially different content.
     #[error("Observation identity was reused with different content")]
     ObservationIdentityConflict,
+    /// One watch-path event key was reused for materially different content.
+    #[error("Watch-path event identity was reused with different content")]
+    WatchPathIdentityConflict,
     /// Cross-record identities do not describe one session tree.
     #[error("Observation, snapshot, and event identities do not agree")]
     IdentityMismatch,

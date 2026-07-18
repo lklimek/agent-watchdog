@@ -93,6 +93,14 @@ configured, and process evidence continue independently. Do not mount all of
 credentials and configuration, while the latter can pin stale inodes after
 SQLite recreates them.
 
+Agents may use MCP `register_watch_path` to add an existing directory beneath a
+configured native worktree prefix. The server projects it through the matching
+read-only container mount, rejects traversal, missing paths, exclusions, and
+symlink escapes, and restores accepted registrations after restart. Explicit
+registrations receive watcher-budget priority and become exact child ownership
+for filesystem activity. Registration cannot expand the Compose mount or access
+a path outside the preconfigured prefix.
+
 Keep `automation_enabled = false` while validating a new
 installation. Main sessions are excluded from automated termination regardless
 of this switch.

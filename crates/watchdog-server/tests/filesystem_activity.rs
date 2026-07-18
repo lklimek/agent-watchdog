@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use watchdog_domain::{RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs};
 use watchdog_server::{AgentApi, DiscoveredSession, FilesystemActivityReconciler};
-use watchdog_store::WatchdogStore;
+use watchdog_store::{RegisteredWatchPathRecord, WatchdogStore};
 use watchdog_testkit::FakeClock;
 
 #[tokio::test]
@@ -49,6 +49,56 @@ async fn single_owner_advances_while_shared_worktree_remains_neutral() {
     assert_eq!(
         progress_for(&store, "shared-b").await,
         Some("Session registered with Agent Watchdog".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn registered_additional_path_becomes_exact_child_activity_ownership() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(10_000),
+        5_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let parent = discover_main(&api).await;
+    discover_child(&api, parent, "registered", "/host/repositories/original").await;
+    let child = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query")
+        .into_iter()
+        .find(|record| record.native.native_id() == "registered")
+        .expect("registered child should exist");
+    store
+        .save_registered_watch_path(
+            &RegisteredWatchPathRecord::new(
+                child.session,
+                child.root,
+                "registered-path",
+                "/host/repositories/additional",
+                WallTimeMs::new(10_000),
+            )
+            .expect("registered path should be valid"),
+        )
+        .await
+        .expect("registered path should persist");
+    let reconciler = FilesystemActivityReconciler::new(api, store.clone(), clock);
+
+    let report = reconciler
+        .reconcile(&[PathBuf::from("/host/repositories/additional/src/lib.rs")])
+        .await
+        .expect("ownership should reconcile");
+
+    assert_eq!(report.attributed(), 1);
+    assert_eq!(report.ambiguous(), 0);
+    assert_eq!(
+        progress_for(&store, "registered").await,
+        Some("Filesystem activity in owned worktree".to_owned())
     );
 }
 

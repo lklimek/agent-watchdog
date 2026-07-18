@@ -111,6 +111,81 @@ impl SessionMetadataRecord {
     }
 }
 
+/// Durable capability-validated native path registered by one scoped agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RegisteredWatchPathRecord {
+    session: SessionIdentity,
+    root: MainSessionId,
+    event_key: BoundedText<512>,
+    native_path: BoundedText<4_096>,
+    registered_at: WallTimeMs,
+}
+
+impl RegisteredWatchPathRecord {
+    /// Construct one bounded watch-path registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`watchdog_domain::DomainInputError`] for empty or oversized text.
+    pub fn new(
+        session: SessionIdentity,
+        root: MainSessionId,
+        event_key: impl Into<String>,
+        native_path: impl Into<String>,
+        registered_at: WallTimeMs,
+    ) -> Result<Self, watchdog_domain::DomainInputError> {
+        let event_key = BoundedText::new("watch_path_event_key", event_key)?;
+        let native_path = BoundedText::new("registered_watch_path", native_path)?;
+        if event_key.is_empty() {
+            return Err(watchdog_domain::DomainInputError::Empty {
+                field: "watch_path_event_key",
+            });
+        }
+        if native_path.is_empty() {
+            return Err(watchdog_domain::DomainInputError::Empty {
+                field: "registered_watch_path",
+            });
+        }
+        Ok(Self {
+            session,
+            root,
+            event_key,
+            native_path,
+            registered_at,
+        })
+    }
+
+    /// Session that owns this registration.
+    #[must_use]
+    pub const fn session(&self) -> SessionIdentity {
+        self.session
+    }
+
+    /// Main tree containing the session.
+    #[must_use]
+    pub const fn root(&self) -> MainSessionId {
+        self.root
+    }
+
+    /// Caller idempotency key.
+    #[must_use]
+    pub fn event_key(&self) -> &str {
+        self.event_key.as_str()
+    }
+
+    /// Capability-validated runtime-native path.
+    #[must_use]
+    pub fn native_path(&self) -> &str {
+        self.native_path.as_str()
+    }
+
+    /// Durable registration time.
+    #[must_use]
+    pub const fn registered_at(&self) -> WallTimeMs {
+        self.registered_at
+    }
+}
+
 fn optional_bounded<const N: usize>(
     field: &'static str,
     value: Option<String>,
