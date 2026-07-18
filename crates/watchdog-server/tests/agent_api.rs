@@ -3,15 +3,16 @@
 use std::sync::Arc;
 
 use watchdog_domain::{
-    AdapterIdentity, Clock, DetailedState, DomainEventKind, DurationMs, EvidenceTrust,
-    NativeSessionKey, ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource,
-    RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
+    AdapterIdentity, BoundedText, Clock, CorrelationBasis, DetailedState, DomainEventKind,
+    DurationMs, EvidenceTrust, NativeSessionKey, ObservationEnvelope, ObservationId,
+    ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, RuntimeKind, SessionId,
+    SessionKind, TimePoint, WallTimeMs,
 };
 use watchdog_server::{
-    AgentApi, AgentApiError, CompletionOutcome, DiscoveredSession, RegisterSession,
+    AgentApi, AgentApiError, AgentEventView, CompletionOutcome, DiscoveredSession, RegisterSession,
     RepositoryMetadata, TransportKey,
 };
-use watchdog_store::{OutboxDestination, WatchdogStore};
+use watchdog_store::{ActivityEvidence, ActivitySampleRecord, OutboxDestination, WatchdogStore};
 use watchdog_testkit::FakeClock;
 
 async fn api_fixture() -> (AgentApi, WatchdogStore, Arc<FakeClock>) {
@@ -534,6 +535,153 @@ async fn scheduler_reconciles_all_sessions_without_persisting_noop_ticks() {
         assert_eq!(event.subject().session_id(), main);
         assert!(matches!(event.kind(), DomainEventKind::AlertDue));
     }
+}
+
+#[tokio::test]
+async fn parent_alert_event_contains_complete_bounded_diagnostics() {
+    let (api, store, clock) = api_fixture().await;
+    let transport = TransportKey::new("diagnostic-main").expect("transport should be valid");
+    let main = register_main(&api, &transport, "diagnostic-main", "register-main").await;
+    let child_id = prepare_diagnostic_child(&api, &store, &clock, &transport, main).await;
+
+    clock.advance(DurationMs::new(15 * 60_000));
+    api.reconcile_timers()
+        .await
+        .expect("alert threshold should reconcile");
+    let page = api
+        .list_events(&transport, Some(0), 100)
+        .await
+        .expect("parent events should list");
+    let alert = page
+        .events
+        .iter()
+        .find(|view| {
+            view.event.subject().session_id() == child_id
+                && matches!(view.event.kind(), DomainEventKind::AlertDue)
+        })
+        .expect("child alert should exist");
+    assert_complete_diagnostics(alert);
+}
+
+async fn prepare_diagnostic_child(
+    api: &AgentApi,
+    store: &WatchdogStore,
+    clock: &Arc<FakeClock>,
+    transport: &TransportKey,
+    main: SessionId,
+) -> SessionId {
+    let child = api
+        .register_session(
+            transport,
+            RegisterSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: "diagnostic-child".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(main),
+                event_key: "register-child".to_owned(),
+            },
+        )
+        .await
+        .expect("child should register");
+    let child_id = child.session.session_id();
+    api.report_progress(
+        transport,
+        child_id,
+        "long-operation",
+        "running the slow suite".to_owned(),
+        Some("cargo test".to_owned()),
+    )
+    .await
+    .expect("operation should report");
+    let native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "diagnostic-child")
+        .expect("native identity should be valid");
+    let process = ProcessIdentity::new(
+        ProcessId::new(4_242).expect("PID should be valid"),
+        99,
+        BoundedText::new("executable", "/usr/bin/claude").expect("executable should be valid"),
+    );
+    api.ingest_native_observation(
+        ObservationEnvelope::new(
+            ObservationId::from_native(RuntimeKind::ClaudeCode, "process", "diagnostic-child")
+                .expect("observation ID should be valid"),
+            native,
+            clock.now(),
+            ObservationSource::new(
+                AdapterIdentity::new(RuntimeKind::ClaudeCode, "linux-procfs-v1")
+                    .expect("adapter should be valid"),
+                "process:identity",
+                EvidenceTrust::Corroborating,
+                None,
+            )
+            .expect("source should be valid"),
+            ObservationPayload::ProcessIdentity(process),
+        )
+        .expect("observation should be valid"),
+    )
+    .await
+    .expect("process identity should apply");
+    store
+        .save_latest_activity(&ActivitySampleRecord {
+            session: child.session,
+            observed_at: clock.now().wall_time(),
+            evidence: ActivityEvidence::ProcessCpu {
+                user_ticks: 0,
+                system_ticks: 0,
+                child_user_ticks: 0,
+                child_system_ticks: 0,
+            },
+        })
+        .await
+        .expect("fresh process check should persist");
+    child_id
+}
+
+fn assert_complete_diagnostics(alert: &AgentEventView) {
+    assert_eq!(
+        alert
+            .diagnostics
+            .process_identity
+            .as_ref()
+            .expect("PID diagnostics should exist")
+            .pid()
+            .value(),
+        4_242
+    );
+    assert_eq!(alert.diagnostics.process_activity.len(), 1);
+    let activity_source = alert
+        .diagnostics
+        .process_activity_provenance
+        .as_ref()
+        .expect("process provenance should exist");
+    assert_eq!(activity_source.adapter().version(), "linux-procfs-v1");
+    assert_eq!(activity_source.fingerprint(), "process:tree-delta");
+    assert_eq!(
+        alert.diagnostics.active_operation.as_deref(),
+        Some("cargo test: running the slow suite")
+    );
+    assert!(
+        alert
+            .diagnostics
+            .signal_times
+            .last_trusted_transition
+            .is_some()
+    );
+    assert!(
+        alert
+            .diagnostics
+            .signal_times
+            .latest_process_sample
+            .is_some()
+    );
+    assert!(alert.diagnostics.source_conflicts.is_empty());
+    let correlation = alert
+        .diagnostics
+        .correlation
+        .as_ref()
+        .expect("selected parent correlation should exist");
+    assert_eq!(correlation.basis, CorrelationBasis::McpRegistration);
+    assert!(correlation.evidence.starts_with("mcp:register_delegation:"));
+    assert!(!alert.diagnostics.suggested_checks.is_empty());
 }
 
 fn native_state_observation(

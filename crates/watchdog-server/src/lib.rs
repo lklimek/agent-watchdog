@@ -20,9 +20,10 @@ mod termination;
 mod watch_paths;
 
 pub use agent_api::{
-    AgentApi, AgentApiError, AgentEventView, AgentHealthView, CompletionOutcome, DiscoveredSession,
-    EventPage, RegisterSession, RepositoryMetadata, SessionTreeView, SessionView,
-    TimerReconciliationReport, TransportKey, WaitingKind,
+    AgentApi, AgentApiError, AgentCorrelationView, AgentDiagnosticView, AgentEventView,
+    AgentHealthView, AgentSignalTimes, CompletionOutcome, DiscoveredSession, EventPage,
+    RegisterSession, RepositoryMetadata, SessionTreeView, SessionView, TimerReconciliationReport,
+    TransportKey, WaitingKind,
 };
 pub use auth::{
     BasicAuthError, BasicAuthenticator, BearerAuthError, BearerAuthenticator,

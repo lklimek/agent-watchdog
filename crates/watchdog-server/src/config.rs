@@ -562,6 +562,36 @@ mod tests {
     }
 
     #[test]
+    fn standard_and_additional_runtime_locations_coexist_as_explicit_mappings() {
+        let fixture = ConfigFixture::new();
+        let additional = fixture.root.path().join("codex-additional");
+        fs::create_dir(&additional).expect("additional Codex root should exist");
+        let standard_line = format!("codex_roots = [{}]", toml_string(&fixture.codex));
+        let mapped_lines = format!(
+            "native_codex_roots = [\"/host/.codex\", \"/srv/codex-state\"]\n\
+             codex_roots = [{}, {}]",
+            toml_string(&fixture.codex),
+            toml_string(&additional)
+        );
+        fixture.write(&fixture.valid_toml().replace(&standard_line, &mapped_lines));
+
+        let manager = ConfigManager::load(&fixture.config_path)
+            .expect("standard and additional roots should load");
+        let config = manager.current();
+        assert_eq!(config.codex_roots().len(), 2);
+        let mappings = config.runtime_path_mappings(watchdog_domain::RuntimeKind::CodexCli);
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(
+            mappings[0].native_root(),
+            std::path::Path::new("/host/.codex")
+        );
+        assert_eq!(
+            mappings[1].native_root(),
+            std::path::Path::new("/srv/codex-state")
+        );
+    }
+
+    #[test]
     fn invalid_reload_preserves_last_snapshot_and_records_bounded_error() {
         let fixture = ConfigFixture::new();
         fixture.write(&fixture.valid_toml());

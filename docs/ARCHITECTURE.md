@@ -419,8 +419,11 @@ freshly checked, and one root failure is isolated from the others. The first
 sample is a baseline. Later trustworthy CPU, I/O, or new-descendant growth emits a
 corroborating progress observation; all-four-counter growth records the
 actionable summary “All four CPU times grew versus the previous process
-snapshot.” Neutral samples emit nothing. Any uncertainty degrades process
-health and cannot authorize destructive action.
+snapshot.” The latest trustworthy CPU delta replaces the previous diagnostic
+sample for that session and signal kind; v1 does not retain a five-second CPU
+time series. Neutral samples emit no progress but remain available as the fresh
+pre-alert diagnostic. Any uncertainty degrades process health and cannot
+authorize destructive action.
 
 ## 10. Correlation
 
@@ -471,9 +474,14 @@ remain active while CPU, I/O, output, child-process, or native operation evidenc
 progresses. A parent-provided deadline overrides the fallback until changed or
 expired.
 
-Immediately before an alert, the coordinator requests cheap fresh process and
-adapter checks. The resulting event includes the evidence snapshot used for the
-decision.
+On Linux, each five-second timer cycle samples verified process trees before it
+evaluates stall deadlines. Positive deltas become progress before the timer can
+alert; a trustworthy neutral delta is retained as fresh corroboration without
+being treated as negative evidence. The timer does not perform an expensive
+transcript rescan. Each parent event carries an explicit bounded diagnostic
+bundle: PID identity, latest process deltas and provenance, trusted signal
+times, active-operation summary, source conflicts, selected correlation
+basis/evidence, and deterministic suggested checks.
 
 ## 12. Termination safety architecture
 
@@ -537,6 +545,14 @@ truncation moves to a newly established EOF boundary and degrades adapter health
 Incompatible complete records advance the cursor, degrade adapter health, and
 place an `UPGRADE` warning on the exactly associated session.
 Only typed lifecycle/activity evidence is retained; transcript bodies are not.
+
+“Standard location” in the supported Docker deployment means a tracked
+Compose/environment/TOML template, not an implicit home-directory capability.
+Docker resolves bind mounts before the server can inspect runtime state, so
+autodetection cannot safely add an unconfigured host path. Every standard or
+additional location therefore remains a concrete read-only bind paired with an
+explicit native-to-mounted mapping; adding one requires configuration but never
+an image rebuild.
 
 ## 13. Persistence
 
