@@ -13,24 +13,28 @@ use std::{
 
 use axum::Router;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
-use watchdog_domain::{RuntimeKind, SecretText};
+use watchdog_domain::{AdapterIdentity, BoundedText, Clock as _, RuntimeKind, SecretText};
 use watchdog_runtime::{
-    CapabilityRoot, ComponentId, ComponentStatus, WatchService, WatchSignal, WatchTargetId,
+    CapabilityRoot, ComponentId, ComponentStatus, DirectoryScanner, ScanBudget, WatchService,
+    WatchSignal, WatchTargetId,
 };
-use watchdog_store::WatchdogStore;
+use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
 
 use crate::config::{ConfigManager, RuntimeConfig};
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, DashboardOutboxDispatcher, DashboardService,
-    GitHubEnricher, HealthService, HumanNotifier, NotificationEndpoints, SystemClock,
-    TerminationConfig, WebhookEndpoint, dashboard_router, health_router, mcp_router,
+    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscoveryReport, ClaudeTeamDiscovery,
+    DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService, HumanNotifier,
+    NotificationEndpoints, SystemClock, TerminationConfig, WebhookEndpoint, dashboard_router,
+    health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
+const WATCH_TARGET_LIMIT: usize = 4_096;
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
+const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
 
 /// Initialize structured JSON tracing using `RUST_LOG` or a safe info default.
 ///
@@ -151,7 +155,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         Arc::clone(&clock) as Arc<_>,
     );
     let _notifier = HumanNotifier::new(
-        store,
+        store.clone(),
         Arc::clone(&clock) as Arc<_>,
         bootstrap.notification_endpoints.clone(),
     )
@@ -176,9 +180,22 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         .merge(dashboard_router(dashboard, bootstrap.basic_auth.clone()))
         .merge(mcp_router(api.clone(), bootstrap.bearer_auth.clone()));
 
+    let (reconcile_tx, reconcile_rx) = mpsc::channel(1);
+    let discovery_worker = spawn_discovery_worker(
+        config.clone(),
+        ClaudeTeamDiscovery::new(api.clone()),
+        store.clone(),
+        Arc::clone(&clock),
+        health.clone(),
+        reconcile_rx,
+    );
     let watcher_stop = Arc::new(AtomicBool::new(false));
-    let watcher =
-        spawn_watcher_supervisor(config.clone(), health.clone(), Arc::clone(&watcher_stop));
+    let watcher = spawn_watcher_supervisor(
+        config.clone(),
+        health.clone(),
+        Arc::clone(&watcher_stop),
+        reconcile_tx,
+    );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
     let reload_worker = spawn_reload_worker(config, api, health.clone())?;
 
@@ -196,11 +213,107 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         .map_err(|_| ServerError::Serve);
 
     watcher_stop.store(true, Ordering::Release);
+    discovery_worker.abort();
     dashboard_worker.abort();
     reload_worker.abort();
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+fn spawn_discovery_worker(
+    config: ConfigManager,
+    claude: ClaudeTeamDiscovery,
+    store: WatchdogStore,
+    clock: Arc<SystemClock>,
+    health: HealthService,
+    mut requested: mpsc::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PERIODIC_RECONCILIATION);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                signal = requested.recv() => {
+                    if signal.is_none() {
+                        return;
+                    }
+                }
+            }
+            let current = config.current();
+            if !current.adapters().claude() {
+                continue;
+            }
+            let report = claude
+                .reconcile(current.claude_roots(), current.allowed_worktree_roots())
+                .await;
+            record_claude_discovery_health(&store, &clock, &health, report).await;
+        }
+    })
+}
+
+async fn record_claude_discovery_health(
+    store: &WatchdogStore,
+    clock: &SystemClock,
+    health: &HealthService,
+    report: ClaudeDiscoveryReport,
+) {
+    let now = clock.now().wall_time();
+    let (status, component, message) = if report.is_degraded() {
+        (
+            AdapterHealthStatus::Degraded,
+            ComponentStatus::Degraded,
+            Some("Some Claude team records could not be reconciled safely"),
+        )
+    } else {
+        (AdapterHealthStatus::Healthy, ComponentStatus::Healthy, None)
+    };
+    health.record(
+        ComponentId::Adapter(RuntimeKind::ClaudeCode),
+        component,
+        message,
+    );
+    let Ok(adapter) = AdapterIdentity::new(
+        RuntimeKind::ClaudeCode,
+        watchdog_claude::TESTED_CLAUDE_VERSION,
+    ) else {
+        return;
+    };
+    let record = AdapterHealthRecord {
+        adapter,
+        status,
+        last_success: Some(now),
+        last_error: report.is_degraded().then_some(now),
+        affected_scope: if report.is_degraded() {
+            BoundedText::new("affected_scope", "configured Claude roots").ok()
+        } else {
+            None
+        },
+        message: message
+            .and_then(|message| BoundedText::new("adapter_health_message", message).ok()),
+    };
+    if store.save_adapter_health(&record).await.is_err() {
+        health.record(
+            ComponentId::Adapter(RuntimeKind::ClaudeCode),
+            ComponentStatus::Degraded,
+            Some("Claude discovery health could not be persisted"),
+        );
+        tracing::warn!(
+            event = "adapter.health_persist_failed",
+            runtime = RuntimeKind::ClaudeCode.as_str(),
+            "Adapter health persistence failed"
+        );
+    } else {
+        tracing::info!(
+            event = "adapter.reconciled",
+            runtime = RuntimeKind::ClaudeCode.as_str(),
+            main_sessions = report.main_sessions(),
+            child_sessions = report.child_sessions(),
+            warnings = report.warning_count(),
+            "Runtime adapter reconciliation completed"
+        );
+    }
 }
 
 fn record_adapter_health(health: &HealthService, config: &RuntimeConfig) {
@@ -281,26 +394,33 @@ fn spawn_watcher_supervisor(
     config: ConfigManager,
     health: HealthService,
     stop: Arc<AtomicBool>,
+    reconcile: mpsc::Sender<()>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut applied = config.current();
         let mut watcher = build_watcher(&applied, &health);
+        let _ = reconcile.try_send(());
         while !stop.load(Ordering::Acquire) {
             let candidate = config.current();
             if !Arc::ptr_eq(&applied, &candidate) {
                 watcher = build_watcher(&candidate, &health);
                 applied = candidate;
+                let _ = reconcile.try_send(());
             }
             if let Some(signal) = watcher.as_ref().and_then(WatchService::next_signal) {
                 match signal {
                     WatchSignal::Targets(_) => {
                         health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
+                        let _ = reconcile.try_send(());
                     }
-                    WatchSignal::ReconcileAll(_) => health.record(
-                        ComponentId::Watcher,
-                        ComponentStatus::Degraded,
-                        Some("Filesystem events were lost; reconciliation is required"),
-                    ),
+                    WatchSignal::ReconcileAll(_) => {
+                        health.record(
+                            ComponentId::Watcher,
+                            ComponentStatus::Degraded,
+                            Some("Filesystem events were lost; reconciliation is required"),
+                        );
+                        let _ = reconcile.try_send(());
+                    }
                 }
             }
             std::thread::park_timeout(Duration::from_millis(100));
@@ -323,35 +443,61 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
     roots.extend_from_slice(config.codex_roots());
     roots.extend_from_slice(config.companion_roots());
     let exclusions = config.exclusions();
-    for (index, root) in roots
+    let Ok(scan_budget) = ScanBudget::new(4, WATCH_TARGET_LIMIT, 4 * 1_024 * 1_024) else {
+        return None;
+    };
+    let scanner = DirectoryScanner::new(scan_budget);
+    let mut next_target = 1_u64;
+    let mut degraded = false;
+    for configured_root in roots
         .into_iter()
-        .filter(|root| {
+        .filter(|root| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
+    {
+        let Ok(root) = CapabilityRoot::new(configured_root) else {
+            degraded = true;
+            continue;
+        };
+        let scan = scanner.scan(&root, Path::new("."));
+        let directories = if let Ok(scan) = scan {
+            degraded |= scan.uncertainty().is_some();
+            scan.directories().to_vec()
+        } else {
+            degraded = true;
+            Vec::new()
+        };
+        let candidates = std::iter::once(root.path().to_owned()).chain(directories);
+        for directory in candidates.filter(|directory| {
             !exclusions
                 .iter()
-                .any(|excluded| excluded.as_path() == root.as_path())
-        })
-        .enumerate()
-    {
-        let target = u64::try_from(index)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .and_then(|value| WatchTargetId::new(value).ok());
-        let registration =
-            target
-                .zip(CapabilityRoot::new(root).ok())
-                .is_some_and(|(target, root)| {
-                    watcher.add_target(target, &root, Path::new(".")).is_ok()
-                });
-        if !registration {
-            health.record(
-                ComponentId::Watcher,
-                ComponentStatus::Degraded,
-                Some("A configured filesystem root could not be watched"),
-            );
-            return Some(watcher);
+                .any(|excluded| directory.starts_with(excluded))
+        }) {
+            if usize::try_from(next_target).map_or(true, |target| target > WATCH_TARGET_LIMIT) {
+                degraded = true;
+                break;
+            }
+            let Ok(relative) = directory.strip_prefix(root.path()) else {
+                degraded = true;
+                continue;
+            };
+            let target = WatchTargetId::new(next_target);
+            next_target = next_target.saturating_add(1);
+            if target
+                .ok()
+                .is_none_or(|target| watcher.add_target(target, &root, relative).is_err())
+            {
+                degraded = true;
+            }
         }
     }
-    health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
+    if degraded {
+        health.record(
+            ComponentId::Watcher,
+            ComponentStatus::Degraded,
+            Some("Some configured filesystem directories could not be watched within bounds"),
+        );
+    } else {
+        health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
+    }
     Some(watcher)
 }
 

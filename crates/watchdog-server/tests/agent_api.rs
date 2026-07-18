@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
-use watchdog_domain::{RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs};
-use watchdog_server::{AgentApi, AgentApiError, CompletionOutcome, RegisterSession, TransportKey};
+use watchdog_domain::{DurationMs, RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs};
+use watchdog_server::{
+    AgentApi, AgentApiError, CompletionOutcome, DiscoveredSession, RegisterSession, TransportKey,
+};
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
 
@@ -111,6 +113,19 @@ async fn child_registration_progress_and_completion_are_idempotent_and_scoped() 
         duplicate.snapshot.last_progress_summary(),
         Some("verification: running cargo test")
     );
+    let conflicting_retry = api
+        .report_progress(
+            &transport,
+            child_id,
+            "progress-1",
+            "running a different command".to_owned(),
+            Some("verification".to_owned()),
+        )
+        .await;
+    assert!(
+        conflicting_retry.is_err(),
+        "reusing an event key with a different payload must remain an error"
+    );
 
     let completed = api
         .complete_session(
@@ -129,6 +144,90 @@ async fn child_registration_progress_and_completion_are_idempotent_and_scoped() 
         api.list_sessions(&transport)
             .await
             .expect("tree should list")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn native_discovery_is_idempotent_persists_metadata_and_remains_mcp_bindable() {
+    let (api, store, clock) = api_fixture().await;
+    let main = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::CodexCli,
+            native_id: "discovered-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "codex-state:discovered-main".to_owned(),
+            title: Some("Native title".to_owned()),
+            startup_directory: Some("/work/repository".to_owned()),
+        })
+        .await
+        .expect("main should be auto-discovered");
+    let child_request = DiscoveredSession {
+        runtime: RuntimeKind::CodexCli,
+        native_id: "discovered-child".to_owned(),
+        kind: SessionKind::Child,
+        parent: Some(main.session.session_id()),
+        event_key: "codex-state:discovered-child".to_owned(),
+        title: Some("Native child".to_owned()),
+        startup_directory: Some("/work/repository-child".to_owned()),
+    };
+    let child = api
+        .discover_session(child_request.clone())
+        .await
+        .expect("child should be auto-discovered");
+    let duplicate = api
+        .discover_session(child_request)
+        .await
+        .expect("repeated discovery should be harmless");
+    assert_eq!(child.snapshot.revision(), duplicate.snapshot.revision());
+
+    clock.advance(DurationMs::new(1_000));
+    let restarted = AgentApi::new(store.clone(), clock)
+        .await
+        .expect("API should restart from store");
+    let rediscovered_main = restarted
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::CodexCli,
+            native_id: "discovered-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "codex-state:discovered-main".to_owned(),
+            title: Some("Native title".to_owned()),
+            startup_directory: Some("/work/repository".to_owned()),
+        })
+        .await
+        .expect("main rediscovery after restart should be harmless");
+    restarted
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::CodexCli,
+            native_id: "discovered-child".to_owned(),
+            kind: SessionKind::Child,
+            parent: Some(rediscovered_main.session.session_id()),
+            event_key: "codex-state:discovered-child".to_owned(),
+            title: Some("Native child".to_owned()),
+            startup_directory: Some("/work/repository-child".to_owned()),
+        })
+        .await
+        .expect("child rediscovery after restart should be harmless");
+
+    let metadata = store
+        .session_metadata(child.session)
+        .await
+        .expect("metadata query should succeed")
+        .expect("metadata should exist");
+    assert_eq!(metadata.title(), Some("Native child"));
+    assert_eq!(metadata.startup_directory(), Some("/work/repository-child"));
+
+    let transport = TransportKey::new("discovered-parent-mcp").expect("valid transport");
+    api.bind_discovered_main(&transport, main.session.session_id())
+        .await
+        .expect("MCP should bind an auto-discovered main");
+    assert_eq!(
+        api.list_sessions(&transport)
+            .await
+            .expect("discovered tree should list")
             .len(),
         2
     );

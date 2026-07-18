@@ -18,7 +18,8 @@ pub const MAX_HOOK_BYTES: usize = 64 * 1_024;
 /// Largest accepted team configuration snapshot.
 pub const MAX_TEAM_CONFIG_BYTES: usize = 1_024 * 1_024;
 const MAX_TEAM_MEMBERS: usize = 256;
-const TESTED_VERSION: &str = "2.1.212";
+/// Claude Code version used for the current adapter compatibility fixtures.
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.212";
 
 /// Parser for official Claude Code lifecycle hook input.
 #[derive(Clone, Debug)]
@@ -544,7 +545,7 @@ impl ClaudeParseError {
         CompatibilityWarning::new(
             WarningKind::Upgrade,
             format!(
-                "Update Agent Watchdog's Claude adapter; tested with Claude Code {TESTED_VERSION}"
+                "Update Agent Watchdog's Claude adapter; tested with Claude Code {TESTED_CLAUDE_VERSION}"
             ),
         )
         .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))

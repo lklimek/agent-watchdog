@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use notify::{Config, ErrorKind, Event, INotifyWatcher, RecursiveMode, Watcher};
+use notify::{Config, ErrorKind, Event, EventKind, INotifyWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 
 use crate::{CapabilityRoot, PathAccessError};
@@ -218,6 +218,9 @@ fn handle_event(
         kernel_rescan.store(true, Ordering::Release);
         return;
     }
+    if matches!(&event.kind, EventKind::Access(_) | EventKind::Other) {
+        return;
+    }
     let Ok(targets) = targets.read() else {
         backend_degraded.store(true, Ordering::Release);
         return;
@@ -253,7 +256,8 @@ fn map_watch_error(error: &notify::Error) -> WatchError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -261,9 +265,12 @@ mod tests {
         },
     };
 
-    use notify::{Event, EventKind, event::Flag};
+    use notify::{
+        Event, EventKind,
+        event::{AccessKind, Flag},
+    };
 
-    use super::{TargetMap, handle_event};
+    use super::{TargetMap, WatchTargetId, handle_event};
 
     #[test]
     fn kernel_rescan_flag_bypasses_the_bounded_event_queue() {
@@ -284,5 +291,33 @@ mod tests {
 
         assert!(kernel_rescan.load(Ordering::Acquire));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn filesystem_reads_do_not_trigger_reconciliation_feedback() {
+        let path = PathBuf::from("/watched/team/config.json");
+        let target = WatchTargetId::new(1).expect("fixture target should be valid");
+        let targets: TargetMap = Arc::new(RwLock::new(BTreeMap::from([(
+            path.clone(),
+            BTreeSet::from([target]),
+        )])));
+        let (sender, receiver) = sync_channel(1);
+        let queue_saturated = AtomicBool::new(false);
+        let backend_degraded = AtomicBool::new(false);
+        let kernel_rescan = AtomicBool::new(false);
+
+        handle_event(
+            Event::new(EventKind::Access(AccessKind::Read)).add_path(path),
+            &targets,
+            &sender,
+            &queue_saturated,
+            &backend_degraded,
+            &kernel_rescan,
+        );
+
+        assert!(receiver.try_recv().is_err());
+        assert!(!queue_saturated.load(Ordering::Acquire));
+        assert!(!backend_degraded.load(Ordering::Acquire));
+        assert!(!kernel_rescan.load(Ordering::Acquire));
     }
 }

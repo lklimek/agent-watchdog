@@ -2807,6 +2807,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "watchdog-claude",
  "watchdog-domain",
  "watchdog-process",
  "watchdog-runtime",
