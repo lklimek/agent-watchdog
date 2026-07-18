@@ -4,3 +4,5 @@
 **/*.db-shm
 **/*.db-wal
 .env
+/config/traefik-users
+/config/watchdog.toml

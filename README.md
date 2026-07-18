@@ -18,6 +18,7 @@ Implementation follows the approved planning package:
 - [Test specification](docs/TEST_SPECIFICATION.md)
 - [Development plan](docs/DEVELOPMENT_PLAN.md)
 - [Contribution and quality gates](CONTRIBUTING.md)
+- [Linux Docker Compose operations](docs/OPERATIONS.md)
 
 Phase 0 architecture probes and their measured decisions are recorded under
 [`docs/spikes`](docs/spikes/README.md). Production crates live under `crates/`.

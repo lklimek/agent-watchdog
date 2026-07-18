@@ -29,6 +29,10 @@ fn invalid_configured_tokens_are_rejected() {
         BearerAuthenticator::new("x".repeat(MAX_AUTHORIZATION_BYTES)),
         Err(BearerAuthError::TooLong)
     ));
+    assert!(matches!(
+        BearerAuthenticator::new("line\nbreak"),
+        Err(BearerAuthError::InvalidCharacters)
+    ));
 }
 
 #[test]

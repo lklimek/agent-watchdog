@@ -1,0 +1,38 @@
+http:
+  routers:
+    watchdog-mcp:
+      entryPoints:
+        - web
+      middlewares:
+        - watchdog-trusted
+      priority: 100
+      rule: PathPrefix(`/mcp`)
+      service: watchdog
+    watchdog-web:
+      entryPoints:
+        - web
+      middlewares:
+        - watchdog-trusted
+        - watchdog-basic-auth
+      priority: 1
+      rule: PathPrefix(`/`)
+      service: watchdog
+
+  middlewares:
+    watchdog-basic-auth:
+      basicAuth:
+        removeHeader: false
+        usersFile: /run/secrets/watchdog-users
+    watchdog-trusted:
+      ipAllowList:
+        sourceRange:
+          {{- range $cidr := splitList "," (env "WATCHDOG_TRUSTED_CIDRS") }}
+          - {{ $cidr | trim | quote }}
+          {{- end }}
+
+  services:
+    watchdog:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: http://agent-watchdog:8080

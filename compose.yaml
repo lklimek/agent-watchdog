@@ -1,0 +1,180 @@
+name: agent-watchdog
+
+services:
+  agent-watchdog:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        BUILD_DATE: ${WATCHDOG_BUILD_DATE:-unknown}
+        VERSION: ${WATCHDOG_VERSION:-0.1.0}
+        VCS_REF: ${WATCHDOG_VCS_REF:-unknown}
+    image: ghcr.io/lklimek/agent-watchdog:${WATCHDOG_IMAGE_TAG:-local}
+    restart: unless-stopped
+    init: true
+    user: "${WATCHDOG_UID:?Set WATCHDOG_UID}:${WATCHDOG_GID:?Set WATCHDOG_GID}"
+    pid: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 20s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=${WATCHDOG_UID},gid=${WATCHDOG_GID},mode=1777
+    expose:
+      - "8080"
+    environment:
+      RUST_LOG: ${RUST_LOG:-watchdog_server=info,watchdog_runtime=info,watchdog_store=info}
+      WATCHDOG_BASIC_PASSWORD: ${WATCHDOG_BASIC_PASSWORD:?Set WATCHDOG_BASIC_PASSWORD}
+      WATCHDOG_BASIC_USERNAME: ${WATCHDOG_BASIC_USERNAME:?Set WATCHDOG_BASIC_USERNAME}
+      WATCHDOG_BEARER_TOKEN: ${WATCHDOG_BEARER_TOKEN:?Set WATCHDOG_BEARER_TOKEN}
+      WATCHDOG_CONFIG_PATH: /etc/agent-watchdog/watchdog.toml
+      WATCHDOG_DATABASE_PATH: /var/lib/agent-watchdog/watchdog.db
+      WATCHDOG_GITHUB_TOKEN: ${WATCHDOG_GITHUB_TOKEN:-}
+      WATCHDOG_HOME_ASSISTANT_WEBHOOK: ${WATCHDOG_HOME_ASSISTANT_WEBHOOK:-}
+      WATCHDOG_LISTEN_ADDRESS: 0.0.0.0:8080
+      WATCHDOG_WEBHOOK: ${WATCHDOG_WEBHOOK:-}
+    volumes:
+      - type: volume
+        source: watchdog-data
+        target: /var/lib/agent-watchdog
+      - type: bind
+        source: ${WATCHDOG_CONFIG_FILE:?Set WATCHDOG_CONFIG_FILE}
+        target: /etc/agent-watchdog/watchdog.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_CLAUDE_PROJECTS_PATH:?Set WATCHDOG_CLAUDE_PROJECTS_PATH}
+        target: /monitored/claude/projects
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_CLAUDE_TEAMS_PATH:?Set WATCHDOG_CLAUDE_TEAMS_PATH}
+        target: /monitored/claude/teams
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_CLAUDE_TASKS_PATH:?Set WATCHDOG_CLAUDE_TASKS_PATH}
+        target: /monitored/claude/tasks
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_CODEX_STATE_DB_PATH:?Set WATCHDOG_CODEX_STATE_DB_PATH}
+        target: /monitored/codex/state/state_5.sqlite
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_CODEX_SESSIONS_PATH:?Set WATCHDOG_CODEX_SESSIONS_PATH}
+        target: /monitored/codex/sessions
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_COMPANION_STATE_PATH:?Set WATCHDOG_COMPANION_STATE_PATH}
+        target: /monitored/companion
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_WORKTREE_ROOT_PATH:?Set WATCHDOG_WORKTREE_ROOT_PATH}
+        target: /monitored/worktrees
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/agent-watchdog", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  traefik:
+    image: traefik:v3.7.8@sha256:4299bbed850421258fc5448c2e0e6ad350981d4d335a68de11b92448aedbefe5
+    restart: unless-stopped
+    init: true
+    user: "${WATCHDOG_UID:?Set WATCHDOG_UID}:${WATCHDOG_GID:?Set WATCHDOG_GID}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      agent-watchdog:
+        condition: service_healthy
+        restart: true
+    command:
+      - --global.checkNewVersion=false
+      - --global.sendAnonymousUsage=false
+      - --entryPoints.web.address=:8080
+      - --entryPoints.web.http.encodedCharacters.allowEncodedSlash=false
+      - --entryPoints.web.http.encodedCharacters.allowEncodedBackSlash=false
+      - --entryPoints.web.http.encodedCharacters.allowEncodedNullCharacter=false
+      - --entryPoints.web.http.encodedCharacters.allowEncodedSemicolon=false
+      - --entryPoints.web.http.encodedCharacters.allowEncodedPercent=false
+      - --entryPoints.web.http.encodedCharacters.allowEncodedQuestionMark=false
+      - --entryPoints.web.http.encodedCharacters.allowEncodedHash=false
+      - --entryPoints.health.address=:8081
+      - --entryPoints.health.http.encodedCharacters.allowEncodedSlash=false
+      - --entryPoints.health.http.encodedCharacters.allowEncodedBackSlash=false
+      - --entryPoints.health.http.encodedCharacters.allowEncodedNullCharacter=false
+      - --entryPoints.health.http.encodedCharacters.allowEncodedSemicolon=false
+      - --entryPoints.health.http.encodedCharacters.allowEncodedPercent=false
+      - --entryPoints.health.http.encodedCharacters.allowEncodedQuestionMark=false
+      - --entryPoints.health.http.encodedCharacters.allowEncodedHash=false
+      - --providers.file.filename=/etc/traefik/dynamic.yaml
+      - --providers.file.watch=false
+      - --ping=true
+      - --ping.entryPoint=health
+      - --api.dashboard=false
+      - --api.insecure=false
+      - --log.format=json
+      - --log.level=INFO
+      - --accesslog=true
+      - --accesslog.format=json
+    environment:
+      WATCHDOG_TRUSTED_CIDRS: ${WATCHDOG_TRUSTED_CIDRS:?Set WATCHDOG_TRUSTED_CIDRS}
+    ports:
+      - name: watchdog-http
+        target: 8080
+        published: "${WATCHDOG_HTTP_PORT:-8080}"
+        host_ip: ${WATCHDOG_HTTP_BIND_ADDRESS:-127.0.0.1}
+        protocol: tcp
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=65532,gid=65532,mode=1777
+    volumes:
+      - type: bind
+        source: ./config/traefik-dynamic.yaml
+        target: /etc/traefik/dynamic.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets:
+      - source: traefik-users
+        target: watchdog-users
+    healthcheck:
+      test:
+        - CMD
+        - traefik
+        - healthcheck
+        - --entryPoints.health.address=:8081
+        - --ping=true
+        - --ping.entryPoint=health
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  watchdog-data:
+
+secrets:
+  traefik-users:
+    file: ${WATCHDOG_TRAEFIK_USERS_FILE:?Set WATCHDOG_TRAEFIK_USERS_FILE}
