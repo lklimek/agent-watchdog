@@ -528,7 +528,7 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         .expect("metadata should query")
         .expect("metadata should exist");
     assert_eq!(metadata.title(), Some("Detailed persistence review"));
-    assert_eq!(metadata.startup_directory(), Some("/host/repositories/job"));
+    assert_eq!(metadata.startup_directory(), None);
 
     assert_companion_log_activity(
         &discovery,
@@ -540,6 +540,70 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         children[0].session,
     )
     .await;
+}
+
+#[tokio::test]
+async fn companion_discovery_keeps_jobs_from_distinct_wrapper_sessions() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let companion_root = fixture.path().join("companion");
+    let workspace_state = companion_root.join("workspace-state");
+    fs::create_dir_all(&workspace_state).expect("workspace state should exist");
+    fs::write(
+        workspace_state.join("state.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "jobs": [
+                {
+                    "id": "companion-job-a",
+                    "sessionId": "wrapper-session-a",
+                    "workspaceRoot": "/host/repositories/coordinator",
+                    "status": "running"
+                },
+                {
+                    "id": "companion-job-b",
+                    "sessionId": "wrapper-session-b",
+                    "workspaceRoot": "/host/repositories/coordinator",
+                    "status": "running"
+                }
+            ]
+        }))
+        .expect("fixture JSON should serialize"),
+    )
+    .expect("summary should be written");
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(20_000),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = CompanionDiscovery::new(api, store.clone(), clock);
+
+    let report = discovery.reconcile(&[companion_root], &[]).await;
+    assert_eq!(report.main_sessions(), 2);
+    assert_eq!(report.child_sessions(), 2);
+    assert_eq!(report.warning_count(), 0);
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 2);
+    assert_eq!(children.len(), 2);
+    assert!(
+        children
+            .iter()
+            .all(|child| mains.iter().any(|main| main.root == child.root)),
+        "each Companion job must remain attached to its own exact wrapper session"
+    );
 }
 
 fn write_companion_summary(path: &Path) {

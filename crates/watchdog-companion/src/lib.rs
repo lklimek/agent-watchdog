@@ -251,7 +251,10 @@ impl CompanionJob {
         self.parent.as_ref()
     }
 
-    /// Untrusted job workspace for later capability validation.
+    /// Untrusted dispatch cwd used only to reconcile native records.
+    ///
+    /// Companion does not guarantee this is the child's actual worktree, so it
+    /// must never establish filesystem ownership by itself.
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root

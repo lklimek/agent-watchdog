@@ -1295,7 +1295,7 @@ impl CompanionDiscovery {
     pub async fn reconcile(
         &self,
         companion_roots: &[PathBuf],
-        worktree_mappings: &[WorktreePathMapping],
+        _worktree_mappings: &[WorktreePathMapping],
     ) -> CompanionDiscoveryReport {
         let mut report = RuntimeDiscoveryReport::default();
         let mut mains = BTreeSet::new();
@@ -1363,7 +1363,6 @@ impl CompanionDiscovery {
                         .reconcile_companion_job(
                             &parser,
                             &reconciled,
-                            worktree_mappings,
                             &mut report,
                             &mut mains,
                             &mut children,
@@ -1389,7 +1388,6 @@ impl CompanionDiscovery {
         &self,
         parser: &watchdog_companion::CompanionParser,
         reconciled: &watchdog_companion::ReconciledCompanionJob,
-        worktree_mappings: &[WorktreePathMapping],
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
@@ -1427,11 +1425,11 @@ impl CompanionDiscovery {
         }
 
         let child_id = SessionId::from_native(reconciled.subject());
-        let startup_directory = validated_directory(
-            Some(reconciled_job.workspace_root()),
-            worktree_mappings,
-            report,
-        );
+        // Companion's workspaceRoot identifies where the dispatch was issued,
+        // not necessarily where the child performs its work. Treating it as a
+        // worktree would grant false filesystem ownership. Exact child paths
+        // come from native runtime evidence or explicit MCP registration.
+        let startup_directory = None;
         if let Err(error) = self
             .api
             .discover_session(DiscoveredSession {
