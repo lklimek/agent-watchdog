@@ -119,6 +119,26 @@ restarting the dispatcher does not send it again.
 The reference run completed in 5.04 seconds, matching the intentional timeout
 without delaying agent ingestion.
 
+## Filesystem-storm safety gate
+
+The Linux watcher test writes 100 files into a target backed by a one-slot
+callback queue. The producer remains nonblocking, collapses the loss into one
+`LocalQueueSaturated` reconciliation signal, and does not allocate an unbounded
+event backlog. The server records watcher uncertainty as degraded health and
+schedules bounded adapter reconciliation. A termination-monitor regression test
+also proves that degraded watcher health prevents a stalled child from entering
+the termination saga; restoring both watcher and adapter health is required
+before the saga may start. Terminal and safety observations use the independent
+durable coordinator path and remain intact.
+
+The supported Compose stack was additionally exercised by creating 12,000 files
+in a newly discovered QA worktree directory in 232 ms. Inotify coalescing kept
+the production 4,096-slot callback boundary below saturation, watcher health
+remained healthy, the service stayed ready, and an authenticated dashboard
+request completed with HTTP 200 in 3.1 ms. Forced overflow remains deterministic
+in the one-slot watcher test above; the Compose burst demonstrates that ordinary
+high-rate topology activity remains responsive without requiring overflow.
+
 ## Architectural impact
 
 Keep a bounded observation channel and a single transactional reducer owner.
