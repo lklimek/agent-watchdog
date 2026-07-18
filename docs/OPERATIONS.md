@@ -117,6 +117,37 @@ On its first mount, Docker copies a sticky world-writable directory scaffold so
 the configured non-root UID can create the SQLite database. Database files are
 then owned by that UID.
 
+## Optional Claude lifecycle hooks
+
+Automatic filesystem discovery works without hooks. For lower-latency native
+state enrichment, configure Claude Code lifecycle commands to POST their stdin
+payload to `/hooks/claude`. This route bypasses browser Basic auth, but remains
+behind the Traefik source allowlist and requires the same application Bearer
+credential as MCP. Requests larger than 64 KiB are rejected, and Watchdog never
+retains hook message/prompt bodies.
+
+Keep the credential out of the hook command line and process list. For example,
+create a user-readable-only curl configuration outside the monitored roots:
+
+```text
+url = "https://watchdog.example/hooks/claude"
+header = "Authorization: Bearer replace-with-WATCHDOG_BEARER_TOKEN"
+header = "Content-Type: application/json"
+data-binary = "@-"
+connect-timeout = 2
+max-time = 5
+fail-with-body
+silent
+show-error
+```
+
+Use `curl --config /absolute/path/to/hook-curl.conf || true` as the command hook
+for `SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`,
+`SubagentStart`, and `SubagentStop`. The fail-open suffix keeps optional
+monitoring unavailability from blocking the agent. Protect the configuration
+with mode `0600`, and follow the current Claude Code hooks documentation when
+adding the command to user settings.
+
 ## Logs and health
 
 ```text

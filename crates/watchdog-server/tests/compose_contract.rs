@@ -70,6 +70,23 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
             "Compose must not create misspelled host paths"
         );
     }
+
+    let dynamic = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/traefik-dynamic.yaml"
+    ))
+    .expect("read Traefik routing policy");
+    assert!(dynamic.contains("watchdog-claude-hooks:"));
+    assert!(dynamic.contains("rule: Path(`/hooks/claude`)"));
+    let hook_route = dynamic
+        .split("watchdog-claude-hooks:")
+        .nth(1)
+        .expect("hook route should exist")
+        .split("watchdog-web:")
+        .next()
+        .expect("web route should follow hook route");
+    assert!(hook_route.contains("watchdog-trusted"));
+    assert!(!hook_route.contains("watchdog-basic-auth"));
 }
 
 fn service_block<'a>(compose: &'a str, service: &str, next: &str) -> &'a str {

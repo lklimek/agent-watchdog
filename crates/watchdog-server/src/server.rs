@@ -29,11 +29,12 @@ use crate::process_monitor::ProcessMonitor;
 #[cfg(target_os = "linux")]
 use crate::termination::TerminationMonitor;
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, CodexDiscovery,
-    CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler,
-    GitHubEnricher, HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints,
-    RepositoryMetadata, RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint,
-    dashboard_router, health_router, mcp_router,
+    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, ClaudeHookService,
+    CodexDiscovery, CompanionDiscovery, DashboardOutboxDispatcher, DashboardService,
+    FilesystemActivityReconciler, GitHubEnricher, HealthService, HumanNotifier,
+    HumanOutboxDispatcher, NotificationEndpoints, RepositoryMetadata, RuntimeDiscoveryReport,
+    SystemClock, TerminationConfig, WebhookEndpoint, claude_hook_router, dashboard_router,
+    health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
@@ -159,6 +160,10 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let router = Router::new()
         .merge(health_router(health.clone(), bootstrap.basic_auth.clone()))
         .merge(dashboard_router(dashboard, bootstrap.basic_auth.clone()))
+        .merge(claude_hook_router(
+            ClaudeHookService::new(api.clone(), Arc::clone(&clock) as Arc<_>),
+            bootstrap.bearer_auth.clone(),
+        ))
         .merge(mcp_router(api.clone(), bootstrap.bearer_auth.clone()));
 
     let (reconcile_tx, reconcile_rx) = mpsc::channel(1);

@@ -255,9 +255,18 @@ Evidence precedence:
 4. process ancestry and worktree evidence;
 5. timestamp heuristics.
 
-Automatic discovery watches the mounted Claude projects, teams, tasks, and
-configured hook inbox. Hooks are enrichment, not a monitoring prerequisite. Team
-files are read-only and never used as a cancellation mechanism.
+Automatic discovery watches the mounted Claude projects, teams, and tasks.
+Optional official lifecycle hooks post to the exact `/hooks/claude` endpoint
+through the trusted-source Traefik route and application Bearer authentication.
+Hooks are enrichment, not a monitoring prerequisite. Team files are read-only
+and never used as a cancellation mechanism.
+
+Hook requests are capped at 64 KiB before parsing. A UUIDv5 of the request bytes
+is the stable retry identity; raw bytes and secret-shaped message/prompt fields
+are never persisted or logged. Exact session and agent IDs create the hierarchy
+and authoritative state. Hook-supplied host paths remain untrusted and are not
+stored as metadata; independently capability-validated discovery or MCP may add
+paths later.
 
 For Claude Code 2.1.214, automatic project discovery accepts only the observed
 `<project>/<session-id>.jsonl` main layout and
