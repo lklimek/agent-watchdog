@@ -13,9 +13,13 @@ RUN mkdir -p \
     /rootfs/monitored/companion \
     /rootfs/monitored/worktrees \
     /rootfs/usr/local/bin \
+    /rootfs/usr/share/licenses/agent-watchdog \
     /rootfs/var/lib/agent-watchdog
 RUN chmod 1777 /rootfs/var/lib/agent-watchdog \
     && touch /rootfs/var/lib/agent-watchdog/.volume-initialized
+RUN cp /source/LICENSE /rootfs/usr/share/licenses/agent-watchdog/MIT.txt \
+    && cp /source/THIRD_PARTY_LICENSES/CDLA-Permissive-2.0.txt \
+        /rootfs/usr/share/licenses/agent-watchdog/CDLA-Permissive-2.0.txt
 RUN --mount=type=cache,id=agent-watchdog-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=agent-watchdog-release-target,target=/source/target \
     cargo build --locked --release -p watchdog-server \
