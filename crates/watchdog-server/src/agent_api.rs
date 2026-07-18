@@ -349,6 +349,35 @@ impl AgentApi {
         Ok(view)
     }
 
+    /// Apply one provenance-preserving runtime observation to an already
+    /// discovered native session.
+    ///
+    /// Retries reuse the timestamp already committed for the same observation
+    /// identity. Subject, source, and payload must still match exactly, so an
+    /// adapter cannot reuse an event key for materially different evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] when the session is absent, its stable native
+    /// identity conflicts, or reducer/persistence application fails.
+    pub async fn ingest_native_observation(
+        &self,
+        observation: ObservationEnvelope,
+    ) -> Result<SessionView, AgentApiError> {
+        let session_id = SessionId::from_native(observation.subject());
+        let record = self
+            .inner
+            .store
+            .session_by_id(session_id)
+            .await?
+            .ok_or(AgentApiError::SessionNotFound)?;
+        if record.native != *observation.subject() {
+            return Err(AgentApiError::SessionIdentityConflict);
+        }
+        self.apply_observation(&record, observation).await?;
+        self.view_for_record(&record).await
+    }
+
     /// Register/enrich a session and bind a main registration's transport once.
     ///
     /// # Errors
@@ -773,8 +802,16 @@ impl AgentApi {
         payload: ObservationPayload,
         now: TimePoint,
     ) -> Result<ApplyResult, AgentApiError> {
-        let mut observation = mcp_observation(record, operation, event_key, payload.clone(), now)?;
-        let lane = self.lane(record, now).await?;
+        let observation = mcp_observation(record, operation, event_key, payload, now)?;
+        self.apply_observation(record, observation).await
+    }
+
+    async fn apply_observation(
+        &self,
+        record: &StoredSessionRecord,
+        mut observation: ObservationEnvelope,
+    ) -> Result<ApplyResult, AgentApiError> {
+        let lane = self.lane(record, observation.observed_at()).await?;
         let mut lane = lane.lock().await;
         if let Some(existing) = self
             .inner
@@ -782,16 +819,16 @@ impl AgentApi {
             .observation(observation.observation_id())
             .await?
         {
-            // Agent API timestamps are assigned by this server, rather than
-            // supplied by the idempotent caller. Reuse the committed timestamp
-            // so a retry can still be compared byte-for-byte while preserving
-            // conflict detection for a reused key with another payload.
-            observation = mcp_observation(
-                record,
-                operation,
-                event_key,
-                payload,
+            // Ingestion timestamps are assigned while an event is observed,
+            // rather than being part of the caller's idempotency contract.
+            // Reuse the committed timestamp for byte-for-byte comparison while
+            // preserving conflict detection for source or payload changes.
+            observation = ObservationEnvelope::new(
+                observation.observation_id(),
+                observation.subject().clone(),
                 existing.observed_at(),
+                observation.source().clone(),
+                observation.payload().clone(),
             )?;
         }
         let result = lane.apply_observation(observation).await?;

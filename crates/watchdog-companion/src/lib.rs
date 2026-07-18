@@ -20,7 +20,8 @@ pub const MAX_SUMMARY_BYTES: usize = 2 * 1_024 * 1_024;
 pub const MAX_DETAIL_BYTES: usize = 8 * 1_024 * 1_024;
 const MAX_JOBS: usize = 50;
 const STATE_VERSION: u32 = 1;
-const TESTED_VERSION: &str = "1.0.6";
+/// Codex Companion version used for current compatibility fixtures.
+pub const TESTED_COMPANION_VERSION: &str = "1.0.6";
 
 /// Parser and reconciler for current Codex Companion persisted state.
 #[derive(Clone, Debug)]
@@ -290,6 +291,12 @@ impl CompanionJob {
     #[must_use]
     pub const fn source(&self) -> CompanionSource {
         self.source
+    }
+
+    /// Native update marker used to derive a stable reconciliation key.
+    #[must_use]
+    pub fn updated_at(&self) -> Option<&str> {
+        self.updated_at.as_ref().map(BoundedText::as_str)
     }
 
     /// Supported graceful interrupt identity when both current fields exist.
@@ -600,7 +607,7 @@ impl CompanionParseError {
         CompatibilityWarning::new(
             WarningKind::Upgrade,
             format!(
-                "Update Agent Watchdog's Codex Companion adapter; tested with plugin {TESTED_VERSION}"
+                "Update Agent Watchdog's Codex Companion adapter; tested with plugin {TESTED_COMPANION_VERSION}"
             ),
         )
         .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))

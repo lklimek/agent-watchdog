@@ -1,5 +1,7 @@
 [paths]
 allowed_worktree_roots = ["/monitored/worktrees"]
+# One runtime-native host prefix for each mounted root above, in the same order.
+native_worktree_roots = ["/home/example/git"]
 claude_roots = [
   "/monitored/claude/projects",
   "/monitored/claude/teams",

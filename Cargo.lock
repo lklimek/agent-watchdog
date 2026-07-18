@@ -2808,6 +2808,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "watchdog-claude",
+ "watchdog-companion",
  "watchdog-domain",
  "watchdog-process",
  "watchdog-runtime",

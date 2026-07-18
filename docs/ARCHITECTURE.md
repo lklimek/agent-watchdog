@@ -417,6 +417,15 @@ immediately before each signal. Signals are never constructed through a shell.
 The server must run as the same numeric host UID as monitored agents; it does not
 run privileged and receives no Docker socket.
 
+Runtime state records host-native working directories, while the supported
+container mounts each allowlisted host prefix at a narrow container path. An
+explicit ordered `native_worktree_roots` to `allowed_worktree_roots` projection
+validates each native path against the canonical mounted target without
+requiring a broad host mount. Traversal, missing targets, and symlink escapes
+discard path evidence and degrade the affected adapter. Human-facing metadata
+retains the native host path; filesystem access always uses the projected
+container path.
+
 ## 13. Persistence
 
 SQLite uses WAL, foreign keys, a busy timeout, and migrations embedded in the
