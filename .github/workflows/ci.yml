@@ -49,3 +49,16 @@ jobs:
           cargo audit --file tools/spikes/Cargo.lock
           cargo deny --config deny.toml check
           cargo deny --manifest-path tools/spikes/Cargo.toml --config deny.toml check
+
+  macos-build:
+    name: macOS build-only check
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Show Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Check workspace builds
+        run: cargo check --workspace --all-targets

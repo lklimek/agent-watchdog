@@ -94,6 +94,21 @@ logging features only. Their registry metadata, enabled feature trees,
 licenses, and current RustSec state were reviewed before inclusion. The
 production lockfile audit covered 316 dependencies with no vulnerability.
 
+## Final production graph review
+
+The 2026-07-18 final graph introduced `webpki-root-certs 1.0.8` through
+`reqwest 0.13.4 -> rustls-platform-verifier 0.7.0`. This is the Rustls project's
+Mozilla trust-anchor data and is licensed under `CDLA-Permissive-2.0`. The
+license is permissive but requires its text to accompany redistributed data.
+The exact SPDX license is therefore allowed in `deny.toml`, its unmodified text
+is tracked under `THIRD_PARTY_LICENSES/`, and both that notice and the project's
+MIT license are copied into `/usr/share/licenses/agent-watchdog/` in the runtime
+image. No wildcard, source, ban, or advisory exception was added.
+
+`cargo-deny 0.20.2` reported advisories, bans, licenses, and sources all `ok`
+after that distribution-compliance fix. Duplicate transitive versions remain
+warnings under the established policy.
+
 ## Primary sources
 
 - <https://crates.io/>

@@ -8,16 +8,16 @@ remain normative.
 ## Repository state
 
 - Working branch: `feat/implementation`.
-- Latest implementation commit before this handoff refresh:
-  `ec3258a feat(mcp): complete parent alert diagnostics`; latest committed
-  documentation checkpoint: `96c4e89 docs: refresh functional closure checkpoint`.
+- Latest committed checkpoint before the final-QA slice:
+  `6504412 docs: record production capacity gates`.
 - No implementation commits in this phase have been pushed. Pushing remains an
   explicit user decision; never push implicitly or directly to `main`.
-- The implementation worktree was clean immediately after `ec3258a`; the
-  handoff refresh itself is documentation-only.
-- Implementation is in Phase 10 integration hardening. Final release QA and the
-  lessons-learned phase have not started.
-- Do not work on macOS compatibility until the end of the project.
+- The final-QA slice includes a Companion ownership correction, release-license
+  packaging, a build-only macOS CI job, final evidence, and handoff documents.
+- Implementation, Linux final QA, self-review, and lessons learned are complete.
+  Only the explicitly external closure items listed below remain.
+- macOS runtime compatibility remains unsupported; only the end-of-project
+  build-only CI claim was added.
 
 ## Implemented and locally committed
 
@@ -150,23 +150,30 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
   provided, the Claude/Codex/Companion live matrix is explicitly **not run** and
   remains a release limitation rather than being silently exercised against
   operator sessions.
+- The deferred Claudius knowledge-transfer document was read during final QA and
+  audited item by item in `docs/spikes/claudius-knowledge-transfer-audit.md`.
+  One applicable mismatch was fixed: Companion `workspaceRoot` no longer grants
+  automatic child filesystem ownership because it identifies the dispatch cwd,
+  not necessarily the job worktree.
+- Final Linux QA passed: workspace format/tests/strict Clippy, production and
+  Phase-0 `cargo-audit`/`cargo-deny`, Compose expansion/security contract,
+  release image build/license extraction, explicit load/restart and slow-peer
+  gates, and a fresh 3/3 Playwright run through Traefik.
+- The Linux host cannot fully cross-check the SQLite-backed workspace for macOS
+  because it has no Apple compiler/SDK; the failure occurs in bundled SQLite C
+  compilation before project Rust code. Domain/process/testkit crates check for
+  `x86_64-apple-darwin`, and CI now has a build-only `macos-15` workspace job.
+  That CI job is unexecuted until the branch is pushed.
+- Final diff/security self-review found no remaining critical or high issue.
+  The Companion ownership correction, exact license distribution, and macOS CI
+  job are covered by tests or release evidence above.
 
-## Remaining Phase 10 work
+## Remaining external closure work
 
 1. Run the explicitly isolated live-runtime matrix only if a disposable
    credentialed runtime environment is supplied. Never inspect existing user
    sessions; otherwise retain the recorded not-run release limitation.
-2. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
-   Compose config/security checks, browser QA, explicit load/slow-peer tests, and
-   any supported live matrix tests.
-3. Perform fresh security/self-review and independent review; fix all critical or
-   high findings.
-4. Only during final QA, read
-   `/data/artifacts/claudius/2026-07-17/watchdog-knowledge-transfer.html`,
-   interpret it in the context of `https://github.com/lklimek/claudius`, and
-   audit the implementation against every applicable pitfall. Do not read it
-   earlier.
-5. Do the deferred macOS build-only check at the end without adding unsupported
-   deployment features.
-6. Update final version matrix, known limitations, release evidence, TODOs, and
-   lessons learned; then stop for the user's explicit push decision.
+2. Obtain an actual macOS CI result after the branch is pushed; the Linux
+   cross-check cannot compile bundled SQLite without an Apple SDK.
+3. Stop for the user's explicit push decision. Never push implicitly or
+   directly to `main`.

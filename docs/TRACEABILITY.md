@@ -54,7 +54,7 @@ not accepted deferrals.
 | FR-KILL-004 | T-KILL-006–008 | Durable graceful→TERM→KILL saga; graceful capability is optional | Automated |
 | FR-KILL-005 | T-CPU-007, T-KILL-007, T-KILL-010, T-KILL-011, T-OPS-002 | Fresh PID/start-time/executable checks and pidfd helper integration | Automated |
 | FR-KILL-006 | T-KILL-008, T-KILL-009 | Default-enabled configurable KILL stage and opt-out test | Automated |
-| FR-KILL-007 | T-KILL-013 | Adapter boundary is read-only; cancellation interface and OS signals are the only mutation capabilities | Automated contract; final security inspection pending |
+| FR-KILL-007 | T-KILL-013 | Adapter boundary is read-only; cancellation interface and OS signals are the only mutation capabilities | Automated contract and final security inspection passed |
 | FR-MCP-001 | T-MCP-001 | Bearer middleware before rmcp parsing/allocation; auth and transport tests | Automated |
 | FR-MCP-002 | T-MCP-002, T-MCP-003 | One immutable main-tree scope per transport and cross-tree rejection | Automated |
 | FR-MCP-003 | T-MCP-004 | Twelve bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated |
@@ -89,7 +89,7 @@ not accepted deferrals.
 | Requirement | Acceptance tests | Implementation and test evidence | Status |
 |---|---|---|---|
 | FR-DATA-001 | T-DATA-001–003, T-KILL-014, T-STA-010, T-STA-013, T-STA-014 | SQLite WAL store, atomic observation/snapshot/event/outbox writes, restart repositories | Automated |
-| FR-DATA-002 | T-DATA-004 | No pruning worker or retention delete path; history persists until wipe | Automated by store/restart behavior; final absence audit pending |
+| FR-DATA-002 | T-DATA-004 | No pruning worker or retention delete path; history persists until wipe | Automated by store/restart behavior; final absence audit passed |
 | FR-DATA-003 | T-DATA-005 | Store-only manual wipe test and Compose volume wipe procedure | Automated |
 | FR-DATA-004 | T-DATA-005 | Disposable named volume and documented no-backup guarantee | Automated/manual contract |
 | FR-CFG-001 | T-CFG-001, T-CFG-003 | Environment bootstrap snapshot, mounted TOML, secret types, concrete roots | Automated |
@@ -99,7 +99,7 @@ not accepted deferrals.
 | FR-OPS-003 | T-OPS-008 | 50-main/500-session production-service load and restart test | Explicit load target passed |
 | FR-OPS-004 | T-EVD-006 | Event-driven workers, bounded queues/scans/records, degradation health; isolated 500-session container gate | Automated; ten-minute CPU averaged 0.000% at Docker precision and burst p99 was 65.732 ms |
 | FR-OPS-005 | T-OPS-004, T-OPS-005 | Component health registry, isolated adapter degradation, critical readiness failure | Automated |
-| FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests | Automated; final log inspection pending |
+| FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests | Automated; final container logs inspected without warnings/errors |
 | FR-OPS-007 | T-OPS-007 | Health/log interface only; no metrics route or exporter | Automated route/Compose inspection |
 | FR-SEC-001 | T-CFG-004, T-CPU-010, T-HTTP-001, T-MCP-001 | Constant-time bounded credentials, secret wrappers, redacted errors/debug | Automated |
 | FR-SEC-002 | T-DIS-007, T-SEC-001 | Linux capability roots, canonical mappings, openat2/no-symlink tests, and rejected MCP traversal/out-of-prefix/symlink registrations | Automated |
@@ -111,17 +111,17 @@ not accepted deferrals.
 |---|---|---|---|
 | FR-COMP-001 | T-COMP-001 | Version-guarded adapters and documented observed versions | **Pending isolated current-runtime matrix** |
 | FR-COMP-002 | T-COMP-002, T-EVD-005, T-KILL-012, T-OPS-004 | Per-adapter/session `UPGRADE`, best-effort state, termination suspension | Automated |
-| FR-COMP-003 | T-COMP-004 | Synthetic adapters exist; real runtime tests must use dedicated roots | **Pending isolated live QA** |
-| FR-COMP-004 | T-COMP-005 | Reducer/correlation/timer/safety slices have synthetic typed-event TDD evidence | Implemented; final history review pending |
-| FR-COMP-005 | T-COMP-006 | Per-commit formatter, targeted tests, and strict Clippy evidence in checkpoint | Implemented; release dependency/security gates pending |
+| FR-COMP-003 | T-COMP-004 | Synthetic adapters exist; real runtime tests must use dedicated roots; Claudius transfer pitfalls audited | **Pending isolated live QA; current uncredentialed environment recorded as not run** |
+| FR-COMP-004 | T-COMP-005 | Reducer/correlation/timer/safety slices have synthetic typed-event TDD evidence and final diff self-review | Complete |
+| FR-COMP-005 | T-COMP-006 | Per-commit formatter, targeted tests, strict Clippy, audit/deny, Compose/image/browser release evidence | Final Linux engineering gates passed |
 
 ## Non-FR acceptance rules
 
 | Source rule | Acceptance tests | Evidence | Status |
 |---|---|---|---|
 | Requirements §7 detailed/compact state model | T-STA-001, T-STA-003, T-STA-011, T-STA-012 | Domain state projection and parent/child reducer aggregation tests | Automated |
-| UX Specification §13 accessibility | T-UI-008, T-UI-009 | Semantic Maud markup, focus/live regions, color-scheme/reduced-motion CSS, Playwright keyboard/mobile checks | Manual browser gate passed; final release rerun pending |
-| Product summary macOS build-only claim | T-COMP-003 | Linux boundaries are compile-gated | **Deferred to final project gate by user instruction** |
+| UX Specification §13 accessibility | T-UI-008, T-UI-009 | Semantic Maud markup, focus/live regions, color-scheme/reduced-motion CSS, Playwright keyboard/mobile checks | Final fresh 3/3 browser rerun passed through Traefik |
+| Product summary macOS build-only claim | T-COMP-003 | Linux boundaries are compile-gated; `macos-15` CI build-only job added; domain/process/testkit cross-check passes | **Actual macOS CI result pending push; Linux full cross-check blocked by missing Apple C SDK** |
 
 ## Load and live-release cases
 
@@ -138,5 +138,6 @@ not accepted deferrals.
 ## Open closure work
 
 1. Complete the isolated live-runtime matrix if a dedicated credentialed runtime
-   environment is available, dependency/security gates, final browser rerun,
-   deferred knowledge-transfer audit, and final macOS build-only check.
+   environment is available and obtain the first `macos-15` CI build-only result
+   after push. The deferred Claudius knowledge-transfer audit and all Linux
+   release gates are complete.
