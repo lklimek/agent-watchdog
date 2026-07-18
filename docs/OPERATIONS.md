@@ -179,6 +179,10 @@ are outside v1 scope.
   must describe the same username/password. MCP uses the separate Bearer token.
 - One adapter is `degraded`: inspect only that adapter's bounded health message
   and its exact mounted roots. Other runtimes should remain available.
+- `notifications` is `degraded`: a durable human-channel outbox record could not
+  be decoded, delivered, audited, or acknowledged. Agent inbox and monitoring
+  continue; inspect structured `notifications.delivery_failed` logs and the
+  configured webhook receiver.
 - Config reload warning: fix TOML syntax, threshold ordering, absent paths, or
   an exclusion outside every capability root, then send `SIGHUP` again.
 - UI says reconnecting: the last snapshot remains visible while SSE retries;

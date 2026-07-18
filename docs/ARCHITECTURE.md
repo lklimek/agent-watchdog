@@ -378,6 +378,9 @@ to compact UI states. Activity is a separate signal from state.
 The stall engine uses monotonic elapsed time during a boot. Persisted wall-clock
 deadlines support restart recovery, but a restart never immediately triggers a
 kill: adapters must reconcile and produce fresh trustworthy evidence first.
+The server evaluates retained main and child sessions every five seconds. A
+pre-threshold evaluation that changes nothing is not persisted, so the scheduler
+does not grow the observation ledger in proportion to polling frequency.
 
 Fallback policy:
 
@@ -541,13 +544,22 @@ raw HTML.
 
 ## 16. Notifications and delivery
 
-Domain events fan out through an outbox:
+Domain events fan out through event-specific routes in the same transaction as
+the observation and snapshot update:
 
 - parent MCP inbox: durable until read/acknowledged;
 - SSE/web notification center: live best effort plus snapshot recovery;
 - browser notification: client best effort after user permission;
 - Home Assistant webhook: one attempt;
 - generic webhook: one attempt.
+
+All meaningful events go to the parent inbox and SSE projection. Human routes
+are added only for main-session stall/failure alerts, unresolved reminders,
+completion, and waiting-for-user transitions, plus termination-saga warnings.
+Child-only state changes therefore update the parent's diagnostics and browser
+child counts without sending a human webhook. Disabled webhook destinations are
+terminally acknowledged, and an existing per-channel attempt suppresses replay
+after restart.
 
 Human payloads contain only issue, main-session title, and startup directory.
 Agent payloads contain PID identity, trusted state, signal timestamps, CPU deltas,

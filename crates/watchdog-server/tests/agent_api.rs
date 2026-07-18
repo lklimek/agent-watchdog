@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 use watchdog_domain::{
-    AdapterIdentity, Clock, DetailedState, DurationMs, EvidenceTrust, NativeSessionKey,
-    ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource, RuntimeKind,
-    SessionId, SessionKind, TimePoint, WallTimeMs,
+    AdapterIdentity, Clock, DetailedState, DomainEventKind, DurationMs, EvidenceTrust,
+    NativeSessionKey, ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource,
+    RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
 };
 use watchdog_server::{
     AgentApi, AgentApiError, CompletionOutcome, DiscoveredSession, RegisterSession, TransportKey,
 };
-use watchdog_store::WatchdogStore;
+use watchdog_store::{OutboxDestination, WatchdogStore};
 use watchdog_testkit::FakeClock;
 
 async fn api_fixture() -> (AgentApi, WatchdogStore, Arc<FakeClock>) {
@@ -343,6 +343,98 @@ async fn restart_reconciliation_resets_process_local_monotonic_ordering() {
         .expect("fresh low-monotonic evidence should apply after restart");
     assert!(!reconciled.snapshot.reconciliation_required());
     assert!(reconciled.snapshot.revision() >= 4);
+}
+
+#[tokio::test]
+async fn scheduler_reconciles_all_sessions_without_persisting_noop_ticks() {
+    let (api, store, clock) = api_fixture().await;
+    let transport = TransportKey::new("timer-main").expect("transport should be valid");
+    let main = register_main(&api, &transport, "timer-main", "register-main").await;
+    api.register_session(
+        &transport,
+        RegisterSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "timer-child".to_owned(),
+            kind: SessionKind::Child,
+            parent: Some(main),
+            event_key: "register-child".to_owned(),
+        },
+    )
+    .await
+    .expect("child should register");
+    let before = store.counts().await.expect("store counts should load");
+
+    let no_change = api
+        .reconcile_timers()
+        .await
+        .expect("early scheduler reconciliation should succeed");
+    assert_eq!(no_change.evaluated_sessions(), 2);
+    assert_eq!(no_change.changed_sessions(), 0);
+    assert_eq!(
+        store.counts().await.expect("store counts should load"),
+        before,
+        "pre-threshold ticks must not grow the durable ledger"
+    );
+
+    clock.advance(DurationMs::new(5 * 60_000));
+    let suspect = api
+        .reconcile_timers()
+        .await
+        .expect("suspect threshold should reconcile");
+    assert_eq!(suspect.changed_sessions(), 2);
+    let page = api
+        .list_events(&transport, Some(0), 100)
+        .await
+        .expect("suspect events should list");
+    assert_eq!(
+        page.events
+            .iter()
+            .filter(|event| matches!(event.event.kind(), DomainEventKind::Suspect))
+            .count(),
+        2
+    );
+
+    let after_suspect = store.counts().await.expect("store counts should load");
+    let repeated = api
+        .reconcile_timers()
+        .await
+        .expect("same clock tick should be harmless");
+    assert_eq!(repeated.changed_sessions(), 0);
+    assert_eq!(
+        store.counts().await.expect("store counts should load"),
+        after_suspect
+    );
+
+    clock.advance(DurationMs::new(10 * 60_000));
+    let stalled = api
+        .reconcile_timers()
+        .await
+        .expect("stall threshold should reconcile");
+    assert_eq!(stalled.changed_sessions(), 2);
+    let sessions = api
+        .list_sessions(&transport)
+        .await
+        .expect("sessions should list");
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.snapshot.state() == DetailedState::Stalled)
+    );
+    for destination in [
+        OutboxDestination::Browser,
+        OutboxDestination::HomeAssistant,
+        OutboxDestination::Webhook,
+    ] {
+        let pending = store
+            .pending_outbox_for(destination, 10)
+            .await
+            .expect("human outbox should load");
+        assert_eq!(pending.len(), 1, "only the main alert should route");
+        let event: watchdog_domain::DomainEvent = serde_json::from_slice(pending[0].payload())
+            .expect("outbox payload should be a domain event");
+        assert_eq!(event.subject().session_id(), main);
+        assert!(matches!(event.kind(), DomainEventKind::AlertDue));
+    }
 }
 
 fn native_state_observation(

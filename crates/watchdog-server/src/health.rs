@@ -282,5 +282,6 @@ fn component_name(component: ComponentId) -> String {
         ComponentId::Authorization => "authorization".to_owned(),
         ComponentId::Watcher => "watcher".to_owned(),
         ComponentId::ObservationQueue => "observation_queue".to_owned(),
+        ComponentId::Notifications => "notifications".to_owned(),
     }
 }
