@@ -7,10 +7,12 @@ with `REQUIREMENTS.md`, `ARCHITECTURE.md`, `TEST_SPECIFICATION.md`,
 ## Repository state
 
 - Working branch: `feat/implementation`.
-- Latest saved commit: `d720c76 fix(health): isolate filesystem safety state`.
+- Latest implementation commit before this handoff refresh:
+  `1b4c4f5 fix(codex): discover sessions without sqlite wal`.
 - No implementation commits in this phase have been pushed. Pushing remains an
   explicit user decision; never push implicitly or directly to `main`.
-- The checkpoint worktree was clean immediately after `d720c76`.
+- The implementation worktree was clean immediately after `1b4c4f5`; the
+  handoff refresh itself is documentation-only.
 - Implementation is in Phase 10 integration hardening. Final release QA and the
   lessons-learned phase have not started.
 - Do not work on macOS compatibility until the end of the project.
@@ -25,10 +27,12 @@ with `REQUIREMENTS.md`, `ARCHITECTURE.md`, `TEST_SPECIFICATION.md`,
   GitHub metadata, and failure containment.
 - Claude projects/transcripts, teams/members/tasks, and official lifecycle hook
   ingestion. Hook paths remain untrusted and are not accepted as capabilities.
-- Codex state database/spawn-edge and rollout fallback ingestion. Codex
-  app-server/hook parsers exist in `watchdog-codex`, but production server wiring
-  still needs an explicit v1 scope decision after checking the current official
-  interface and supported deployment constraints.
+- Codex state database/spawn-edge ingestion, independent recent rollout
+  discovery/activity tailing, and official lifecycle-hook ingestion. The narrow
+  SQLite bind is bootstrap evidence and may lag WAL rows; rollout, process, and
+  optional hook sources continue independently. App-server parsing remains
+  adapter-ready because app-server cannot passively observe unrelated CLI
+  processes.
 - Companion summary/detail reconciliation and content-free log-growth activity.
 - MCP tools and durable parent inbox, authenticated HTTP transport, child-only
   staged termination, process identity/PID-reuse gates, deadlines, reminders,
@@ -50,6 +54,11 @@ with `REQUIREMENTS.md`, `ARCHITECTURE.md`, `TEST_SPECIFICATION.md`,
 - `d720c76`: filesystem reconciliation has independent generation-guarded health;
   a newer overflow cannot be cleared by an older scan. Dashboard delivery has a
   separate component and can no longer overwrite safety health.
+- `cabf59f`: official Codex lifecycle hooks now enter through a bounded,
+  Bearer-authenticated endpoint without retaining prompt/result bodies.
+- `1b4c4f5`: current Codex main/child rollout metadata is discovered even when
+  SQLite is absent or behind WAL. Descending bounded scans prefer current
+  timestamped paths, preserve exact hierarchy, and tail subsequent activity.
 
 ## Verification already completed
 
@@ -61,6 +70,11 @@ with `REQUIREMENTS.md`, `ARCHITECTURE.md`, `TEST_SPECIFICATION.md`,
   (ignored release load/slow-peer tests compile but do not run by default).
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed
   after the health changes.
+- `cargo test --workspace --all-targets`: passed at the start of the 2026-07-18
+  continuation after the hook slice.
+- Rollout-only and SQLite-backed Codex discovery tests pass together; all six
+  cross-adapter discovery tests, all seven scan/attribution tests, and strict
+  Clippy for `watchdog-runtime` plus `watchdog-server` pass after `1b4c4f5`.
 - Explicit load target: 2/2 passed; 500-session ingestion about 379–416 ms,
   dashboard 32–35 ms, high-water RSS 13.2–17.0 MiB, and ten restart cycles. See
   `docs/spikes/capacity.md` for exact commands and budgets.
@@ -100,29 +114,21 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
 
 1. Reconcile every v1 requirement against code and tests; create the required
    requirement-to-test-to-code traceability matrix.
-2. Resolve the production Codex integration scope: determine whether current
-   official app-server/hook connectivity can be safely automatic in Compose or
-   should remain parser-ready/fallback-only in v1. Do not expose the existing
-   parser as an endpoint without verifying the current official protocol.
-3. Resolve consistent read-only access to Codex SQLite WAL/SHM state. The current
-   Compose profile mounts only `state_5.sqlite`; verify whether this can miss live
-   WAL rows and replace it with a concrete least-privilege solution if needed.
-4. Complete explicitly isolated live-runtime tests for current Claude, Codex CLI,
+2. Complete explicitly isolated live-runtime tests for current Claude, Codex CLI,
    and Companion versions. Never inspect existing user sessions.
-5. Measure the remaining release budgets: ten-minute steady-state CPU and a
+3. Measure the remaining release budgets: ten-minute steady-state CPU and a
    representative production burst p99. Record exact environment/results.
-6. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
+4. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
    Compose config/security checks, browser QA, explicit load/slow-peer tests, and
    any supported live matrix tests.
-7. Perform fresh security/self-review and independent review; fix all critical or
+5. Perform fresh security/self-review and independent review; fix all critical or
    high findings.
-8. Only during final QA, read
+6. Only during final QA, read
    `/data/artifacts/claudius/2026-07-17/watchdog-knowledge-transfer.html`,
    interpret it in the context of `https://github.com/lklimek/claudius`, and
    audit the implementation against every applicable pitfall. Do not read it
    earlier.
-9. Do the deferred macOS build-only check at the end without adding unsupported
+7. Do the deferred macOS build-only check at the end without adding unsupported
    deployment features.
-10. Update final version matrix, known limitations, release evidence, TODOs, and
-    lessons learned; then stop for the user's explicit push decision.
-
+8. Update final version matrix, known limitations, release evidence, TODOs, and
+   lessons learned; then stop for the user's explicit push decision.
