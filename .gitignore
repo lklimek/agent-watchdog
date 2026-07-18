@@ -6,3 +6,4 @@
 .env
 /config/traefik-users
 /config/watchdog.toml
+/.claudius-ledger/

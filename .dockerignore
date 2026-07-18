@@ -5,4 +5,5 @@ config/traefik-users
 config/watchdog.toml
 target
 tools/spikes/target
+rust-toolchain.toml
 /data

@@ -3,7 +3,6 @@ FROM rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7c
 
 WORKDIR /source
 COPY . .
-RUN cargo build --locked --release -p watchdog-server
 RUN mkdir -p \
     /rootfs/etc/agent-watchdog \
     /rootfs/monitored/claude/projects \
@@ -13,9 +12,14 @@ RUN mkdir -p \
     /rootfs/monitored/codex/sessions \
     /rootfs/monitored/companion \
     /rootfs/monitored/worktrees \
+    /rootfs/usr/local/bin \
     /rootfs/var/lib/agent-watchdog
 RUN chmod 1777 /rootfs/var/lib/agent-watchdog \
     && touch /rootfs/var/lib/agent-watchdog/.volume-initialized
+RUN --mount=type=cache,id=agent-watchdog-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=agent-watchdog-release-target,target=/source/target \
+    cargo build --locked --release -p watchdog-server \
+    && cp /source/target/release/watchdog-server /rootfs/usr/local/bin/agent-watchdog
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa
 
@@ -31,7 +35,6 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.version="${VERSION}"
 
 COPY --from=builder /rootfs/ /
-COPY --from=builder /source/target/release/watchdog-server /usr/local/bin/agent-watchdog
 
 USER nonroot:nonroot
 EXPOSE 8080
