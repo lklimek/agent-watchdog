@@ -129,6 +129,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-STA-011 | Main completes while a child remains active. | Main becomes unknown/conflicted, not finished. | §7.3 |
 | T-STA-012 | Child stalls while parent is active. | Parent state stays active; child count/badge changes. | §7.3, FR-UI-001 |
 | T-STA-013 | Server restarts with an expired wall deadline. | Fresh reconciliation is required before alert/termination. | FR-DATA-001, FR-KILL-002 |
+| T-STA-014 | A restarted process receives fresh evidence whose monotonic value is below the prior process's persisted value. | The durable restart boundary resets ordering; fresh evidence applies and clears reconciliation. | FR-DATA-001, FR-STA-009 |
 
 ### 5.5 Termination safety
 

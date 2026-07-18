@@ -344,6 +344,13 @@ Counter decrease, PID start-time change, missing process data, or process-tree
 ambiguity invalidates the comparison and creates uncertainty; it does not create
 synthetic inactivity.
 
+The server samples verified identities every five seconds. The first sample is
+a baseline. Later trustworthy CPU, I/O, or new-descendant growth emits a
+corroborating progress observation; all-four-counter growth records the
+actionable summary “All four CPU times grew versus the previous process
+snapshot.” Neutral samples emit nothing. Any uncertainty degrades process
+health and cannot authorize destructive action.
+
 ## 10. Correlation
 
 Correlation produces candidates, not silent guesses. The score is lexicographic:
@@ -462,6 +469,12 @@ Manual wipe is an explicit administrative CLI operation that stops ingestion,
 deletes only the Watchdog database and cached summaries/notifications, recreates
 the schema, and restarts discovery. It never follows paths into mounted runtime
 state.
+
+Persisted monotonic values are never compared across server processes. Before
+startup reconciliation, the server durably marks every retained session as
+restart-required, clears its process-local monotonic observation cursor, and
+emits the reconciliation-required event. Fresh trusted native evidence clears
+that gate; deadlines and termination remain conservative until then.
 
 ## 14. MCP surface
 

@@ -23,6 +23,8 @@ use watchdog_runtime::{
 use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
 
 use crate::config::{ConfigManager, RuntimeConfig};
+#[cfg(target_os = "linux")]
+use crate::process_monitor::ProcessMonitor;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
     CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService,
@@ -35,6 +37,8 @@ const WATCH_QUEUE_CAPACITY: usize = 4_096;
 const WATCH_TARGET_LIMIT: usize = 4_096;
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
+#[cfg(target_os = "linux")]
+const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Initialize structured JSON tracing using `RUST_LOG` or a safe info default.
 ///
@@ -122,12 +126,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     health.record(ComponentId::Store, ComponentStatus::Healthy, None);
     health.record(ComponentId::Authorization, ComponentStatus::Healthy, None);
 
-    let api = AgentApi::with_policy(
-        store.clone(),
-        Arc::clone(&clock) as Arc<_>,
-        current.reducer_policy(),
-    )
-    .await?;
+    let api = initialize_agent_api(&store, &clock, &current).await?;
     health.record(ComponentId::Reducer, ComponentStatus::Healthy, None);
     record_adapter_health(&health, &current);
 
@@ -142,11 +141,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let _deadline_policy = current.deadline_policy();
 
     #[cfg(target_os = "linux")]
-    {
-        watchdog_process::LinuxProcessSampler::new(32_768)
-            .map_err(|_| ServerError::ProcessSampler)?;
-        health.record(ComponentId::ProcessSampler, ComponentStatus::Healthy, None);
-    }
+    let process_monitor = initialize_process_monitor(&api, &store, &clock, &health)?;
 
     let dashboard = DashboardService::new(store.clone(), Arc::clone(&clock) as Arc<_>);
     let dispatcher = DashboardOutboxDispatcher::new(
@@ -197,6 +192,8 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         reconcile_tx,
     );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
+    #[cfg(target_os = "linux")]
+    let process_worker = spawn_process_worker(process_monitor, health.clone());
     let reload_worker = spawn_reload_worker(config, api, health.clone())?;
 
     let listener = tokio::net::TcpListener::bind(bootstrap.listen_address)
@@ -215,10 +212,90 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     watcher_stop.store(true, Ordering::Release);
     discovery_worker.abort();
     dashboard_worker.abort();
+    #[cfg(target_os = "linux")]
+    process_worker.abort();
     reload_worker.abort();
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+async fn initialize_agent_api(
+    store: &WatchdogStore,
+    clock: &Arc<SystemClock>,
+    config: &RuntimeConfig,
+) -> Result<AgentApi, ServerError> {
+    let api = AgentApi::with_policy(
+        store.clone(),
+        Arc::clone(clock) as Arc<_>,
+        config.reducer_policy(),
+    )
+    .await?;
+    api.mark_restarted().await?;
+    Ok(api)
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_process_monitor(
+    api: &AgentApi,
+    store: &WatchdogStore,
+    clock: &Arc<SystemClock>,
+    health: &HealthService,
+) -> Result<ProcessMonitor, ServerError> {
+    let monitor = ProcessMonitor::new(api.clone(), store.clone(), Arc::clone(clock) as Arc<_>)
+        .map_err(|_| ServerError::ProcessSampler)?;
+    health.record(ComponentId::ProcessSampler, ComponentStatus::Healthy, None);
+    Ok(monitor)
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_process_worker(monitor: ProcessMonitor, health: HealthService) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PROCESS_SAMPLE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match monitor.reconcile().await {
+                Ok(report) if report.warning_count() == 0 => {
+                    health.record(ComponentId::ProcessSampler, ComponentStatus::Healthy, None);
+                    if report.progressed_sessions() > 0 {
+                        tracing::info!(
+                            event = "process.reconciled",
+                            monitored_sessions = report.monitored_sessions(),
+                            progressed_sessions = report.progressed_sessions(),
+                            warnings = 0,
+                            "Process activity reconciliation completed"
+                        );
+                    }
+                }
+                Ok(report) => {
+                    health.record(
+                        ComponentId::ProcessSampler,
+                        ComponentStatus::Degraded,
+                        Some("Some verified process trees could not be sampled safely"),
+                    );
+                    tracing::warn!(
+                        event = "process.reconciled",
+                        monitored_sessions = report.monitored_sessions(),
+                        progressed_sessions = report.progressed_sessions(),
+                        warnings = report.warning_count(),
+                        "Process activity reconciliation was incomplete"
+                    );
+                }
+                Err(_) => {
+                    health.record(
+                        ComponentId::ProcessSampler,
+                        ComponentStatus::Failed,
+                        Some("Process activity reconciliation failed"),
+                    );
+                    tracing::error!(
+                        event = "process.reconcile_failed",
+                        "Process activity reconciliation failed"
+                    );
+                }
+            }
+        }
+    })
 }
 
 fn start_discovery(

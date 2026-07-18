@@ -6,6 +6,11 @@ use std::{
 };
 
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+use watchdog_domain::{
+    AdapterIdentity, EvidenceTrust, ObservationEnvelope, ObservationId, ObservationPayload,
+    ObservationSource, ProcessId,
+};
 use watchdog_domain::{Clock, DetailedState, RuntimeKind, SessionId, SessionKind};
 use watchdog_runtime::{CapabilityRoot, DirectoryScanner, ScanBudget};
 
@@ -430,9 +435,62 @@ impl CompanionDiscovery {
         if let Err(error) = self.api.ingest_native_observation(observation).await {
             log_reconcile_failure(RuntimeKind::CodexCompanion, "child", &error);
             report.warn();
-        } else if children.insert(child_id) {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        self.ingest_companion_process(job).await;
+        if children.insert(child_id) {
             report.child_sessions = report.child_sessions.saturating_add(1);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn ingest_companion_process(&self, job: &watchdog_companion::CompanionJob) {
+        let Some(pid) = job.pid() else {
+            return;
+        };
+        let Ok(pid) = ProcessId::new(pid) else {
+            return;
+        };
+        let Ok(sampler) = watchdog_process::LinuxProcessSampler::new(1) else {
+            return;
+        };
+        let Ok(identity) = sampler.read_identity(pid) else {
+            return;
+        };
+        let event_key = format!(
+            "{}:{}:{}",
+            SessionId::from_native(job.subject()),
+            identity.pid().value(),
+            identity.start_time_ticks()
+        );
+        let Ok(source) = ObservationSource::new(
+            AdapterIdentity::new(
+                RuntimeKind::CodexCompanion,
+                watchdog_companion::TESTED_COMPANION_VERSION,
+            )
+            .unwrap_or_else(|_| unreachable!("static adapter identity is bounded")),
+            "state:pid",
+            EvidenceTrust::Corroborating,
+            None,
+        ) else {
+            return;
+        };
+        let Ok(observation_id) =
+            ObservationId::from_native(RuntimeKind::CodexCompanion, "process-identity", event_key)
+        else {
+            return;
+        };
+        let Ok(observation) = ObservationEnvelope::new(
+            observation_id,
+            job.subject().clone(),
+            self.clock.now(),
+            source,
+            ObservationPayload::ProcessIdentity(identity),
+        ) else {
+            return;
+        };
+        let _ = self.api.ingest_native_observation(observation).await;
     }
 }
 
