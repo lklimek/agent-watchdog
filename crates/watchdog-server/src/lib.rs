@@ -17,6 +17,7 @@ mod process_monitor;
 mod server;
 #[cfg(target_os = "linux")]
 mod termination;
+mod watch_paths;
 
 pub use agent_api::{
     AgentApi, AgentApiError, AgentEventView, AgentHealthView, CompletionOutcome, DiscoveredSession,

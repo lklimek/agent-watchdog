@@ -558,6 +558,7 @@ binary. Core tables:
 | `inbox_offsets` | Parent MCP durable event cursor. |
 | `adapter_health` | Version, compatibility, last success/error, degraded scope. |
 | `notification_attempts` | One-shot human notification audit. |
+| `registered_watch_paths` | Scoped, idempotent agent path registrations restored into watcher coverage. |
 
 Full transcript bodies are never stored. Observation evidence and native-derived
 summaries have per-field and per-record byte caps.
@@ -592,6 +593,7 @@ Proposed tools:
 |---|---|
 | `register_session` | Enrich an autodiscovered main/child or declare a new in-scope session. |
 | `register_delegation` | Record parent/child relation and optional expected check-in. |
+| `register_watch_path` | Add a concrete path beneath a configured worktree prefix for one in-scope session. |
 | `report_progress` | Add event-driven progress with bounded summary and optional operation. |
 | `report_waiting` | Mark waiting for user/tool/agent or intentionally waiting. |
 | `complete_session` | Report terminal outcome; native evidence still reconciles it. |

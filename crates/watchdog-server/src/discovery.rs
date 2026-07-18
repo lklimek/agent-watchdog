@@ -105,6 +105,12 @@ impl WorktreePathMapping {
         self.project_relative(relative)
     }
 
+    pub(crate) fn project_native_directory(&self, candidate: &Path) -> Option<(String, PathBuf)> {
+        let native = self.validate_native_path(candidate)?;
+        let mounted = self.project_native_path(candidate)?;
+        mounted.is_dir().then_some((native, mounted))
+    }
+
     fn project_relative(&self, relative: &Path) -> Option<PathBuf> {
         if relative
             .components()

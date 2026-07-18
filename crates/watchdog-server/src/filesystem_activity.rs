@@ -15,6 +15,7 @@ use watchdog_store::{StoreError, StoredSessionRecord, WatchdogStore};
 use crate::AgentApi;
 
 const MAX_CHILD_SESSIONS: u32 = 1_000;
+const MAX_REGISTERED_PATHS: u32 = 4_096;
 
 /// Best-effort result of attributing one coalesced inotify batch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -83,7 +84,11 @@ impl FilesystemActivityReconciler {
             .store
             .sessions_by_kind(SessionKind::Child, MAX_CHILD_SESSIONS)
             .await?;
-        let (owners, records) = self.load_owners(records).await?;
+        let registered_paths = self
+            .store
+            .registered_watch_paths(MAX_REGISTERED_PATHS)
+            .await?;
+        let (owners, records) = self.load_owners(records, &registered_paths).await?;
         let mut report = FilesystemActivityReport::default();
         let mut paths = changed_paths.to_vec();
         paths.sort();
@@ -119,6 +124,7 @@ impl FilesystemActivityReconciler {
     async fn load_owners(
         &self,
         records: Vec<StoredSessionRecord>,
+        registered_paths: &[watchdog_store::RegisteredWatchPathRecord],
     ) -> Result<
         (
             WorktreeOwners,
@@ -141,6 +147,15 @@ impl FilesystemActivityReconciler {
                 }
             }
             by_child.insert(child, record);
+        }
+        for registered in registered_paths {
+            let SessionIdentity::Child(child) = registered.session() else {
+                continue;
+            };
+            let directory = PathBuf::from(registered.native_path());
+            if by_child.contains_key(&child) && is_concrete_native_path(&directory) {
+                owners.register(directory, child);
+            }
         }
         Ok((owners, by_child))
     }

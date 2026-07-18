@@ -248,6 +248,7 @@ struct AgentApiInner {
     policy: RwLock<ReducerPolicy>,
     scopes: ScopeRegistry,
     lanes: AsyncRwLock<HashMap<SessionId, Arc<Mutex<SessionCoordinator>>>>,
+    watch_paths: RwLock<Option<crate::watch_paths::WatchPathRegistry>>,
 }
 
 /// Scoped application service underlying all MCP tools.
@@ -297,8 +298,17 @@ impl AgentApi {
                 policy: RwLock::new(policy),
                 scopes: ScopeRegistry::default(),
                 lanes: AsyncRwLock::new(HashMap::new()),
+                watch_paths: RwLock::new(None),
             }),
         })
+    }
+
+    pub(crate) fn configure_watch_paths(&self, registry: crate::watch_paths::WatchPathRegistry) {
+        *self
+            .inner
+            .watch_paths
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registry);
     }
 
     /// Apply reloaded reducer thresholds to existing and future session lanes.
@@ -319,6 +329,39 @@ impl AgentApi {
         for lane in lanes {
             lane.lock().await.set_policy(policy);
         }
+    }
+
+    /// Register one additional capability-validated path for an in-scope session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] for unbound/cross-tree targets, invalid paths,
+    /// unavailable watcher registration, or persistence failure.
+    pub async fn register_watch_path(
+        &self,
+        transport: &TransportKey,
+        session_id: SessionId,
+        event_key: &str,
+        native_path: &str,
+    ) -> Result<watchdog_store::RegisteredWatchPathRecord, AgentApiError> {
+        validate_event_key(event_key)?;
+        let session = self.resolve_scoped(transport, session_id).await?;
+        let registry = self
+            .inner
+            .watch_paths
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(AgentApiError::WatchPathUnavailable)?;
+        registry
+            .register(session.session, session.root, event_key, native_path)
+            .await
+            .map_err(|error| match error {
+                crate::watch_paths::WatchPathError::Rejected => AgentApiError::WatchPathRejected,
+                crate::watch_paths::WatchPathError::Capacity
+                | crate::watch_paths::WatchPathError::State => AgentApiError::WatchPathUnavailable,
+                crate::watch_paths::WatchPathError::Store(source) => AgentApiError::Store(source),
+            })
     }
 
     /// Persist a restart boundary for every retained session before native
@@ -1323,6 +1366,12 @@ pub enum AgentApiError {
     /// Durable legacy projection lacks restartable reducer state.
     #[error("MCP session reducer state is unavailable until reconciliation")]
     ReducerSnapshotUnavailable,
+    /// The supplied path is not a concrete allowlisted worktree directory.
+    #[error("MCP watch path is outside the configured worktree roots")]
+    WatchPathRejected,
+    /// Watch-path registration is not available in this server process.
+    #[error("MCP watch path registration is unavailable")]
+    WatchPathUnavailable,
     /// Bounded input failed domain validation.
     #[error(transparent)]
     Domain(#[from] DomainInputError),

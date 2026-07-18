@@ -21,7 +21,7 @@ not accepted deferrals.
 | FR-DIS-004 | T-DIS-010 | Runtime-namespaced native IDs and role-preserving identities; `domain/tests/identity.rs` | Automated |
 | FR-DIS-005 | T-DIS-003, T-DIS-005 | Deterministic correlation priority and retained relation evidence; `domain/tests/correlation.rs` | Automated |
 | FR-DIS-006 | T-DIS-003, T-DIS-004, T-DIS-011, T-DIS-012 | Correlation engine plus exact native Claude/Codex/Companion hierarchy parsers | Automated |
-| FR-DIS-007 | T-DIS-006, T-DIS-007 | Capability-root enforcement and watcher registration exist, but MCP cannot yet register an additional path | **Gap** |
+| FR-DIS-007 | T-DIS-006, T-DIS-007 | Durable scoped `register_watch_path`, capability projection, prioritized watcher rebuild, and exact child ownership | Automated |
 | FR-DIS-008 | T-DIS-008 | TOML accepts multiple mapped runtime roots and reloads them; Compose requires explicit concrete host binds rather than implicit home discovery | **Partial** |
 | FR-DIS-009 | T-DIS-002 | Startup-directory/worktree metadata, root-scoped stores, dashboard cards, and ambiguity-safe worktree activity | Automated |
 | FR-EVD-001 | T-EVD-001 | Linux `WatchService`, targeted invalidation, server watcher supervisor | Automated |
@@ -57,7 +57,7 @@ not accepted deferrals.
 | FR-KILL-007 | T-KILL-013 | Adapter boundary is read-only; cancellation interface and OS signals are the only mutation capabilities | Automated contract; final security inspection pending |
 | FR-MCP-001 | T-MCP-001 | Bearer middleware before rmcp parsing/allocation; auth and transport tests | Automated |
 | FR-MCP-002 | T-MCP-002, T-MCP-003 | One immutable main-tree scope per transport and cross-tree rejection | Automated |
-| FR-MCP-003 | T-MCP-004 | Eleven bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated, except path registration gap under FR-DIS-007 |
+| FR-MCP-003 | T-MCP-004 | Twelve bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated |
 | FR-MCP-004 | T-DATA-003, T-MCP-005 | Transactional parent inbox and durable cursor across reconnect/restart | Automated |
 | FR-MCP-005 | T-MCP-006 | `AgentEventView` pairs events with current session evidence, but the FR-STA-007 diagnostic bundle is incomplete | **Partial** |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |
@@ -102,7 +102,7 @@ not accepted deferrals.
 | FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests | Automated; final log inspection pending |
 | FR-OPS-007 | T-OPS-007 | Health/log interface only; no metrics route or exporter | Automated route/Compose inspection |
 | FR-SEC-001 | T-CFG-004, T-CPU-010, T-HTTP-001, T-MCP-001 | Constant-time bounded credentials, secret wrappers, redacted errors/debug | Automated |
-| FR-SEC-002 | T-DIS-007, T-SEC-001 | Linux capability roots, canonical mappings, openat2/no-symlink path tests | Automated, except missing MCP path tool |
+| FR-SEC-002 | T-DIS-007, T-SEC-001 | Linux capability roots, canonical mappings, openat2/no-symlink tests, and rejected MCP traversal/out-of-prefix/symlink registrations | Automated |
 | FR-SEC-003 | T-HTTP-003, T-SEC-002 | Bounded typed parsers, no shell construction from native content, Maud escaping/CSP | Automated |
 
 ## Compatibility and engineering process
@@ -137,19 +137,14 @@ not accepted deferrals.
 
 ## Open closure work
 
-1. Add a tree-scoped MCP path-registration tool that accepts only paths beneath
-   configured worktree prefixes, registers a watcher target, persists enough
-   state for restart reconciliation, and proves both in-prefix success and
-   traversal/symlink/out-of-prefix rejection (FR-DIS-007, FR-SEC-002,
-   T-DIS-006/007).
-2. Add an explicit bounded parent diagnostic bundle containing the latest PID,
+1. Add an explicit bounded parent diagnostic bundle containing the latest PID,
    process activity deltas/provenance, signal times, operation summary, source
    conflicts, selected correlation basis/evidence, and actionable suggested
    checks (FR-STA-007, FR-MCP-005, T-STA-008, T-MCP-006).
-3. Reconcile FR-DIS-008 wording with the supported Docker least-privilege model:
+2. Reconcile FR-DIS-008 wording with the supported Docker least-privilege model:
    TOML supports additional roots, but Compose cannot safely mount an unknown
    host path automatically. Either document standard-path environment defaults
    that still resolve to concrete binds or obtain explicit scope approval.
-4. Complete the isolated live-runtime matrix, ten-minute steady-state CPU,
+3. Complete the isolated live-runtime matrix, ten-minute steady-state CPU,
    representative burst p99, dependency/security gates, final browser rerun,
    deferred knowledge-transfer audit, and final macOS build-only check.

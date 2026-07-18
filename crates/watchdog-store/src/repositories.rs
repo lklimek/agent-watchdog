@@ -6,11 +6,119 @@ use watchdog_domain::{
 
 use crate::{
     ActivitySampleRecord, AdapterHealthRecord, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
-    NotificationAttemptRecord, RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreError,
-    StoredSessionRecord, TerminationSagaRecord, WatchdogStore, bounded_json, sqlite_integer,
+    NotificationAttemptRecord, RegisteredWatchPathRecord, RelationRecord, SessionMetadataRecord,
+    SnapshotUpdate, StoreError, StoredSessionRecord, TerminationSagaRecord, WatchdogStore,
+    bounded_json, sqlite_integer,
 };
 
 impl WatchdogStore {
+    /// Persist one scoped watch path with caller-key idempotency.
+    ///
+    /// Returns `true` only for a newly inserted session/path pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for a missing/mismatched session tree, a reused
+    /// event key with different content, or persistence failure.
+    pub async fn save_registered_watch_path(
+        &self,
+        record: &RegisteredWatchPathRecord,
+    ) -> Result<bool, StoreError> {
+        let payload = bounded_json(record, "registered watch path")?;
+        let mut transaction = self.pool.begin().await?;
+        let stored_root: Option<String> =
+            sqlx::query_scalar("SELECT root_session_id FROM sessions WHERE session_id = ?")
+                .bind(record.session().session_id().to_string())
+                .fetch_optional(&mut *transaction)
+                .await?;
+        let expected_root = record.root().session_id().to_string();
+        if stored_root.as_deref() != Some(expected_root.as_str()) {
+            return Err(StoreError::IdentityMismatch);
+        }
+        let existing: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT record_json FROM registered_watch_paths WHERE event_key = ?",
+        )
+        .bind(record.event_key())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing {
+            let existing: RegisteredWatchPathRecord = decode_json(&existing)?;
+            if existing.session() == record.session()
+                && existing.root() == record.root()
+                && existing.event_key() == record.event_key()
+                && existing.native_path() == record.native_path()
+            {
+                transaction.commit().await?;
+                return Ok(false);
+            }
+            return Err(StoreError::WatchPathIdentityConflict);
+        }
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO registered_watch_paths \
+             (event_key, session_id, root_session_id, native_path, registered_at_ms, record_json) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.event_key())
+        .bind(record.session().session_id().to_string())
+        .bind(expected_root)
+        .bind(record.native_path())
+        .bind(record.registered_at().value())
+        .bind(payload)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::WatchPathIdentityConflict);
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    /// Load all bounded registered paths in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an invalid limit, corrupt record, or database failure.
+    pub async fn registered_watch_paths(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<RegisteredWatchPathRecord>, StoreError> {
+        validate_limit(limit)?;
+        load_json_rows(
+            sqlx::query(
+                "SELECT record_json FROM registered_watch_paths \
+                 ORDER BY registered_at_ms, event_key LIMIT ?",
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?,
+            "record_json",
+        )
+    }
+
+    /// Load bounded paths registered for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an invalid limit, corrupt record, or database failure.
+    pub async fn registered_watch_paths_for(
+        &self,
+        session: SessionIdentity,
+        limit: u32,
+    ) -> Result<Vec<RegisteredWatchPathRecord>, StoreError> {
+        validate_limit(limit)?;
+        load_json_rows(
+            sqlx::query(
+                "SELECT record_json FROM registered_watch_paths WHERE session_id = ? \
+                 ORDER BY registered_at_ms, event_key LIMIT ?",
+            )
+            .bind(session.session_id().to_string())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?,
+            "record_json",
+        )
+    }
+
     /// Upsert bounded operator-facing metadata for an existing session.
     ///
     /// # Errors
