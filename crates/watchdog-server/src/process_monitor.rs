@@ -286,6 +286,8 @@ mod tests {
                 kind: SessionKind::Main,
                 parent: None,
                 event_key: "discover-process-job".to_owned(),
+                adapter_version: "test".to_owned(),
+                evidence_source: "test:process-discovery".to_owned(),
                 title: None,
                 startup_directory: None,
             })

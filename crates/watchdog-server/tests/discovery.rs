@@ -216,6 +216,7 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
     }
     let now_ms = 2_000_000_000_000_i64;
     create_codex_state(&state_root.join("state_5.sqlite"), now_ms).await;
+    set_codex_version(&state_root.join("state_5.sqlite"), "codex-main", "0.999.0").await;
 
     let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
         .await
@@ -251,6 +252,18 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
         .expect("children should query");
     assert_eq!(mains.len(), 1);
     assert_eq!(children.len(), 1);
+    assert!(
+        store
+            .snapshot(mains[0].session)
+            .await
+            .expect("main snapshot should query")
+            .expect("main snapshot should exist")
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .compatibility_warning()
+            .is_none(),
+        "a different version remains optimistic while its known schema parses"
+    );
     let child_metadata = store
         .session_metadata(children[0].session)
         .await
@@ -261,6 +274,19 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
         child_metadata.startup_directory(),
         Some("/host/repositories/child")
     );
+}
+
+async fn set_codex_version(path: &std::path::Path, id: &str, version: &str) {
+    let pool = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(path))
+        .await
+        .expect("fixture database should reopen");
+    sqlx::query("UPDATE threads SET cli_version = ? WHERE id = ?")
+        .bind(version)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("fixture version should update");
+    pool.close().await;
 }
 
 async fn create_codex_state(path: &std::path::Path, now_ms: i64) {

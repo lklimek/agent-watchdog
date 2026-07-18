@@ -72,10 +72,23 @@ pub struct DiscoveredSession {
     pub parent: Option<SessionId>,
     /// Adapter-provided deterministic idempotency key.
     pub event_key: String,
+    /// Tested native adapter version that produced the discovery evidence.
+    pub adapter_version: String,
+    /// Bounded provenance fingerprint naming the native discovery surface.
+    pub evidence_source: String,
     /// Bounded native title, when available.
     pub title: Option<String>,
     /// Capability-validated startup directory, when available.
     pub startup_directory: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum RegistrationProvenance {
+    Mcp,
+    Native {
+        adapter_version: String,
+        evidence_source: String,
+    },
 }
 
 /// Agent-reported waiting class.
@@ -394,8 +407,12 @@ impl AgentApi {
         };
         let transport = discovery_transport(root)?;
         self.inner.scopes.bind_once(transport.clone(), root)?;
+        let provenance = RegistrationProvenance::Native {
+            adapter_version: request.adapter_version,
+            evidence_source: request.evidence_source,
+        };
         let view = self
-            .register_session(
+            .register_session_with_provenance(
                 &transport,
                 RegisterSession {
                     runtime: request.runtime,
@@ -404,6 +421,7 @@ impl AgentApi {
                     parent: request.parent,
                     event_key: request.event_key,
                 },
+                provenance,
             )
             .await?;
 
@@ -483,6 +501,16 @@ impl AgentApi {
         transport: &TransportKey,
         request: RegisterSession,
     ) -> Result<SessionView, AgentApiError> {
+        self.register_session_with_provenance(transport, request, RegistrationProvenance::Mcp)
+            .await
+    }
+
+    async fn register_session_with_provenance(
+        &self,
+        transport: &TransportKey,
+        request: RegisterSession,
+        provenance: RegistrationProvenance,
+    ) -> Result<SessionView, AgentApiError> {
         validate_event_key(&request.event_key)?;
         let native = NativeSessionKey::new(request.runtime, request.native_id)?;
         let session_id = SessionId::from_native(&native);
@@ -512,22 +540,12 @@ impl AgentApi {
         {
             return Err(AgentApiError::SessionIdentityConflict);
         }
-        let result = self
-            .apply_payload(
-                &record,
-                "register_session",
-                &request.event_key,
-                ObservationPayload::Progress(BoundedText::new(
-                    "progress",
-                    "Session registered with Agent Watchdog",
-                )?),
-                now,
-            )
-            .await?;
+        let observation = registration_observation(&record, &request.event_key, now, &provenance)?;
+        let result = self.apply_observation(&record, observation).await?;
         if let Some(parent) = parent
             && result == ApplyResult::Applied
         {
-            self.save_relation(&record, &parent, &request.event_key, now)
+            self.save_relation(&record, &parent, &request.event_key, now, &provenance)
                 .await?;
         }
         if request.kind == SessionKind::Main {
@@ -612,8 +630,14 @@ impl AgentApi {
         if !matches!(child.session, SessionIdentity::Child(_)) {
             return Err(AgentApiError::ChildSessionRequired);
         }
-        self.save_relation(&child, &parent, event_key, self.inner.clock.now())
-            .await?;
+        self.save_relation(
+            &child,
+            &parent,
+            event_key,
+            self.inner.clock.now(),
+            &RegistrationProvenance::Mcp,
+        )
+        .await?;
         if let Some(command) = deadline {
             return self
                 .mutate_scoped(
@@ -1016,16 +1040,12 @@ impl AgentApi {
         parent: &StoredSessionRecord,
         event_key: &str,
         now: TimePoint,
+        provenance: &RegistrationProvenance,
     ) -> Result<(), AgentApiError> {
         let SessionIdentity::Child(child_id) = child.session else {
             return Err(AgentApiError::ChildSessionRequired);
         };
-        let source = ObservationSource::new(
-            AdapterIdentity::new(child.native.runtime(), "mcp-v1")?,
-            format!("mcp:register_delegation:{event_key}"),
-            EvidenceTrust::Authoritative,
-            None,
-        )?;
+        let source = registration_source(&child.native, event_key, provenance, true)?;
         self.inner
             .store
             .select_relation(&RelationRecord {
@@ -1044,6 +1064,70 @@ impl AgentApi {
 
 fn discovery_transport(root: MainSessionId) -> Result<TransportKey, DomainInputError> {
     TransportKey::new(format!("autodiscovery:{}", root.session_id()))
+}
+
+fn registration_observation(
+    record: &StoredSessionRecord,
+    event_key: &str,
+    now: TimePoint,
+    provenance: &RegistrationProvenance,
+) -> Result<ObservationEnvelope, AgentApiError> {
+    let (namespace, source) = match provenance {
+        RegistrationProvenance::Mcp => (
+            "mcp:register_session",
+            registration_source(&record.native, event_key, provenance, false)?,
+        ),
+        RegistrationProvenance::Native { .. } => (
+            "native-discovery",
+            registration_source(&record.native, event_key, provenance, false)?,
+        ),
+    };
+    let native_event_id = format!("{}:{event_key}", record.session.session_id());
+    Ok(ObservationEnvelope::new(
+        ObservationId::from_native(record.native.runtime(), namespace, native_event_id)?,
+        record.native.clone(),
+        now,
+        source,
+        ObservationPayload::Progress(BoundedText::new(
+            "progress",
+            "Session registered with Agent Watchdog",
+        )?),
+    )?)
+}
+
+fn registration_source(
+    native: &NativeSessionKey,
+    event_key: &str,
+    provenance: &RegistrationProvenance,
+    relation: bool,
+) -> Result<ObservationSource, DomainInputError> {
+    let (version, fingerprint) = match provenance {
+        RegistrationProvenance::Mcp => (
+            "mcp-v1",
+            if relation {
+                format!("mcp:register_delegation:{event_key}")
+            } else {
+                "mcp:register_session".to_owned()
+            },
+        ),
+        RegistrationProvenance::Native {
+            adapter_version,
+            evidence_source,
+        } => (
+            adapter_version.as_str(),
+            if relation {
+                format!("{evidence_source}:relation")
+            } else {
+                evidence_source.clone()
+            },
+        ),
+    };
+    ObservationSource::new(
+        AdapterIdentity::new(native.runtime(), version)?,
+        fingerprint,
+        EvidenceTrust::Authoritative,
+        None,
+    )
 }
 
 fn restart_observation(
