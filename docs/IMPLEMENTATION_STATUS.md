@@ -2,7 +2,8 @@
 
 This file is the clean-context handoff for continuing implementation. Read it
 with `REQUIREMENTS.md`, `ARCHITECTURE.md`, `TEST_SPECIFICATION.md`,
-`DEVELOPMENT_PLAN.md`, and `OPERATIONS.md`; those documents remain normative.
+`DEVELOPMENT_PLAN.md`, `TRACEABILITY.md`, and `OPERATIONS.md`; those documents
+remain normative.
 
 ## Repository state
 
@@ -112,8 +113,9 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
 
 ## Remaining Phase 10 work
 
-1. Reconcile every v1 requirement against code and tests; create the required
-   requirement-to-test-to-code traceability matrix.
+1. Close the functional gaps recorded in `TRACEABILITY.md`: agent-registered
+   allowlisted watch paths, complete parent diagnostics, and the supported
+   standard-path configuration wording.
 2. Complete explicitly isolated live-runtime tests for current Claude, Codex CLI,
    and Companion versions. Never inspect existing user sessions.
 3. Measure the remaining release budgets: ten-minute steady-state CPU and a
