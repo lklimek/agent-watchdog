@@ -41,10 +41,15 @@ impl WorktreeOwners {
     #[must_use]
     pub fn attribute(
         &self,
-        worktree: &Path,
+        changed_path: &Path,
         process_evidence: Option<ChildSessionId>,
     ) -> Attribution {
-        let Some(owners) = self.owners.get(worktree) else {
+        let Some((_, owners)) = self
+            .owners
+            .iter()
+            .filter(|(worktree, _)| changed_path.starts_with(worktree))
+            .max_by_key(|(worktree, _)| worktree.components().count())
+        else {
             return Attribution::Unowned;
         };
         if owners.len() == 1 {

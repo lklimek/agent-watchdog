@@ -60,3 +60,17 @@ fn shared_worktree_is_neutral_without_process_evidence() {
         Attribution::Child(second)
     );
 }
+
+#[test]
+fn nested_change_uses_the_most_specific_registered_worktree() {
+    let root = tempfile::tempdir().expect("temporary worktree should exist");
+    let outer = child("outer");
+    let nested = child("nested");
+    let nested_root = root.path().join("packages/nested");
+    let changed = nested_root.join("src/lib.rs");
+    let mut owners = WorktreeOwners::new();
+    owners.register(root.path(), outer);
+    owners.register(&nested_root, nested);
+
+    assert_eq!(owners.attribute(&changed, None), Attribution::Child(nested));
+}

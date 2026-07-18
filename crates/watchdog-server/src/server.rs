@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsString,
     io::{Read as _, Write as _},
@@ -29,14 +30,16 @@ use crate::process_monitor::ProcessMonitor;
 use crate::termination::TerminationMonitor;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
-    CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService,
-    HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints, RuntimeDiscoveryReport,
-    SystemClock, TerminationConfig, WebhookEndpoint, dashboard_router, health_router, mcp_router,
+    CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler,
+    GitHubEnricher, HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints,
+    RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint, dashboard_router,
+    health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
 const WATCH_TARGET_LIMIT: usize = 4_096;
+const FILESYSTEM_ACTIVITY_QUEUE_CAPACITY: usize = 64;
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
 const NOTIFICATION_DELIVERY_LIMIT: u32 = 128;
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
@@ -179,11 +182,14 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         reconcile_rx,
     );
     let watcher_stop = Arc::new(AtomicBool::new(false));
+    let (filesystem_activity_tx, filesystem_activity_worker) =
+        initialize_filesystem_activity(&api, &store, &clock, &health);
     let watcher = spawn_watcher_supervisor(
         config.clone(),
         health.clone(),
         Arc::clone(&watcher_stop),
         reconcile_tx,
+        filesystem_activity_tx,
     );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
     let notification_worker = spawn_notification_worker(notification_dispatcher, health.clone());
@@ -213,6 +219,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     dashboard_worker.abort();
     notification_worker.abort();
     timer_worker.abort();
+    filesystem_activity_worker.abort();
     #[cfg(target_os = "linux")]
     process_worker.abort();
     #[cfg(target_os = "linux")]
@@ -221,6 +228,21 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+fn initialize_filesystem_activity(
+    api: &AgentApi,
+    store: &WatchdogStore,
+    clock: &Arc<SystemClock>,
+    health: &HealthService,
+) -> (mpsc::Sender<Vec<PathBuf>>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel(FILESYSTEM_ACTIVITY_QUEUE_CAPACITY);
+    let reconciler =
+        FilesystemActivityReconciler::new(api.clone(), store.clone(), Arc::clone(clock) as Arc<_>);
+    (
+        sender,
+        spawn_filesystem_activity_worker(reconciler, health.clone(), receiver),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -709,6 +731,7 @@ fn spawn_watcher_supervisor(
     health: HealthService,
     stop: Arc<AtomicBool>,
     reconcile: mpsc::Sender<()>,
+    filesystem_activity: mpsc::Sender<Vec<PathBuf>>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut applied = config.current();
@@ -721,11 +744,29 @@ fn spawn_watcher_supervisor(
                 applied = candidate;
                 let _ = reconcile.try_send(());
             }
-            if let Some(signal) = watcher.as_ref().and_then(WatchService::next_signal) {
+            if let Some(signal) = watcher
+                .as_ref()
+                .and_then(|registry| registry.service.next_signal())
+            {
                 match signal {
-                    WatchSignal::Targets(_) => {
-                        health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
-                        let _ = reconcile.try_send(());
+                    WatchSignal::Targets(targets) => {
+                        reconcile_watch_targets(
+                            watcher.as_ref(),
+                            &targets,
+                            &health,
+                            &reconcile,
+                            &filesystem_activity,
+                        );
+                    }
+                    WatchSignal::TopologyChanged(targets) => {
+                        reconcile_watch_targets(
+                            watcher.as_ref(),
+                            &targets,
+                            &health,
+                            &reconcile,
+                            &filesystem_activity,
+                        );
+                        watcher = build_watcher(&applied, &health);
                     }
                     WatchSignal::ReconcileAll(_) => {
                         health.record(
@@ -742,7 +783,86 @@ fn spawn_watcher_supervisor(
     })
 }
 
-fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<WatchService> {
+fn reconcile_watch_targets(
+    watcher: Option<&WatchRegistry>,
+    targets: &[WatchTargetId],
+    health: &HealthService,
+    reconcile: &mpsc::Sender<()>,
+    filesystem_activity: &mpsc::Sender<Vec<PathBuf>>,
+) {
+    health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
+    let _ = reconcile.try_send(());
+    let paths = watcher.map_or_else(Vec::new, |registry| {
+        targets
+            .iter()
+            .filter_map(|target| registry.worktree_paths.get(target).cloned())
+            .collect()
+    });
+    if !paths.is_empty() && filesystem_activity.try_send(paths).is_err() {
+        health.record(
+            ComponentId::Watcher,
+            ComponentStatus::Degraded,
+            Some("Filesystem activity queue is saturated"),
+        );
+    }
+}
+
+fn spawn_filesystem_activity_worker(
+    reconciler: FilesystemActivityReconciler,
+    health: HealthService,
+    mut requests: mpsc::Receiver<Vec<PathBuf>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(paths) = requests.recv().await {
+            match reconciler.reconcile(&paths).await {
+                Ok(report) if report.warnings() == 0 => {
+                    if report.attributed() > 0 {
+                        tracing::debug!(
+                            event = "filesystem_activity.reconciled",
+                            attributed_sessions = report.attributed(),
+                            ambiguous_paths = report.ambiguous(),
+                            unowned_paths = report.unowned(),
+                            "Worktree activity was reconciled"
+                        );
+                    }
+                }
+                Ok(report) => {
+                    health.record(
+                        ComponentId::Watcher,
+                        ComponentStatus::Degraded,
+                        Some("Some filesystem activity could not be attributed safely"),
+                    );
+                    tracing::warn!(
+                        event = "filesystem_activity.incomplete",
+                        attributed_sessions = report.attributed(),
+                        ambiguous_paths = report.ambiguous(),
+                        unowned_paths = report.unowned(),
+                        warnings = report.warnings(),
+                        "Worktree activity reconciliation was incomplete"
+                    );
+                }
+                Err(_) => {
+                    health.record(
+                        ComponentId::Watcher,
+                        ComponentStatus::Degraded,
+                        Some("Filesystem activity ownership could not be loaded"),
+                    );
+                    tracing::warn!(
+                        event = "filesystem_activity.failed",
+                        "Worktree activity reconciliation failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+struct WatchRegistry {
+    service: WatchService,
+    worktree_paths: BTreeMap<WatchTargetId, PathBuf>,
+}
+
+fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<WatchRegistry> {
     let Ok(mut watcher) = WatchService::new(WATCH_QUEUE_CAPACITY) else {
         health.record(
             ComponentId::Watcher,
@@ -752,10 +872,22 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
         return None;
     };
     let mut roots = Vec::new();
-    roots.extend_from_slice(config.allowed_worktree_roots());
-    roots.extend_from_slice(config.claude_roots());
-    roots.extend_from_slice(config.codex_roots());
-    roots.extend_from_slice(config.companion_roots());
+    roots.extend(
+        config
+            .allowed_worktree_roots()
+            .iter()
+            .cloned()
+            .map(|root| (root, true)),
+    );
+    roots.extend(
+        config
+            .claude_roots()
+            .iter()
+            .chain(config.codex_roots())
+            .chain(config.companion_roots())
+            .cloned()
+            .map(|root| (root, false)),
+    );
     let exclusions = config.exclusions();
     let Ok(scan_budget) = ScanBudget::new(4, WATCH_TARGET_LIMIT, 4 * 1_024 * 1_024) else {
         return None;
@@ -763,9 +895,10 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
     let scanner = DirectoryScanner::new(scan_budget);
     let mut next_target = 1_u64;
     let mut degraded = false;
-    for configured_root in roots
+    let mut worktree_paths = BTreeMap::new();
+    for (configured_root, is_worktree) in roots
         .into_iter()
-        .filter(|root| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
+        .filter(|(root, _)| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
     {
         let Ok(root) = CapabilityRoot::new(configured_root) else {
             degraded = true;
@@ -795,11 +928,19 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
             };
             let target = WatchTargetId::new(next_target);
             next_target = next_target.saturating_add(1);
-            if target
-                .ok()
-                .is_none_or(|target| watcher.add_target(target, &root, relative).is_err())
-            {
+            let Ok(target) = target else {
                 degraded = true;
+                continue;
+            };
+            if watcher.add_target(target, &root, relative).is_err() {
+                degraded = true;
+                continue;
+            }
+            if is_worktree
+                && let Some(native_path) =
+                    native_worktree_path(&directory, config.worktree_mappings())
+            {
+                worktree_paths.insert(target, native_path);
             }
         }
     }
@@ -812,7 +953,20 @@ fn build_watcher(config: &RuntimeConfig, health: &HealthService) -> Option<Watch
     } else {
         health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
     }
-    Some(watcher)
+    Some(WatchRegistry {
+        service: watcher,
+        worktree_paths,
+    })
+}
+
+fn native_worktree_path(
+    mounted_path: &Path,
+    mappings: &[crate::WorktreePathMapping],
+) -> Option<PathBuf> {
+    mappings.iter().find_map(|mapping| {
+        let relative = mounted_path.strip_prefix(mapping.mounted_root()).ok()?;
+        Some(mapping.native_root().join(relative))
+    })
 }
 
 async fn shutdown_signal() {
@@ -1014,7 +1168,7 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-    use super::{BootstrapConfig, check_liveness};
+    use super::{BootstrapConfig, check_liveness, native_worktree_path};
 
     #[test]
     fn internal_healthcheck_accepts_only_a_successful_liveness_response() {
@@ -1081,5 +1235,19 @@ mod tests {
         });
         let error = result.expect_err("invalid token").to_string();
         assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn watched_container_directory_projects_back_to_native_worktree_path() {
+        let mounted = tempfile::tempdir().expect("mounted root should exist");
+        let nested = mounted.path().join("repo/src");
+        std::fs::create_dir_all(&nested).expect("nested directory should exist");
+        let mapping = crate::WorktreePathMapping::new("/host/repositories", mounted.path())
+            .expect("mapping should be valid");
+
+        assert_eq!(
+            native_worktree_path(&nested, &[mapping]),
+            Some(std::path::PathBuf::from("/host/repositories/repo/src"))
+        );
     }
 }
