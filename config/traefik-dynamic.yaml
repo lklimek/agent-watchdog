@@ -16,6 +16,14 @@ http:
       priority: 100
       rule: Path(`/hooks/claude`)
       service: watchdog
+    watchdog-codex-hooks:
+      entryPoints:
+        - web
+      middlewares:
+        - watchdog-trusted
+      priority: 100
+      rule: Path(`/hooks/codex`)
+      service: watchdog
     watchdog-web:
       entryPoints:
         - web

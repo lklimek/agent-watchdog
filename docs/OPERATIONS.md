@@ -148,6 +148,27 @@ monitoring unavailability from blocking the agent. Protect the configuration
 with mode `0600`, and follow the current Claude Code hooks documentation when
 adding the command to user settings.
 
+## Optional Codex lifecycle hooks
+
+Codex automatic filesystem/process discovery also works without hooks. Current
+Codex releases can send `SessionStart`, `SubagentStart`, `SubagentStop`, and
+`Stop` lifecycle input to `/hooks/codex`. This route has the same trusted-source
+and Bearer requirements as `/hooks/claude`, and Watchdog discards prompt,
+assistant-message, and transcript content.
+
+Create a second mode-`0600` curl configuration using the Claude example above,
+changing only the URL to:
+
+```text
+url = "https://watchdog.example/hooks/codex"
+```
+
+Add one user-level Codex command hook for each of the four lifecycle events,
+using `curl --config /absolute/path/to/codex-hook-curl.conf || true`. Hooks are
+optional enrichment and must fail open. Review and trust the exact user hook in
+Codex, and follow the current official hooks documentation because hook setup is
+versioned runtime behavior. An empty successful response is intentional.
+
 ## Logs and health
 
 ```text

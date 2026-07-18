@@ -30,11 +30,11 @@ use crate::process_monitor::ProcessMonitor;
 use crate::termination::TerminationMonitor;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, ClaudeHookService,
-    CodexDiscovery, CompanionDiscovery, DashboardOutboxDispatcher, DashboardService,
-    FilesystemActivityReconciler, GitHubEnricher, HealthService, HumanNotifier,
+    CodexDiscovery, CodexHookService, CompanionDiscovery, DashboardOutboxDispatcher,
+    DashboardService, FilesystemActivityReconciler, GitHubEnricher, HealthService, HumanNotifier,
     HumanOutboxDispatcher, NotificationEndpoints, RepositoryMetadata, RuntimeDiscoveryReport,
-    SystemClock, TerminationConfig, WebhookEndpoint, claude_hook_router, dashboard_router,
-    health_router, mcp_router,
+    SystemClock, TerminationConfig, WebhookEndpoint, claude_hook_router, codex_hook_router,
+    dashboard_router, health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
@@ -157,14 +157,14 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     health.record(ComponentId::Notifications, ComponentStatus::Healthy, None);
     let github = initialize_github(&bootstrap, &current, &clock)?;
 
-    let router = Router::new()
-        .merge(health_router(health.clone(), bootstrap.basic_auth.clone()))
-        .merge(dashboard_router(dashboard, bootstrap.basic_auth.clone()))
-        .merge(claude_hook_router(
-            ClaudeHookService::new(api.clone(), Arc::clone(&clock) as Arc<_>),
-            bootstrap.bearer_auth.clone(),
-        ))
-        .merge(mcp_router(api.clone(), bootstrap.bearer_auth.clone()));
+    let router = application_router(
+        health.clone(),
+        dashboard,
+        api.clone(),
+        Arc::clone(&clock),
+        bootstrap.basic_auth.clone(),
+        bootstrap.bearer_auth.clone(),
+    );
 
     let (reconcile_tx, reconcile_rx) = mpsc::channel(1);
     let filesystem_uncertainty_generation = Arc::new(AtomicU64::new(0));
@@ -230,6 +230,28 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+fn application_router(
+    health: HealthService,
+    dashboard: DashboardService,
+    api: AgentApi,
+    clock: Arc<SystemClock>,
+    basic_auth: BasicAuthenticator,
+    bearer_auth: BearerAuthenticator,
+) -> Router {
+    Router::new()
+        .merge(health_router(health, basic_auth.clone()))
+        .merge(dashboard_router(dashboard, basic_auth))
+        .merge(claude_hook_router(
+            ClaudeHookService::new(api.clone(), Arc::clone(&clock) as Arc<_>),
+            bearer_auth.clone(),
+        ))
+        .merge(codex_hook_router(
+            CodexHookService::new(api.clone(), clock),
+            bearer_auth.clone(),
+        ))
+        .merge(mcp_router(api, bearer_auth))
 }
 
 fn initialize_github(
