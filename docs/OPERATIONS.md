@@ -122,6 +122,9 @@ An `UPGRADE` warning on a session means a runtime format or behavior is newer
 than the tested adapter. Monitoring continues on a best-effort basis, but
 destructive automation is suspended for affected sessions. Update Agent
 Watchdog and inspect detailed health before treating the warning as resolved.
+`termination_automation` degradation means the child-only reconciliation pass
+failed safely; no new signal stage is attempted until the worker and all safety
+components are healthy again.
 
 ## Reload configuration
 

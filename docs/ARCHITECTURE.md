@@ -430,6 +430,15 @@ Any contrary observation cancels the saga. After grace:
 5. if enabled, re-verify and send `SIGKILL` through pidfd;
 6. record the outcome at every stage.
 
+A five-second Linux worker loads only stored child sessions, batches selected
+relation evidence by root, samples a fresh PID/start-time/executable identity,
+and derives health gates from store, queue, owning adapter, and process-sampler
+status. Missing evidence suspends the saga without mutation. The worker and
+normal reducer lanes share one event allocator, preventing event-ID collisions,
+and each pass reads the current reloadable automation, grace, `SIGKILL`, and
+post-stall timing policy. Main sessions are excluded by the store query and by
+the `TerminationCandidate` type boundary.
+
 If pidfd is unavailable, the fallback verifies PID start time and executable
 immediately before each signal. Signals are never constructed through a shell.
 The server must run as the same numeric host UID as monitored agents; it does not

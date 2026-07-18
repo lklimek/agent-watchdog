@@ -21,6 +21,8 @@ pub enum ComponentId {
     ObservationQueue,
     /// Best-effort human webhook delivery.
     Notifications,
+    /// Conservative child-only termination scheduler.
+    TerminationAutomation,
 }
 
 impl ComponentId {

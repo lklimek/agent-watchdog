@@ -25,6 +25,8 @@ use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
 use crate::config::{ConfigManager, RuntimeConfig};
 #[cfg(target_os = "linux")]
 use crate::process_monitor::ProcessMonitor;
+#[cfg(target_os = "linux")]
+use crate::termination::TerminationMonitor;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
     CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, GitHubEnricher, HealthService,
@@ -133,17 +135,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     record_adapter_health(&health, &current);
 
     #[cfg(target_os = "linux")]
-    let _termination_config = TerminationConfig::new(
-        current.automation_enabled(),
-        current.sigkill_enabled(),
-        current.warning_grace(),
-        current.action_grace(),
-    )
-    .map_err(|_| ServerError::Configuration)?;
-    let _deadline_policy = current.deadline_policy();
-
-    #[cfg(target_os = "linux")]
-    let process_monitor = initialize_process_monitor(&api, &store, &clock, &health)?;
+    let linux_monitors = initialize_linux_monitors(&api, &store, &clock, &health, &current)?;
 
     let dashboard = DashboardService::new(store.clone(), Arc::clone(&clock) as Arc<_>);
     let dispatcher = DashboardOutboxDispatcher::new(
@@ -197,7 +189,10 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let notification_worker = spawn_notification_worker(notification_dispatcher, health.clone());
     let timer_worker = spawn_timer_worker(api.clone(), health.clone());
     #[cfg(target_os = "linux")]
-    let process_worker = spawn_process_worker(process_monitor, health.clone());
+    let process_worker = spawn_process_worker(linux_monitors.process, health.clone());
+    #[cfg(target_os = "linux")]
+    let termination_worker =
+        spawn_termination_worker(linux_monitors.termination, config.clone(), health.clone());
     let reload_worker = spawn_reload_worker(config, api, health.clone())?;
 
     let listener = tokio::net::TcpListener::bind(bootstrap.listen_address)
@@ -220,10 +215,112 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     timer_worker.abort();
     #[cfg(target_os = "linux")]
     process_worker.abort();
+    #[cfg(target_os = "linux")]
+    termination_worker.abort();
     reload_worker.abort();
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxMonitors {
+    process: ProcessMonitor,
+    termination: TerminationMonitor,
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_linux_monitors(
+    api: &AgentApi,
+    store: &WatchdogStore,
+    clock: &Arc<SystemClock>,
+    health: &HealthService,
+    config: &RuntimeConfig,
+) -> Result<LinuxMonitors, ServerError> {
+    let termination_config = TerminationConfig::new(
+        config.automation_enabled(),
+        config.sigkill_enabled(),
+        config.warning_grace(),
+        config.action_grace(),
+    )
+    .map_err(|_| ServerError::Configuration)?;
+    let process = initialize_process_monitor(api, store, clock, health)?;
+    let termination = TerminationMonitor::new(
+        api,
+        store.clone(),
+        Arc::clone(clock) as Arc<_>,
+        health.clone(),
+        termination_config,
+        config.deadline_policy().terminate_after_stalled(),
+    )
+    .map_err(|_| ServerError::ProcessSampler)?;
+    health.record(
+        ComponentId::TerminationAutomation,
+        ComponentStatus::Healthy,
+        None,
+    );
+    Ok(LinuxMonitors {
+        process,
+        termination,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_termination_worker(
+    mut monitor: TerminationMonitor,
+    config: ConfigManager,
+    health: HealthService,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TIMER_RECONCILIATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let current = config.current();
+            let Ok(termination_config) = TerminationConfig::new(
+                current.automation_enabled(),
+                current.sigkill_enabled(),
+                current.warning_grace(),
+                current.action_grace(),
+            ) else {
+                health.record(
+                    ComponentId::TerminationAutomation,
+                    ComponentStatus::Degraded,
+                    Some("Child termination configuration is invalid"),
+                );
+                continue;
+            };
+            monitor.update_policy(
+                termination_config,
+                current.deadline_policy().terminate_after_stalled(),
+            );
+            if let Ok(report) = monitor.reconcile().await {
+                health.record(
+                    ComponentId::TerminationAutomation,
+                    ComponentStatus::Healthy,
+                    None,
+                );
+                if report.changed_sagas() > 0 {
+                    tracing::info!(
+                        event = "termination.reconciled",
+                        evaluated_children = report.evaluated_children(),
+                        changed_sagas = report.changed_sagas(),
+                        "Child termination reconciliation completed"
+                    );
+                }
+            } else {
+                health.record(
+                    ComponentId::TerminationAutomation,
+                    ComponentStatus::Degraded,
+                    Some("Child termination reconciliation is suspended"),
+                );
+                tracing::error!(
+                    event = "termination.reconcile_failed",
+                    "Child termination reconciliation failed safely"
+                );
+            }
+        }
+    })
 }
 
 fn initialize_notification_dispatcher(
