@@ -217,6 +217,7 @@ impl TerminationMonitor {
         for (component, termination_component) in [
             (ComponentId::Store, TerminationComponent::Store),
             (ComponentId::ObservationQueue, TerminationComponent::Queue),
+            (ComponentId::Watcher, TerminationComponent::Queue),
             (ComponentId::Adapter(runtime), TerminationComponent::Adapter),
             (ComponentId::ProcessSampler, TerminationComponent::Process),
         ] {
@@ -932,6 +933,7 @@ mod monitor_tests {
             ComponentId::Store,
             ComponentId::ObservationQueue,
             ComponentId::ProcessSampler,
+            ComponentId::Watcher,
         ] {
             health.record(component, ComponentStatus::Healthy, None);
         }
@@ -975,6 +977,25 @@ mod monitor_tests {
             ComponentStatus::Healthy,
             None,
         );
+        health.record(
+            ComponentId::Watcher,
+            ComponentStatus::Degraded,
+            Some("filesystem events were lost"),
+        );
+        let watcher_suspended = monitor
+            .reconcile()
+            .await
+            .expect("watcher degradation should fail closed");
+        assert_eq!(watcher_suspended.changed_sagas(), 0);
+        assert!(
+            store
+                .termination_saga(child_id)
+                .await
+                .expect("saga query should succeed")
+                .is_none()
+        );
+
+        health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
         let started = monitor
             .reconcile()
             .await
