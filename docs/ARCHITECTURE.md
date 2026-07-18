@@ -340,6 +340,13 @@ PIDs, phase, and terminal errors. Summary and job files are independently parsed
 because they are not an atomic pair. Missing records after native pruning are not
 treated as failure without corroboration.
 
+Companion's native `workspaceRoot` is bookkeeping for the cwd from which the
+dispatch was issued; it is not proof of the child's actual worktree. The adapter
+uses it only to reconcile summary/detail consistency. It never grants automatic
+filesystem ownership or persists it as the child's startup directory. An exact
+child worktree must come from a native runtime source that identifies it or from
+the child's explicit MCP session/watch-path registration.
+
 For `jobs/<safe-job-id>.log`, Watchdog persists only device, inode, and byte
 offset. The first sighting starts at EOF; a later increase on the same file
 identity emits one content-free progress observation keyed by the new offset.
