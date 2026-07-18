@@ -9,10 +9,10 @@ remain normative.
 
 - Working branch: `feat/implementation`.
 - Latest implementation commit before this handoff refresh:
-  `1b4c4f5 fix(codex): discover sessions without sqlite wal`.
+  `ec3258a feat(mcp): complete parent alert diagnostics`.
 - No implementation commits in this phase have been pushed. Pushing remains an
   explicit user decision; never push implicitly or directly to `main`.
-- The implementation worktree was clean immediately after `1b4c4f5`; the
+- The implementation worktree was clean immediately after `ec3258a`; the
   handoff refresh itself is documentation-only.
 - Implementation is in Phase 10 integration hardening. Final release QA and the
   lessons-learned phase have not started.
@@ -60,6 +60,17 @@ remain normative.
 - `1b4c4f5`: current Codex main/child rollout metadata is discovered even when
   SQLite is absent or behind WAL. Descending bounded scans prefer current
   timestamped paths, preserve exact hierarchy, and tail subsequent activity.
+- `7b0cd27`: durable tree-scoped MCP watch-path registration validates concrete
+  native paths through configured read-only capability mappings, restores them
+  after restart, prioritizes them in the watcher budget, and attributes exact
+  child filesystem activity without expanding Compose mounts.
+- `ec3258a`: Linux process sampling now precedes every timer evaluation and
+  retains only the latest CPU delta per session/kind. Durable parent events
+  expose a bounded diagnostic bundle with PID identity, CPU provenance/times,
+  operation, conflicts, typed correlation basis/evidence, and suggested checks.
+  Standard/additional runtime roots now have an explicit tested
+  native-to-mounted configuration contract. `TRACEABILITY.md` has no remaining
+  functional gaps.
 
 ## Verification already completed
 
@@ -76,6 +87,15 @@ remain normative.
 - Rollout-only and SQLite-backed Codex discovery tests pass together; all six
   cross-adapter discovery tests, all seven scan/attribution tests, and strict
   Clippy for `watchdog-runtime` plus `watchdog-server` pass after `1b4c4f5`.
+- `cargo test --workspace --all-targets` passed after the diagnostic bundle and
+  typed correlation-basis changes. The new parent diagnostic and process CPU
+  persistence tests appear in the run; the release load/slow-peer gates remain
+  explicitly ignored by the default suite.
+- The focused standard/additional runtime-mapping test passed after its final
+  addition. Strict Clippy passed for domain, store, and server with all targets
+  and warnings denied after all functional-closure changes.
+- Watch-path store, capability/restart, MCP schema, filesystem ownership, full
+  server, and strict Clippy suites passed before `7b0cd27`.
 - Explicit load target: 2/2 passed; 500-session ingestion about 379–416 ms,
   dashboard 32–35 ms, high-water RSS 13.2–17.0 MiB, and ten restart cycles. See
   `docs/spikes/capacity.md` for exact commands and budgets.
@@ -87,9 +107,8 @@ remain normative.
   in 232 ms; the service stayed responsive. The burst fixture was then removed
   and the application container recreated successfully.
 
-Run a full workspace test again before the next commit because the last broad
-test was server-only even though strict workspace Clippy covered every crate.
-Use the cached Cargo wrapper without `CLAUDIUS_FORCE=1`:
+Use the cached Cargo wrapper without `CLAUDIUS_FORCE=1` for all remaining Rust
+verification:
 
 ```text
 CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
@@ -113,23 +132,21 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
 
 ## Remaining Phase 10 work
 
-1. Close the remaining functional gaps recorded in `TRACEABILITY.md`: complete
-   parent diagnostics and the supported standard-path configuration wording.
-2. Complete explicitly isolated live-runtime tests for current Claude, Codex CLI,
+1. Complete explicitly isolated live-runtime tests for current Claude, Codex CLI,
    and Companion versions. Never inspect existing user sessions.
-3. Measure the remaining release budgets: ten-minute steady-state CPU and a
+2. Measure the remaining release budgets: ten-minute steady-state CPU and a
    representative production burst p99. Record exact environment/results.
-4. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
+3. Run full format, workspace test, strict Clippy, `cargo deny`, `cargo audit`,
    Compose config/security checks, browser QA, explicit load/slow-peer tests, and
    any supported live matrix tests.
-5. Perform fresh security/self-review and independent review; fix all critical or
+4. Perform fresh security/self-review and independent review; fix all critical or
    high findings.
-6. Only during final QA, read
+5. Only during final QA, read
    `/data/artifacts/claudius/2026-07-17/watchdog-knowledge-transfer.html`,
    interpret it in the context of `https://github.com/lklimek/claudius`, and
    audit the implementation against every applicable pitfall. Do not read it
    earlier.
-7. Do the deferred macOS build-only check at the end without adding unsupported
+6. Do the deferred macOS build-only check at the end without adding unsupported
    deployment features.
-8. Update final version matrix, known limitations, release evidence, TODOs, and
+7. Update final version matrix, known limitations, release evidence, TODOs, and
    lessons learned; then stop for the user's explicit push decision.
