@@ -78,9 +78,10 @@ commit's default test run:
   test -p watchdog-server --test load -- --ignored --nocapture
 ```
 
-On the reference Linux host, the debug-profile test ingested and durably
-converged all 500 sessions in 416 ms, built the 50-card dashboard (including all
-child counts) in 33 ms, and reported a test-process high-water RSS of 13.4 MiB.
+On the reference Linux host, repeated debug-profile runs ingested and durably
+converged all 500 sessions in 379–416 ms, built the 50-card dashboard (including
+all child counts) in 32–35 ms, and reported a test-process high-water RSS of
+13.2–17.0 MiB.
 It then reconstructed all 500 reducer lanes from the same database and produced
 an identical dashboard. The executable gate permits 30 seconds for ingestion,
 2 seconds for a dashboard snapshot, and 256 MiB high-water RSS to tolerate CI
@@ -88,6 +89,15 @@ variance while still catching catastrophic regressions. These figures cover
 the in-process production path, not container overhead, live adapter parsing,
 the 10-minute steady-state CPU gate, or burst p99; those remain separate release
 measurements.
+
+The same explicit test target also performs a restart soak. It closes and
+reopens the production SQLite-backed service ten times at the full 50/500
+population, writes a durable restart boundary, reconciles every session with a
+fresh native observation, and verifies WAL/foreign-key health plus the complete
+dashboard hierarchy after every cycle. The population and restart tests
+completed together in 5.67 seconds on the reference host. This gate exercises
+restart idempotency and durable lane reconstruction; interruption at every
+termination-saga stage remains a separate safety test.
 
 ## Architectural impact
 
