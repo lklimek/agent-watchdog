@@ -268,6 +268,38 @@ impl AgentApi {
         }
     }
 
+    /// Persist a restart boundary for every retained session before native
+    /// reconciliation or timer-driven work resumes.
+    ///
+    /// Linux monotonic timestamps are process-local and cannot be ordered
+    /// across a server restart. This clears the retained monotonic cursor and
+    /// marks each session as requiring fresh evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] when retained sessions cannot be listed or a
+    /// restart marker cannot be committed atomically.
+    pub async fn mark_restarted(&self) -> Result<(), AgentApiError> {
+        let mut sessions = self
+            .inner
+            .store
+            .sessions_by_kind(SessionKind::Main, MAX_TREE_SESSIONS)
+            .await?;
+        sessions.extend(
+            self.inner
+                .store
+                .sessions_by_kind(SessionKind::Child, MAX_TREE_SESSIONS)
+                .await?,
+        );
+        let now = self.inner.clock.now();
+        for record in sessions {
+            let observation = restart_observation(&record, now)?;
+            let lane = self.lane(&record, now).await?;
+            lane.lock().await.apply_restarted(observation).await?;
+        }
+        Ok(())
+    }
+
     /// Persist one automatically discovered session independently from MCP
     /// registration while retaining the ability for a parent agent to bind the
     /// resulting main tree later.
@@ -950,6 +982,30 @@ impl AgentApi {
 
 fn discovery_transport(root: MainSessionId) -> Result<TransportKey, DomainInputError> {
     TransportKey::new(format!("autodiscovery:{}", root.session_id()))
+}
+
+fn restart_observation(
+    record: &StoredSessionRecord,
+    now: TimePoint,
+) -> Result<ObservationEnvelope, AgentApiError> {
+    let event_key = format!(
+        "{}:{}:{}",
+        record.session.session_id(),
+        now.wall_time().value(),
+        now.monotonic_ms()
+    );
+    Ok(ObservationEnvelope::new(
+        ObservationId::from_native(record.native.runtime(), "server-restart", event_key)?,
+        record.native.clone(),
+        now,
+        ObservationSource::new(
+            AdapterIdentity::new(record.native.runtime(), "agent-watchdog-restart-v1")?,
+            "server:restart",
+            EvidenceTrust::Authoritative,
+            None,
+        )?,
+        ObservationPayload::SchedulerTick,
+    )?)
 }
 
 fn mcp_observation(

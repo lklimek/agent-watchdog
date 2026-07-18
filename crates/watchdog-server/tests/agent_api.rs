@@ -293,6 +293,58 @@ async fn native_observation_ingestion_preserves_provenance_and_retry_idempotency
     assert_eq!(stored.source().trust(), EvidenceTrust::Authoritative);
 }
 
+#[tokio::test]
+async fn restart_reconciliation_resets_process_local_monotonic_ordering() {
+    let (api, store, clock) = api_fixture().await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "restart-job")
+        .expect("native identity should be valid");
+    api.discover_session(DiscoveredSession {
+        runtime: native.runtime(),
+        native_id: native.native_id().to_owned(),
+        kind: SessionKind::Main,
+        parent: None,
+        event_key: "restart-job:discovered".to_owned(),
+        title: None,
+        startup_directory: None,
+    })
+    .await
+    .expect("session should be discovered");
+    let first_id =
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "state", "restart-job:first")
+            .expect("observation identity should be valid");
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        first_id,
+        TimePoint::new(WallTimeMs::new(20_000), 700_000),
+        DetailedState::Running,
+    ))
+    .await
+    .expect("pre-restart evidence should apply");
+
+    clock.set(TimePoint::new(WallTimeMs::new(30_000), 5));
+    let restarted = AgentApi::new(store, clock.clone())
+        .await
+        .expect("API should restart");
+    restarted
+        .mark_restarted()
+        .await
+        .expect("all retained sessions should be marked for reconciliation");
+    let fresh_id =
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "state", "restart-job:fresh")
+            .expect("observation identity should be valid");
+    let reconciled = restarted
+        .ingest_native_observation(native_state_observation(
+            &native,
+            fresh_id,
+            clock.now(),
+            DetailedState::Running,
+        ))
+        .await
+        .expect("fresh low-monotonic evidence should apply after restart");
+    assert!(!reconciled.snapshot.reconciliation_required());
+    assert!(reconciled.snapshot.revision() >= 4);
+}
+
 fn native_state_observation(
     native: &NativeSessionKey,
     id: ObservationId,

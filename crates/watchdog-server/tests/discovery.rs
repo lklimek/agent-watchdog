@@ -103,8 +103,9 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
     ] {
         fs::create_dir(directory).expect("fixture directory should be created");
     }
+    let state_path = workspace_state.join("state.json");
     fs::write(
-        workspace_state.join("state.json"),
+        &state_path,
         serde_json::to_vec(&json!({
             "version": 1,
             "jobs": [{
@@ -114,7 +115,7 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
                 "title": "Review persistence",
                 "status": "running",
                 "phase": "verifying",
-                "pid": 4242,
+                "pid": std::process::id(),
                 "updatedAt": "2026-07-18T10:00:00Z"
             }]
         }))
@@ -148,6 +149,7 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
     assert_eq!(report.child_sessions(), 1);
     assert_eq!(report.warning_count(), 1);
 
+    update_companion_summary(&state_path);
     clock.advance(DurationMs::new(1_000));
     let repeated = discovery
         .reconcile(
@@ -169,12 +171,18 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         .await
         .expect("snapshot should query")
         .expect("snapshot should exist");
+    let reducer = snapshot
+        .reducer_snapshot()
+        .expect("reducer snapshot should be retained");
+    assert_eq!(reducer.state(), DetailedState::Running);
+    #[cfg(target_os = "linux")]
     assert_eq!(
-        snapshot
-            .reducer_snapshot()
-            .expect("reducer snapshot should be retained")
-            .state(),
-        DetailedState::Running
+        reducer
+            .process_identity()
+            .expect("fresh native PID should be verified")
+            .pid()
+            .value(),
+        std::process::id()
     );
     let metadata = store
         .session_metadata(children[0].session)
@@ -183,6 +191,13 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         .expect("metadata should exist");
     assert_eq!(metadata.title(), Some("Review persistence"));
     assert_eq!(metadata.startup_directory(), Some("/host/repositories/job"));
+}
+
+fn update_companion_summary(path: &std::path::Path) {
+    let updated = fs::read_to_string(path)
+        .expect("summary should remain readable")
+        .replace("2026-07-18T10:00:00Z", "2026-07-18T10:01:00Z");
+    fs::write(path, updated).expect("summary update should be written");
 }
 
 #[tokio::test]

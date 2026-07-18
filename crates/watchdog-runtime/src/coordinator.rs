@@ -139,6 +139,27 @@ impl SessionCoordinator {
         self.apply_input(observation, input).await
     }
 
+    /// Persist a restart boundary that invalidates process-local monotonic
+    /// ordering and requires fresh native reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError`] for non-tick payloads, event allocation, or
+    /// persistence failure.
+    pub async fn apply_restarted(
+        &mut self,
+        observation: ObservationEnvelope,
+    ) -> Result<ApplyResult, CoordinatorError> {
+        if !matches!(
+            observation.payload(),
+            watchdog_domain::ObservationPayload::SchedulerTick
+        ) {
+            return Err(CoordinatorError::InvalidInput);
+        }
+        let input = ReducerInput::Restarted(observation.observed_at());
+        self.apply_input(observation, input).await
+    }
+
     async fn apply_input(
         &mut self,
         observation: ObservationEnvelope,

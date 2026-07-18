@@ -10,6 +10,8 @@ mod github;
 mod health;
 mod mcp;
 mod notifications;
+#[cfg(target_os = "linux")]
+mod process_monitor;
 mod server;
 #[cfg(target_os = "linux")]
 mod termination;
