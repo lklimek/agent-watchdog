@@ -12,6 +12,7 @@ pub(super) fn dashboard(snapshot: &DashboardSnapshot) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="color-scheme" content="light dark";
                 title { "Agent Watchdog" }
+                link rel="icon" href="data:,";
                 link rel="stylesheet" href="/ui/assets/app.css";
                 script defer src="/ui/assets/app.js" {}
             }
