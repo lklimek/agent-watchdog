@@ -32,14 +32,16 @@ use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeTeamDiscovery, CodexDiscovery,
     CompanionDiscovery, DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler,
     GitHubEnricher, HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints,
-    RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint, dashboard_router,
-    health_router, mcp_router,
+    RepositoryMetadata, RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint,
+    dashboard_router, health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
 const WATCH_TARGET_LIMIT: usize = 4_096;
 const FILESYSTEM_ACTIVITY_QUEUE_CAPACITY: usize = 64;
+const MAX_GITHUB_SESSIONS: u32 = 1_000;
+const GITHUB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
 const NOTIFICATION_DELIVERY_LIMIT: u32 = 128;
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
@@ -152,20 +154,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         bootstrap.notification_endpoints.clone(),
     )?;
     health.record(ComponentId::Notifications, ComponentStatus::Healthy, None);
-    let _github = if current.github_enabled() {
-        Some(
-            GitHubEnricher::new(
-                Arc::clone(&clock) as Arc<_>,
-                bootstrap
-                    .github_token
-                    .as_ref()
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .map_err(|_| ServerError::GitHubConfiguration)?,
-        )
-    } else {
-        None
-    };
+    let github = initialize_github(&bootstrap, &current, &clock)?;
 
     let router = Router::new()
         .merge(health_router(health.clone(), bootstrap.basic_auth.clone()))
@@ -184,6 +173,8 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let watcher_stop = Arc::new(AtomicBool::new(false));
     let (filesystem_activity_tx, filesystem_activity_worker) =
         initialize_filesystem_activity(&api, &store, &clock, &health);
+    let github_worker =
+        github.map(|enricher| spawn_github_worker(enricher, api.clone(), store.clone()));
     let watcher = spawn_watcher_supervisor(
         config.clone(),
         health.clone(),
@@ -220,6 +211,9 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     notification_worker.abort();
     timer_worker.abort();
     filesystem_activity_worker.abort();
+    if let Some(worker) = github_worker {
+        worker.abort();
+    }
     #[cfg(target_os = "linux")]
     process_worker.abort();
     #[cfg(target_os = "linux")]
@@ -228,6 +222,25 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let _ = watcher.await;
     tracing::info!(event = "server.stopped", "Agent Watchdog server stopped");
     result
+}
+
+fn initialize_github(
+    bootstrap: &BootstrapConfig,
+    config: &RuntimeConfig,
+    clock: &Arc<SystemClock>,
+) -> Result<Option<GitHubEnricher>, ServerError> {
+    if !config.github_enabled() {
+        return Ok(None);
+    }
+    GitHubEnricher::new(
+        Arc::clone(clock) as Arc<_>,
+        bootstrap
+            .github_token
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret),
+    )
+    .map(Some)
+    .map_err(|_| ServerError::GitHubConfiguration)
 }
 
 fn initialize_filesystem_activity(
@@ -243,6 +256,82 @@ fn initialize_filesystem_activity(
         sender,
         spawn_filesystem_activity_worker(reconciler, health.clone(), receiver),
     )
+}
+
+fn spawn_github_worker(
+    enricher: GitHubEnricher,
+    api: AgentApi,
+    store: WatchdogStore,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(GITHUB_RECONCILIATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Ok((enriched, warnings)) =
+                reconcile_github_metadata(&enricher, &api, &store).await
+            {
+                tracing::debug!(
+                    event = "github.reconciled",
+                    enriched_sessions = enriched,
+                    warnings,
+                    "GitHub pull-request metadata was reconciled"
+                );
+            } else {
+                tracing::warn!(
+                    event = "github.reconcile_failed",
+                    "GitHub metadata could not be loaded; branch fallback remains available"
+                );
+            }
+        }
+    })
+}
+
+async fn reconcile_github_metadata(
+    enricher: &GitHubEnricher,
+    api: &AgentApi,
+    store: &WatchdogStore,
+) -> Result<(u32, u32), ()> {
+    let sessions = store
+        .sessions_by_kind(watchdog_domain::SessionKind::Main, MAX_GITHUB_SESSIONS)
+        .await
+        .map_err(|_| ())?;
+    let mut enriched_sessions = 0_u32;
+    let mut warnings = 0_u32;
+    for session in sessions {
+        let metadata = store
+            .session_metadata(session.session)
+            .await
+            .map_err(|_| ())?;
+        let Some(metadata) = metadata else {
+            warnings = warnings.saturating_add(1);
+            continue;
+        };
+        let (Some(remote), Some(branch)) = (metadata.repository_remote(), metadata.branch()) else {
+            continue;
+        };
+        let Ok(github) = enricher.enrich(remote, branch).await else {
+            warnings = warnings.saturating_add(1);
+            continue;
+        };
+        let repository = RepositoryMetadata {
+            remote: Some(remote.to_owned()),
+            branch: Some(github.branch().to_owned()),
+            pull_request_number: github.pull_request_number(),
+            pull_request_url: github.pull_request_url().map(ToOwned::to_owned),
+            replace_pull_request: true,
+        };
+        if api
+            .enrich_repository_metadata(session.session, repository)
+            .await
+            .is_err()
+        {
+            warnings = warnings.saturating_add(1);
+        } else {
+            enriched_sessions = enriched_sessions.saturating_add(1);
+        }
+    }
+    Ok((enriched_sessions, warnings))
 }
 
 #[cfg(target_os = "linux")]

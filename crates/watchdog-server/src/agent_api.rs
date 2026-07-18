@@ -82,6 +82,21 @@ pub struct DiscoveredSession {
     pub startup_directory: Option<String>,
 }
 
+/// Best-effort repository metadata derived from a trusted native source.
+#[derive(Clone, Debug, Default)]
+pub struct RepositoryMetadata {
+    /// Repository remote retained for later GitHub enrichment.
+    pub remote: Option<String>,
+    /// Current native branch.
+    pub branch: Option<String>,
+    /// Enriched open pull-request number.
+    pub pull_request_number: Option<u64>,
+    /// Locally validated pull-request URL.
+    pub pull_request_url: Option<String>,
+    /// Replace (and therefore allow clearing) stored pull-request fields.
+    pub replace_pull_request: bool,
+}
+
 #[derive(Clone, Debug)]
 enum RegistrationProvenance {
     Mcp,
@@ -459,6 +474,54 @@ impl AgentApi {
         )?;
         self.inner.store.save_session_metadata(&metadata).await?;
         Ok(view)
+    }
+
+    /// Merge repository, branch, and optional pull-request metadata without
+    /// changing runtime state or discovery provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] when the session metadata is absent, fields
+    /// exceed their bounds, or persistence fails.
+    pub async fn enrich_repository_metadata(
+        &self,
+        session: SessionIdentity,
+        repository: RepositoryMetadata,
+    ) -> Result<(), AgentApiError> {
+        let existing = self
+            .inner
+            .store
+            .session_metadata(session)
+            .await?
+            .ok_or(AgentApiError::SessionNotFound)?;
+        let metadata = SessionMetadataRecord::new(
+            session,
+            existing.title().map(ToOwned::to_owned),
+            existing.startup_directory().map(ToOwned::to_owned),
+            repository
+                .remote
+                .or_else(|| existing.repository_remote().map(ToOwned::to_owned)),
+            repository
+                .branch
+                .or_else(|| existing.branch().map(ToOwned::to_owned)),
+            if repository.replace_pull_request {
+                repository.pull_request_number
+            } else {
+                repository
+                    .pull_request_number
+                    .or(existing.pull_request_number())
+            },
+            if repository.replace_pull_request {
+                repository.pull_request_url
+            } else {
+                repository
+                    .pull_request_url
+                    .or_else(|| existing.pull_request_url().map(ToOwned::to_owned))
+            },
+            self.inner.clock.now().wall_time(),
+        )?;
+        self.inner.store.save_session_metadata(&metadata).await?;
+        Ok(())
     }
 
     /// Apply one provenance-preserving runtime observation to an already

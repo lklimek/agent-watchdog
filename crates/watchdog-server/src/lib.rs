@@ -19,8 +19,8 @@ mod termination;
 
 pub use agent_api::{
     AgentApi, AgentApiError, AgentEventView, AgentHealthView, CompletionOutcome, DiscoveredSession,
-    EventPage, RegisterSession, SessionTreeView, SessionView, TimerReconciliationReport,
-    TransportKey, WaitingKind,
+    EventPage, RegisterSession, RepositoryMetadata, SessionTreeView, SessionView,
+    TimerReconciliationReport, TransportKey, WaitingKind,
 };
 pub use auth::{
     BasicAuthError, BasicAuthenticator, BearerAuthError, BearerAuthenticator,

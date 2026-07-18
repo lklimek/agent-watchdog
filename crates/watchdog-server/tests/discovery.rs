@@ -301,6 +301,7 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
         child_metadata.startup_directory(),
         Some("/host/repositories/child")
     );
+    assert_repository_metadata(&child_metadata);
 
     append_rollout_activity(&rollout_root.join("codex-child.jsonl"));
     clock.advance(DurationMs::new(1_000));
@@ -337,6 +338,14 @@ fn create_rollout_fixtures(rollout_root: &std::path::Path) {
     }
 }
 
+fn assert_repository_metadata(metadata: &watchdog_store::SessionMetadataRecord) {
+    assert_eq!(metadata.branch(), Some("feat/watchdog"));
+    assert_eq!(
+        metadata.repository_remote(),
+        Some("https://github.com/lklimek/agent-watchdog.git")
+    );
+}
+
 fn append_rollout_activity(path: &std::path::Path) {
     let mut rollout = fs::OpenOptions::new()
         .append(true)
@@ -369,7 +378,7 @@ async fn create_codex_state(path: &std::path::Path, now_ms: i64) {
     .await
     .expect("fixture database should open");
     sqlx::query(
-        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, cli_version TEXT NOT NULL DEFAULT '', agent_nickname TEXT, agent_role TEXT, recency_at_ms INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, git_branch TEXT, git_origin_url TEXT, cli_version TEXT NOT NULL DEFAULT '', agent_nickname TEXT, agent_role TEXT, recency_at_ms INTEGER NOT NULL DEFAULT 0)",
     )
     .execute(&pool)
     .await
@@ -414,7 +423,7 @@ async fn create_codex_state(path: &std::path::Path, now_ms: i64) {
             now_ms,
         ),
     ] {
-        sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, archived, cli_version, agent_nickname, recency_at_ms) VALUES (?, ?, 1, 1, 'cli', 'openai', ?, ?, '{}', 'default', ?, '0.144.5', ?, ?)")
+        sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, archived, git_branch, git_origin_url, cli_version, agent_nickname, recency_at_ms) VALUES (?, ?, 1, 1, 'cli', 'openai', ?, ?, '{}', 'default', ?, 'feat/watchdog', 'https://github.com/lklimek/agent-watchdog.git', '0.144.5', ?, ?)")
             .bind(id)
             .bind(format!("/state/{id}.jsonl"))
             .bind(cwd)
