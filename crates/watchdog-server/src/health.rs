@@ -289,7 +289,9 @@ fn component_name(component: ComponentId) -> String {
         ComponentId::Reducer => "reducer".to_owned(),
         ComponentId::Authorization => "authorization".to_owned(),
         ComponentId::Watcher => "watcher".to_owned(),
+        ComponentId::FilesystemReconciliation => "filesystem_reconciliation".to_owned(),
         ComponentId::ObservationQueue => "observation_queue".to_owned(),
+        ComponentId::DashboardDelivery => "dashboard_delivery".to_owned(),
         ComponentId::Notifications => "notifications".to_owned(),
         ComponentId::TerminationAutomation => "termination_automation".to_owned(),
     }

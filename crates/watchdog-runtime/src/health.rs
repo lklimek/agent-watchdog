@@ -17,8 +17,12 @@ pub enum ComponentId {
     Authorization,
     /// Filesystem invalidation watcher.
     Watcher,
+    /// Bounded reconciliation after filesystem uncertainty.
+    FilesystemReconciliation,
     /// Per-session observation admission queue.
     ObservationQueue,
+    /// Durable dashboard outbox and live snapshot delivery.
+    DashboardDelivery,
     /// Best-effort human webhook delivery.
     Notifications,
     /// Conservative child-only termination scheduler.

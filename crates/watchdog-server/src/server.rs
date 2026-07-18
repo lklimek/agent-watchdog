@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -167,6 +167,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         .merge(mcp_router(api.clone(), bootstrap.bearer_auth.clone()));
 
     let (reconcile_tx, reconcile_rx) = mpsc::channel(1);
+    let filesystem_uncertainty_generation = Arc::new(AtomicU64::new(0));
     let discovery_worker = start_discovery(
         config.clone(),
         api.clone(),
@@ -174,6 +175,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         Arc::clone(&clock),
         health.clone(),
         reconcile_rx,
+        Arc::clone(&filesystem_uncertainty_generation),
     );
     let watcher_stop = Arc::new(AtomicBool::new(false));
     let (filesystem_activity_tx, filesystem_activity_worker) =
@@ -186,6 +188,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         Arc::clone(&watcher_stop),
         reconcile_tx,
         filesystem_activity_tx,
+        filesystem_uncertainty_generation,
     );
     let dashboard_worker = spawn_dashboard_worker(dispatcher, health.clone());
     let notification_worker = spawn_notification_worker(notification_dispatcher, health.clone());
@@ -599,13 +602,22 @@ fn start_discovery(
     clock: Arc<SystemClock>,
     health: HealthService,
     requested: mpsc::Receiver<()>,
+    filesystem_uncertainty_generation: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     let discoveries = RuntimeDiscoveries {
         claude: ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone()),
         codex: CodexDiscovery::new(api.clone(), store.clone(), clock.clone()),
         companion: CompanionDiscovery::new(api, store.clone(), clock.clone()),
     };
-    spawn_discovery_worker(config, discoveries, store, clock, health, requested)
+    spawn_discovery_worker(
+        config,
+        discoveries,
+        store,
+        clock,
+        health,
+        requested,
+        filesystem_uncertainty_generation,
+    )
 }
 
 struct RuntimeDiscoveries {
@@ -621,6 +633,7 @@ fn spawn_discovery_worker(
     clock: Arc<SystemClock>,
     health: HealthService,
     mut requested: mpsc::Receiver<()>,
+    filesystem_uncertainty_generation: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PERIODIC_RECONCILIATION);
@@ -634,6 +647,8 @@ fn spawn_discovery_worker(
                     }
                 }
             }
+            let reconciliation_generation =
+                filesystem_uncertainty_generation.load(Ordering::Acquire);
             let current = config.current();
             if current.adapters().claude() {
                 let report = discoveries
@@ -688,8 +703,27 @@ fn spawn_discovery_worker(
                 )
                 .await;
             }
+            mark_filesystem_reconciliation_complete(
+                &health,
+                &filesystem_uncertainty_generation,
+                reconciliation_generation,
+            );
         }
     })
+}
+
+fn mark_filesystem_reconciliation_complete(
+    health: &HealthService,
+    uncertainty_generation: &AtomicU64,
+    reconciliation_generation: u64,
+) {
+    if uncertainty_generation.load(Ordering::Acquire) == reconciliation_generation {
+        health.record(
+            ComponentId::FilesystemReconciliation,
+            ComponentStatus::Healthy,
+            None,
+        );
+    }
 }
 
 async fn record_discovery_health(
@@ -777,12 +811,12 @@ fn spawn_dashboard_worker(
             interval.tick().await;
             match dispatcher.deliver_pending(DASHBOARD_DELIVERY_LIMIT).await {
                 Ok(_) => health.record(
-                    ComponentId::ObservationQueue,
+                    ComponentId::DashboardDelivery,
                     ComponentStatus::Healthy,
                     None,
                 ),
                 Err(_) => health.record(
-                    ComponentId::ObservationQueue,
+                    ComponentId::DashboardDelivery,
                     ComponentStatus::Degraded,
                     Some("Dashboard delivery is degraded"),
                 ),
@@ -830,6 +864,7 @@ fn spawn_watcher_supervisor(
     stop: Arc<AtomicBool>,
     reconcile: mpsc::Sender<()>,
     filesystem_activity: mpsc::Sender<Vec<PathBuf>>,
+    filesystem_uncertainty_generation: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut applied = config.current();
@@ -854,6 +889,7 @@ fn spawn_watcher_supervisor(
                             &health,
                             &reconcile,
                             &filesystem_activity,
+                            &filesystem_uncertainty_generation,
                         );
                     }
                     WatchSignal::TopologyChanged(targets) => {
@@ -863,12 +899,14 @@ fn spawn_watcher_supervisor(
                             &health,
                             &reconcile,
                             &filesystem_activity,
+                            &filesystem_uncertainty_generation,
                         );
                         watcher = build_watcher(&applied, &health);
                     }
                     WatchSignal::ReconcileAll(_) => {
+                        filesystem_uncertainty_generation.fetch_add(1, Ordering::AcqRel);
                         health.record(
-                            ComponentId::Watcher,
+                            ComponentId::FilesystemReconciliation,
                             ComponentStatus::Degraded,
                             Some("Filesystem events were lost; reconciliation is required"),
                         );
@@ -887,8 +925,8 @@ fn reconcile_watch_targets(
     health: &HealthService,
     reconcile: &mpsc::Sender<()>,
     filesystem_activity: &mpsc::Sender<Vec<PathBuf>>,
+    filesystem_uncertainty_generation: &AtomicU64,
 ) {
-    health.record(ComponentId::Watcher, ComponentStatus::Healthy, None);
     let _ = reconcile.try_send(());
     let paths = watcher.map_or_else(Vec::new, |registry| {
         targets
@@ -897,8 +935,9 @@ fn reconcile_watch_targets(
             .collect()
     });
     if !paths.is_empty() && filesystem_activity.try_send(paths).is_err() {
+        filesystem_uncertainty_generation.fetch_add(1, Ordering::AcqRel);
         health.record(
-            ComponentId::Watcher,
+            ComponentId::FilesystemReconciliation,
             ComponentStatus::Degraded,
             Some("Filesystem activity queue is saturated"),
         );
@@ -1261,12 +1300,23 @@ mod tests {
         ffi::OsString,
         io::{Read as _, Write as _},
         net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         thread,
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use watchdog_domain::{TimePoint, WallTimeMs};
+    use watchdog_runtime::{ComponentId, ComponentStatus};
+    use watchdog_testkit::FakeClock;
 
-    use super::{BootstrapConfig, check_liveness, native_worktree_path};
+    use super::{
+        BootstrapConfig, check_liveness, mark_filesystem_reconciliation_complete,
+        native_worktree_path,
+    };
+    use crate::HealthService;
 
     #[test]
     fn internal_healthcheck_accepts_only_a_successful_liveness_response() {
@@ -1346,6 +1396,33 @@ mod tests {
         assert_eq!(
             native_worktree_path(&nested, &[mapping]),
             Some(std::path::PathBuf::from("/host/repositories/repo/src"))
+        );
+    }
+
+    #[test]
+    fn newer_filesystem_uncertainty_cannot_be_cleared_by_an_older_reconciliation() {
+        let health = HealthService::new(Arc::new(FakeClock::new(TimePoint::new(
+            WallTimeMs::new(100),
+            100,
+        ))));
+        let generation = AtomicU64::new(1);
+        health.record(
+            ComponentId::FilesystemReconciliation,
+            ComponentStatus::Degraded,
+            Some("filesystem events were lost"),
+        );
+
+        generation.store(2, Ordering::Release);
+        mark_filesystem_reconciliation_complete(&health, &generation, 1);
+        assert_eq!(
+            health.component_status(ComponentId::FilesystemReconciliation),
+            Some(ComponentStatus::Degraded)
+        );
+
+        mark_filesystem_reconciliation_complete(&health, &generation, 2);
+        assert_eq!(
+            health.component_status(ComponentId::FilesystemReconciliation),
+            Some(ComponentStatus::Healthy)
         );
     }
 }
