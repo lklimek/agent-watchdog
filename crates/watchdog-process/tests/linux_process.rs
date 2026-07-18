@@ -106,6 +106,37 @@ fn linux_sampler_reads_only_the_selected_helper_tree() {
 }
 
 #[test]
+fn linux_sampler_builds_multiple_trees_from_one_bounded_capture() {
+    let mut first = spawn_helper();
+    let mut second = spawn_helper();
+    thread::sleep(Duration::from_millis(20));
+    let sampler = LinuxProcessSampler::new(4_096).expect("sampling budget should be valid");
+    let identities = [&first, &second].map(|helper| {
+        sampler
+            .read_identity(ProcessId::new(helper.id()).expect("helper PID should be valid"))
+            .expect("helper identity should be readable")
+    });
+
+    let snapshots = sampler
+        .sample_trees(&identities)
+        .expect("shared process-table capture should succeed");
+
+    for identity in &identities {
+        let snapshot = snapshots
+            .get(&identity.pid())
+            .expect("each root should have a result")
+            .as_ref()
+            .expect("each helper tree should sample");
+        assert_eq!(snapshot.root(), identity);
+        assert!(snapshot.processes().contains_key(&identity.pid()));
+    }
+    for helper in [&mut first, &mut second] {
+        helper.kill().expect("helper should stop");
+        helper.wait().expect("helper should be reaped");
+    }
+}
+
+#[test]
 fn verified_pidfd_signals_only_the_matching_helper() {
     let mut helper = spawn_helper();
     thread::sleep(Duration::from_millis(20));
