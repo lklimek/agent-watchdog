@@ -150,6 +150,7 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
     assert_eq!(report.warning_count(), 1);
 
     update_companion_summary(&state_path);
+    write_companion_detail(&workspace_state);
     clock.advance(DurationMs::new(1_000));
     let repeated = discovery
         .reconcile(
@@ -189,7 +190,7 @@ async fn companion_discovery_reconciles_summary_without_optional_registration_or
         .await
         .expect("metadata should query")
         .expect("metadata should exist");
-    assert_eq!(metadata.title(), Some("Review persistence"));
+    assert_eq!(metadata.title(), Some("Detailed persistence review"));
     assert_eq!(metadata.startup_directory(), Some("/host/repositories/job"));
 }
 
@@ -198,6 +199,26 @@ fn update_companion_summary(path: &std::path::Path) {
         .expect("summary should remain readable")
         .replace("2026-07-18T10:00:00Z", "2026-07-18T10:01:00Z");
     fs::write(path, updated).expect("summary update should be written");
+}
+
+fn write_companion_detail(workspace_state: &std::path::Path) {
+    let jobs = workspace_state.join("jobs");
+    fs::create_dir(&jobs).expect("detail directory should be created");
+    fs::write(
+        jobs.join("companion-job.json"),
+        serde_json::to_vec(&json!({
+            "id": "companion-job",
+            "sessionId": "claude-parent",
+            "workspaceRoot": "/host/repositories/job",
+            "title": "Detailed persistence review",
+            "status": "running",
+            "phase": "verifying",
+            "pid": std::process::id(),
+            "updatedAt": "2026-07-18T10:01:00Z"
+        }))
+        .expect("detail JSON should serialize"),
+    )
+    .expect("detail should be written");
 }
 
 #[tokio::test]
