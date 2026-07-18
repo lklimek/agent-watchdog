@@ -22,6 +22,7 @@ tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 watchdog-domain.workspace = true
+watchdog-claude = { path = "../watchdog-claude", version = "=0.1.0" }
 watchdog-runtime.workspace = true
 watchdog-store.workspace = true
 

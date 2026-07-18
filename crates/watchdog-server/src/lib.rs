@@ -5,6 +5,7 @@ mod auth;
 mod clock;
 mod config;
 mod dashboard;
+mod discovery;
 mod github;
 mod health;
 mod mcp;
@@ -14,8 +15,8 @@ mod server;
 mod termination;
 
 pub use agent_api::{
-    AgentApi, AgentApiError, AgentEventView, AgentHealthView, CompletionOutcome, EventPage,
-    RegisterSession, SessionTreeView, SessionView, TransportKey, WaitingKind,
+    AgentApi, AgentApiError, AgentEventView, AgentHealthView, CompletionOutcome, DiscoveredSession,
+    EventPage, RegisterSession, SessionTreeView, SessionView, TransportKey, WaitingKind,
 };
 pub use auth::{
     BasicAuthError, BasicAuthenticator, BearerAuthError, BearerAuthenticator,
@@ -27,6 +28,7 @@ pub use dashboard::{
     DashboardScope, DashboardService, DashboardSnapshot, DashboardSort, DashboardWarning,
     dashboard_router,
 };
+pub use discovery::{ClaudeDiscoveryReport, ClaudeTeamDiscovery};
 pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};
 pub use mcp::{WatchdogMcpService, WatchdogSessionManager, mcp_router};

@@ -16,7 +16,7 @@ use watchdog_domain::{
 use watchdog_runtime::{CoordinatorError, EventSequence, SessionCoordinator};
 use watchdog_store::{
     AdapterHealthRecord, ApplyResult, InboxOffsetRecord, OutboxDestination, RelationRecord,
-    StoreError, StoredSessionRecord, WatchdogStore,
+    SessionMetadataRecord, StoreError, StoredSessionRecord, WatchdogStore,
 };
 
 const MAX_TREE_SESSIONS: u32 = 1_000;
@@ -57,6 +57,25 @@ pub struct RegisterSession {
     pub parent: Option<SessionId>,
     /// Caller-provided idempotency key.
     pub event_key: String,
+}
+
+/// Runtime-native session discovered without MCP or optional hook registration.
+#[derive(Clone, Debug)]
+pub struct DiscoveredSession {
+    /// Runtime namespace.
+    pub runtime: RuntimeKind,
+    /// Runtime-native session/job/thread identifier.
+    pub native_id: String,
+    /// Main or child role.
+    pub kind: SessionKind,
+    /// Existing native parent identity for a child discovery.
+    pub parent: Option<SessionId>,
+    /// Adapter-provided deterministic idempotency key.
+    pub event_key: String,
+    /// Bounded native title, when available.
+    pub title: Option<String>,
+    /// Capability-validated startup directory, when available.
+    pub startup_directory: Option<String>,
 }
 
 /// Agent-reported waiting class.
@@ -247,6 +266,87 @@ impl AgentApi {
         for lane in lanes {
             lane.lock().await.set_policy(policy);
         }
+    }
+
+    /// Persist one automatically discovered session independently from MCP
+    /// registration while retaining the ability for a parent agent to bind the
+    /// resulting main tree later.
+    ///
+    /// Adapter callers must capability-validate any path before supplying it as
+    /// operator-facing metadata. Repeated discoveries with the same event key
+    /// are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] for invalid identity/metadata, a missing child
+    /// parent, conflicting hierarchy, or persistence failure.
+    pub async fn discover_session(
+        &self,
+        request: DiscoveredSession,
+    ) -> Result<SessionView, AgentApiError> {
+        let native = NativeSessionKey::new(request.runtime, request.native_id.clone())?;
+        let session_id = SessionId::from_native(&native);
+        let root = match request.kind {
+            SessionKind::Main => MainSessionId::from(session_id),
+            SessionKind::Child => {
+                let parent_id = request.parent.ok_or(AgentApiError::MissingParent)?;
+                self.inner
+                    .store
+                    .session_by_id(parent_id)
+                    .await?
+                    .ok_or(AgentApiError::SessionNotFound)?
+                    .root
+            }
+        };
+        let transport = discovery_transport(root)?;
+        self.inner.scopes.bind_once(transport.clone(), root)?;
+        let view = self
+            .register_session(
+                &transport,
+                RegisterSession {
+                    runtime: request.runtime,
+                    native_id: request.native_id,
+                    kind: request.kind,
+                    parent: request.parent,
+                    event_key: request.event_key,
+                },
+            )
+            .await?;
+
+        let existing = self.inner.store.session_metadata(view.session).await?;
+        let metadata = SessionMetadataRecord::new(
+            view.session,
+            request.title.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(SessionMetadataRecord::title)
+                    .map(ToOwned::to_owned)
+            }),
+            request.startup_directory.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(SessionMetadataRecord::startup_directory)
+                    .map(ToOwned::to_owned)
+            }),
+            existing
+                .as_ref()
+                .and_then(SessionMetadataRecord::repository_remote)
+                .map(ToOwned::to_owned),
+            existing
+                .as_ref()
+                .and_then(SessionMetadataRecord::branch)
+                .map(ToOwned::to_owned),
+            existing
+                .as_ref()
+                .and_then(SessionMetadataRecord::pull_request_number),
+            existing
+                .as_ref()
+                .and_then(SessionMetadataRecord::pull_request_url)
+                .map(ToOwned::to_owned),
+            self.inner.clock.now().wall_time(),
+        )?;
+        self.inner.store.save_session_metadata(&metadata).await?;
+        Ok(view)
     }
 
     /// Register/enrich a session and bind a main registration's transport once.
@@ -673,9 +773,28 @@ impl AgentApi {
         payload: ObservationPayload,
         now: TimePoint,
     ) -> Result<ApplyResult, AgentApiError> {
-        let observation = mcp_observation(record, operation, event_key, payload, now)?;
+        let mut observation = mcp_observation(record, operation, event_key, payload.clone(), now)?;
         let lane = self.lane(record, now).await?;
-        let result = lane.lock().await.apply_observation(observation).await?;
+        let mut lane = lane.lock().await;
+        if let Some(existing) = self
+            .inner
+            .store
+            .observation(observation.observation_id())
+            .await?
+        {
+            // Agent API timestamps are assigned by this server, rather than
+            // supplied by the idempotent caller. Reuse the committed timestamp
+            // so a retry can still be compared byte-for-byte while preserving
+            // conflict detection for a reused key with another payload.
+            observation = mcp_observation(
+                record,
+                operation,
+                event_key,
+                payload,
+                existing.observed_at(),
+            )?;
+        }
+        let result = lane.apply_observation(observation).await?;
         Ok(result)
     }
 
@@ -790,6 +909,10 @@ impl AgentApi {
             .await?;
         Ok(())
     }
+}
+
+fn discovery_transport(root: MainSessionId) -> Result<TransportKey, DomainInputError> {
+    TransportKey::new(format!("autodiscovery:{}", root.session_id()))
 }
 
 fn mcp_observation(
