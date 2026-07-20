@@ -226,6 +226,13 @@ Agent Watchdog is monitoring the configured Claude and Codex locations.
 
 Keep unaffected session cards visible. Show one concise page-level warning naming the affected runtime and refer operators to `/health` or logs.
 
+Render the runtime label before every page-level badge, for example `Codex CLI —
+DEGRADED …`, so simultaneous adapter failures are distinguishable on mobile and
+by assistive technology. A retained Claude team and its current transcript render
+as one main-session card when the one-to-one alias is unambiguous. Claude-launched
+Codex work appears in that card's sub-agent counts rather than as another top-level
+main session. Inactive native team members appear as finished, not stalled.
+
 ### Authentication failure
 
 Use the browser’s Basic Auth challenge. Do not render session metadata in an unauthenticated error page.

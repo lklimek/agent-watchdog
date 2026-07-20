@@ -531,3 +531,42 @@ Before editing code it must:
 The clean-context agent should be able to derive every product and architectural
 choice from the five documents. Conversation history is neither required nor
 authoritative once these documents are committed.
+
+## 21. Live-runtime corrective increment
+
+The 2026-07-20 owner-authorized local-system probe found related integration
+gaps: Codex completion was flattened into progress; inactive Claude members
+aged into stalled; a retained Claude team lead and its post-reset transcript
+became two main cards; and Claude-originated Codex threads appeared as top-level
+mains. Companion wrapper IDs did not reuse Claude transcript aliases, retained
+terminal jobs polluted a fresh database, the default Compose template omitted
+the separate `/data/git-worktrees` prefix, and a first-seen completed Codex
+rollout initialized its cursor at EOF without recovering terminal state.
+Simultaneous adapter warnings were visually indistinguishable, old team configs
+polluted a fresh active view, and unchanged correlation outcomes were logged on
+every filesystem invalidation.
+
+Execute this increment in the normal TDD order:
+
+1. Add RED parser/discovery/render regressions T-DIS-013–020 and T-UI-011.
+2. Decode Codex lifecycle payload types without retaining bodies.
+3. Retain Claude member activity state, terminalize inactive members, apply the
+   24-hour team-config bootstrap gate, and add the unique lead alias.
+4. Retain Codex originator metadata and attach explicit Claude-launched threads
+   only through a unique validated directory/repository match.
+5. Share Claude aliases with Companion discovery, admit historical terminal jobs
+   only when recent, and recover the newest lifecycle record with one bounded
+   tail read before initializing a Codex rollout cursor at EOF.
+6. Render human-readable runtime labels on page-level warnings; correct the
+   standard Companion state path; and add a second concrete read-only worktree
+   mount/mapping for the agent worktree prefix.
+7. Cache bounded Codex-correlation log outcomes so only a first or changed
+   selection/ambiguity is emitted.
+8. Run targeted adapter/server tests, workspace formatting, workspace tests,
+   strict Clippy, and a fresh-volume Compose probe against the owner-authorized
+   real local runtime files.
+9. Record exact live outcomes and unresolved evidence limitations before commit.
+
+The existing production-like database is not rewritten or auto-pruned by this
+increment. Fresh-volume validation proves bootstrap behavior; operators may use
+the documented manual wipe for already-retained duplicate/history records.

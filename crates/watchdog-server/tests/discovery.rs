@@ -10,10 +10,12 @@ use std::{
 
 use serde_json::json;
 use sqlx::sqlite::SqliteConnectOptions;
-use watchdog_domain::{DetailedState, DurationMs, SessionKind, TimePoint, WallTimeMs};
+use watchdog_domain::{
+    DetailedState, DurationMs, RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
+};
 use watchdog_server::{
     AgentApi, ClaudeDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
-    DashboardService, WorktreePathMapping,
+    DashboardService, DiscoveredSession, DiscoveryAliasRegistry, WorktreePathMapping,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
@@ -297,6 +299,497 @@ async fn claude_team_member_transcript_does_not_create_a_duplicate_main() {
             .last_progress_summary(),
         Some("Claude transcript activity")
     );
+}
+
+#[tokio::test]
+async fn claude_team_lead_aliases_a_post_reset_transcript_by_unique_cwd() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let (projects, teams, worktrees, _) = create_claude_team_alias_fixtures(fixture.path());
+    let config = teams.join("session-main/config.json");
+    let mut team: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config).expect("team config should read"))
+            .expect("team config should parse");
+    team["leadSessionId"] = json!("retained-team-lead");
+    fs::write(
+        &config,
+        serde_json::to_vec(&team).expect("team config should serialize"),
+    )
+    .expect("team config should update");
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = ClaudeDiscovery::new(api, store.clone(), clock);
+    let runtime_mappings = [
+        WorktreePathMapping::new("/home/test/.claude/projects", projects.clone())
+            .expect("projects mapping should be valid"),
+        WorktreePathMapping::new("/home/test/.claude/teams", teams.clone())
+            .expect("teams mapping should be valid"),
+    ];
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", worktrees)
+        .expect("worktree mapping should be valid");
+
+    discovery
+        .reconcile(
+            &[projects, teams],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(mains[0].native.native_id(), "retained-team-lead");
+}
+
+#[tokio::test]
+async fn ambiguous_claude_team_lead_cwd_does_not_guess_an_alias() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let projects = fixture.path().join("projects");
+    let project = projects.join("-host-main");
+    let teams = fixture.path().join("teams");
+    let worktrees = fixture.path().join("worktrees");
+    fs::create_dir_all(&project).expect("project directory should exist");
+    fs::create_dir_all(worktrees.join("main")).expect("worktree should exist");
+    fs::write(
+        project.join("current-transcript.jsonl"),
+        b"{\"type\":\"assistant\",\"sessionId\":\"current-transcript\",\"cwd\":\"/host/main\"}\n",
+    )
+    .expect("transcript should write");
+    for lead in ["retained-one", "retained-two"] {
+        let team = teams.join(lead);
+        fs::create_dir_all(&team).expect("team directory should exist");
+        fs::write(
+            team.join("config.json"),
+            serde_json::to_vec(&json!({
+                "leadSessionId": lead,
+                "members": [{"agentType":"team-lead","name":"lead","cwd":"/host/main"}]
+            }))
+            .expect("team config should serialize"),
+        )
+        .expect("team config should write");
+    }
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let runtime_mappings = [
+        WorktreePathMapping::new("/runtime/projects", projects.clone())
+            .expect("project mapping should be valid"),
+        WorktreePathMapping::new("/runtime/teams", teams.clone())
+            .expect("team mapping should be valid"),
+    ];
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", worktrees).expect("worktree mapping should be valid");
+
+    ClaudeDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[projects, teams],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    assert_eq!(mains.len(), 3);
+    assert!(
+        mains
+            .iter()
+            .any(|main| main.native.native_id() == "current-transcript")
+    );
+}
+
+#[tokio::test]
+async fn inactive_claude_team_member_is_terminal_instead_of_stalling() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let teams = fixture.path().join("teams");
+    let team = teams.join("watchdog-team");
+    let worktrees = fixture.path().join("worktrees");
+    for directory in [&team, &worktrees.join("main"), &worktrees.join("child")] {
+        fs::create_dir_all(directory).expect("fixture directory should exist");
+    }
+    fs::write(
+        team.join("config.json"),
+        serde_json::to_vec(&json!({
+            "name": "watchdog-team",
+            "leadSessionId": "lead",
+            "members": [
+                {"agentType":"team-lead","name":"lead","cwd":"/host/main"},
+                {"agentType":"developer","name":"done","agentId":"child","cwd":"/host/child","isActive":false}
+            ]
+        }))
+        .expect("team config should serialize"),
+    )
+    .expect("team config should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = ClaudeDiscovery::new(api, store.clone(), clock);
+    let mapping =
+        WorktreePathMapping::new("/host", worktrees).expect("worktree mapping should be valid");
+
+    discovery
+        .reconcile(&[teams], &[], std::slice::from_ref(&mapping))
+        .await;
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(children.len(), 1);
+    assert_session_state(&store, children[0].session, DetailedState::Completed).await;
+}
+
+#[tokio::test]
+async fn stale_claude_team_config_does_not_bootstrap_historical_sessions() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let teams = fixture.path().join("teams");
+    let team = teams.join("historical-team");
+    fs::create_dir_all(&team).expect("team directory should exist");
+    fs::write(
+        team.join("config.json"),
+        br#"{"leadSessionId":"old-lead","members":[]}"#,
+    )
+    .expect("team config should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let two_days_ms = 2 * 24 * 60 * 60 * 1_000;
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms() + two_days_ms),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+
+    ClaudeDiscovery::new(api, store.clone(), clock)
+        .reconcile(&[teams], &[], &[])
+        .await;
+    assert!(
+        store
+            .sessions_by_kind(SessionKind::Main, 10)
+            .await
+            .expect("mains should query")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn claude_originated_codex_rollout_joins_unique_repository_main() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let mounted = fixture.path().join("mounted");
+    let claude_repo = mounted.join("repositories/main");
+    let codex_worktree = mounted.join("worktrees/child");
+    let rollout_root = fixture.path().join("codex-rollouts");
+    for directory in [&claude_repo, &codex_worktree, &rollout_root] {
+        fs::create_dir_all(directory).expect("fixture directory should exist");
+    }
+    fs::create_dir_all(claude_repo.join(".git")).expect("git metadata should exist");
+    fs::write(
+        claude_repo.join(".git/config"),
+        b"[remote \"origin\"]\n\turl = git@github.com:example/project.git\n",
+    )
+    .expect("git config should write");
+    fs::write(
+        rollout_root.join("rollout-claude-child.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-child\",\"cwd\":\"/host/worktrees/child\",\"originator\":\"Claude Code\",\"source\":\"vscode\",\"git\":{\"repository_url\":\"https://github.com/example/project.git\"}}}\n",
+    )
+    .expect("rollout should write");
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let main = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "claude-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "claude-main-discovery".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test".to_owned(),
+            title: Some("Claude coordinator".to_owned()),
+            startup_directory: Some("/host/repositories/main".to_owned()),
+        })
+        .await
+        .expect("Claude main should register");
+    let rollout_mapping = WorktreePathMapping::new("/state", rollout_root.clone())
+        .expect("rollout mapping should be valid");
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", mounted).expect("worktree mapping should be valid");
+
+    CodexDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[rollout_root],
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].native.runtime(), RuntimeKind::CodexCli);
+    assert_eq!(children[0].root.session_id(), main.root.session_id());
+    assert_eq!(
+        SessionId::from_native(&children[0].native),
+        children[0].session.session_id()
+    );
+}
+
+#[tokio::test]
+async fn claude_originated_codex_rollout_does_not_guess_between_two_parents() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let mounted = fixture.path().join("mounted");
+    let worktree = mounted.join("main");
+    let rollouts = fixture.path().join("rollouts");
+    fs::create_dir_all(&worktree).expect("worktree should exist");
+    fs::create_dir_all(&rollouts).expect("rollout root should exist");
+    fs::write(
+        rollouts.join("rollout-ambiguous.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-ambiguous\",\"cwd\":\"/host/main\",\"originator\":\"Claude Code\",\"source\":\"vscode\"}}\n",
+    )
+    .expect("rollout should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    for native_id in ["claude-one", "claude-two"] {
+        api.discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: native_id.to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: format!("discover-{native_id}"),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test".to_owned(),
+            title: None,
+            startup_directory: Some("/host/main".to_owned()),
+        })
+        .await
+        .expect("Claude main should register");
+    }
+    let rollout_mapping = WorktreePathMapping::new("/state", rollouts.clone())
+        .expect("rollout mapping should be valid");
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", mounted).expect("worktree mapping should be valid");
+
+    CodexDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[rollouts],
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    assert_eq!(
+        store
+            .sessions_by_kind(SessionKind::Main, 10)
+            .await
+            .expect("mains should query")
+            .len(),
+        3
+    );
+    assert!(
+        store
+            .sessions_by_kind(SessionKind::Child, 10)
+            .await
+            .expect("children should query")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn companion_wrapper_parent_reuses_the_claude_team_member_alias() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let projects = fixture.path().join("projects");
+    let project = projects.join("-host-repositories-main");
+    let teams = fixture.path().join("teams");
+    let team = teams.join("session-main");
+    let companion = fixture.path().join("companion/workspace");
+    let worktrees = fixture.path().join("worktrees");
+    for directory in [&project, &team, &companion, &worktrees.join("main")] {
+        fs::create_dir_all(directory).expect("fixture directory should exist");
+    }
+    fs::write(
+        project.join("wrapper-session.jsonl"),
+        b"{\"type\":\"agent-setting\",\"agentSetting\":\"codex:codex-rescue\",\"sessionId\":\"wrapper-session\"}\n{\"type\":\"assistant\",\"sessionId\":\"wrapper-session\",\"cwd\":\"/host/repositories/main\"}\n",
+    )
+    .expect("wrapper transcript should write");
+    fs::write(
+        team.join("config.json"),
+        serde_json::to_vec(&json!({
+            "name": "session-main",
+            "leadSessionId": "lead",
+            "members": [
+                {"agentType":"team-lead","name":"lead","cwd":"/host/repositories/main"},
+                {"agentType":"codex:codex-rescue","name":"codex-worker","agentId":"team-worker","cwd":"/host/repositories/main","isActive":true}
+            ]
+        }))
+        .expect("team config should serialize"),
+    )
+    .expect("team config should write");
+    fs::write(
+        companion.join("state.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "jobs": [{
+                "id": "companion-job",
+                "sessionId": "wrapper-session",
+                "workspaceRoot": "/host/repositories/main",
+                "status": "running"
+            }]
+        }))
+        .expect("Companion state should serialize"),
+    )
+    .expect("Companion state should write");
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let aliases = DiscoveryAliasRegistry::default();
+    let runtime_mappings = [
+        WorktreePathMapping::new("/home/test/.claude/projects", projects.clone())
+            .expect("project mapping should be valid"),
+        WorktreePathMapping::new("/home/test/.claude/teams", teams.clone())
+            .expect("team mapping should be valid"),
+    ];
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", worktrees)
+        .expect("worktree mapping should be valid");
+    ClaudeDiscovery::with_alias_registry(
+        api.clone(),
+        store.clone(),
+        clock.clone(),
+        aliases.clone(),
+    )
+    .reconcile(
+        &[projects, teams],
+        &runtime_mappings,
+        std::slice::from_ref(&worktree_mapping),
+    )
+    .await;
+    CompanionDiscovery::with_alias_registry(api, store.clone(), clock, aliases)
+        .reconcile(&[fixture.path().join("companion")], &[])
+        .await;
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(mains[0].native.native_id(), "lead");
+    assert_eq!(children.len(), 2);
+    assert!(
+        children
+            .iter()
+            .all(|child| child.root.session_id() == mains[0].root.session_id())
+    );
+}
+
+#[tokio::test]
+async fn stale_terminal_companion_job_does_not_bootstrap_history() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let companion = fixture.path().join("companion/workspace");
+    let jobs = companion.join("jobs");
+    fs::create_dir_all(&jobs).expect("job directory should exist");
+    fs::write(
+        companion.join("state.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "jobs": [
+                {"id":"old-job","sessionId":"old-wrapper","workspaceRoot":"/work","status":"completed"},
+                {"id":"active-job","sessionId":"active-wrapper","workspaceRoot":"/work","status":"running"}
+            ]
+        }))
+        .expect("summary should serialize"),
+    )
+    .expect("summary should write");
+    fs::write(
+        jobs.join("old-job.json"),
+        br#"{"id":"old-job","sessionId":"old-wrapper","workspaceRoot":"/work","status":"completed"}"#,
+    )
+    .expect("detail should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms() + 2 * 24 * 60 * 60 * 1_000),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+
+    CompanionDiscovery::new(api, store.clone(), clock)
+        .reconcile(&[fixture.path().join("companion")], &[])
+        .await;
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(mains[0].native.native_id(), "active-wrapper");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].native.native_id(), "active-job");
 }
 
 async fn load_snapshot(
@@ -787,6 +1280,102 @@ async fn codex_rollout_metadata_discovers_live_hierarchy_without_sqlite_visibili
             .last_progress_summary(),
         Some("Codex rollout activity")
     );
+
+    append_rollout_completion(&rollout_root.join("rollout-child.jsonl"));
+    clock.advance(DurationMs::new(1_000));
+    discovery
+        .reconcile(
+            std::slice::from_ref(&rollout_root),
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&mapping),
+        )
+        .await;
+    assert_session_state(&store, children[0].session, DetailedState::Completed).await;
+}
+
+#[tokio::test]
+async fn codex_rollout_bootstrap_recovers_a_terminal_tail_record() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let rollouts = fixture.path().join("rollouts");
+    let worktrees = fixture.path().join("worktrees");
+    fs::create_dir_all(&rollouts).expect("rollout root should exist");
+    fs::create_dir_all(worktrees.join("main")).expect("worktree should exist");
+    fs::write(
+        rollouts.join("rollout-completed.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"completed-thread\",\"cwd\":\"/host/main\",\"source\":\"vscode\"}}\n{\"type\":\"response_item\",\"payload\":{\"content\":\"SECRET_TRANSCRIPT_BODY\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"SECRET_RESULT\"}}\n",
+    )
+    .expect("rollout should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let rollout_mapping = WorktreePathMapping::new("/state", rollouts.clone())
+        .expect("rollout mapping should be valid");
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", worktrees).expect("worktree mapping should be valid");
+
+    CodexDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[rollouts],
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    assert_eq!(mains.len(), 1);
+    assert_session_state(&store, mains[0].session, DetailedState::Completed).await;
+    assert!(!format!("{:?}", load_snapshot(&store, mains[0].session).await).contains("SECRET"));
+}
+
+#[tokio::test]
+async fn codex_rollout_bootstrap_ignores_a_terminal_record_without_newline_boundary() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let rollouts = fixture.path().join("rollouts");
+    let worktrees = fixture.path().join("worktrees");
+    fs::create_dir_all(&rollouts).expect("rollout root should exist");
+    fs::create_dir_all(worktrees.join("main")).expect("worktree should exist");
+    fs::write(
+        rollouts.join("rollout-partial.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"partial-thread\",\"cwd\":\"/host/main\",\"source\":\"vscode\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}",
+    )
+    .expect("rollout should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let rollout_mapping = WorktreePathMapping::new("/state", rollouts.clone())
+        .expect("rollout mapping should be valid");
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", worktrees).expect("worktree mapping should be valid");
+
+    CodexDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[rollouts],
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    assert_eq!(mains.len(), 1);
+    assert_session_state(&store, mains[0].session, DetailedState::Starting).await;
 }
 
 #[tokio::test]
@@ -935,6 +1524,18 @@ fn append_rollout_activity(path: &std::path::Path) {
     rollout
         .write_all(b"{\"type\":\"event_msg\",\"payload\":{}}\n")
         .expect("new rollout activity should append");
+}
+
+fn append_rollout_completion(path: &std::path::Path) {
+    let mut rollout = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("rollout should reopen for append");
+    rollout
+        .write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"SECRET_TRANSCRIPT_BODY\"}}\n",
+        )
+        .expect("completion should append");
 }
 
 async fn set_codex_version(path: &std::path::Path, id: &str, version: &str) {

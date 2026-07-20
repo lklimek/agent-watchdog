@@ -65,6 +65,7 @@ impl CodexRolloutParser {
             .filter(|value| !value.is_empty())
             .ok_or(CodexParseError::MissingField("type"))?;
 
+        let observation_payload = normalize_payload(record_type, &raw.payload)?;
         let normalized = if record_type == "session_meta" {
             normalize_metadata(raw.payload, known_subject)?
         } else if is_activity_record(record_type) {
@@ -79,17 +80,12 @@ impl CodexRolloutParser {
             EvidenceTrust::Corroborating,
             None,
         )?;
-        let payload = if record_type == "session_meta" {
-            ObservationPayload::NativeState(DetailedState::Starting)
-        } else {
-            ObservationPayload::Progress(BoundedText::new("progress", "Codex rollout activity")?)
-        };
         let observation = ObservationEnvelope::new(
             ObservationId::from_native(RuntimeKind::CodexCli, "rollout", event_key)?,
             normalized.subject.clone(),
             observed_at,
             source,
-            payload,
+            observation_payload,
         )?;
 
         Ok(CodexRolloutEvidence {
@@ -99,6 +95,8 @@ impl CodexRolloutParser {
             observation,
             cwd: normalized.cwd,
             title: normalized.title,
+            originator: normalized.originator,
+            repository_url: normalized.repository_url,
         })
     }
 }
@@ -111,6 +109,8 @@ pub struct CodexRolloutEvidence {
     observation: ObservationEnvelope,
     cwd: Option<PathBuf>,
     title: Option<BoundedText<512>>,
+    originator: Option<BoundedText<512>>,
+    repository_url: Option<BoundedText<512>>,
 }
 
 impl CodexRolloutEvidence {
@@ -149,6 +149,18 @@ impl CodexRolloutEvidence {
     pub fn title(&self) -> Option<&str> {
         self.title.as_ref().map(BoundedText::as_str)
     }
+
+    /// Bounded launcher identity from current session metadata.
+    #[must_use]
+    pub fn originator(&self) -> Option<&str> {
+        self.originator.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Bounded repository URL from current session metadata.
+    #[must_use]
+    pub fn repository_url(&self) -> Option<&str> {
+        self.repository_url.as_ref().map(BoundedText::as_str)
+    }
 }
 
 impl fmt::Debug for CodexRolloutEvidence {
@@ -160,6 +172,8 @@ impl fmt::Debug for CodexRolloutEvidence {
             .field("classification", &self.classification)
             .field("has_cwd", &self.cwd.is_some())
             .field("title", &self.title)
+            .field("has_originator", &self.originator.is_some())
+            .field("has_repository_url", &self.repository_url.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -182,6 +196,13 @@ struct RawSessionMeta {
     agent_role: Option<String>,
     #[serde(default)]
     source: Value,
+    originator: Option<String>,
+    git: Option<RawGit>,
+}
+
+#[derive(Deserialize)]
+struct RawGit {
+    repository_url: Option<String>,
 }
 
 struct NormalizedRollout {
@@ -190,6 +211,8 @@ struct NormalizedRollout {
     classification: Option<SessionKind>,
     cwd: Option<PathBuf>,
     title: Option<BoundedText<512>>,
+    originator: Option<BoundedText<512>>,
+    repository_url: Option<BoundedText<512>>,
 }
 
 fn normalize_metadata(
@@ -228,6 +251,17 @@ fn normalize_metadata(
         .or_else(|| raw.agent_role.filter(|value| !value.is_empty()))
         .map(|value| BoundedText::new("agent_title", value))
         .transpose()?;
+    let originator = raw
+        .originator
+        .filter(|value| !value.is_empty())
+        .map(|value| BoundedText::new("originator", value))
+        .transpose()?;
+    let repository_url = raw
+        .git
+        .and_then(|git| git.repository_url)
+        .filter(|value| !value.is_empty())
+        .map(|value| BoundedText::new("repository_url", value))
+        .transpose()?;
     Ok(NormalizedRollout {
         subject,
         parent,
@@ -238,6 +272,8 @@ fn normalize_metadata(
         }),
         cwd: raw.cwd.filter(|value| !value.is_empty()).map(PathBuf::from),
         title,
+        originator,
+        repository_url,
     })
 }
 
@@ -254,7 +290,33 @@ fn normalize_activity(
         classification: None,
         cwd: None,
         title: None,
+        originator: None,
+        repository_url: None,
     })
+}
+
+fn normalize_payload(
+    record_type: &str,
+    payload: &Value,
+) -> Result<ObservationPayload, DomainInputError> {
+    if record_type == "session_meta" {
+        return Ok(ObservationPayload::NativeState(DetailedState::Starting));
+    }
+    if record_type == "event_msg" {
+        match payload.get("type").and_then(Value::as_str) {
+            Some("task_started") => {
+                return Ok(ObservationPayload::NativeState(DetailedState::Running));
+            }
+            Some("task_complete") => {
+                return Ok(ObservationPayload::NativeState(DetailedState::Completed));
+            }
+            _ => {}
+        }
+    }
+    Ok(ObservationPayload::Progress(BoundedText::new(
+        "progress",
+        "Codex rollout activity",
+    )?))
 }
 
 fn is_activity_record(record_type: &str) -> bool {

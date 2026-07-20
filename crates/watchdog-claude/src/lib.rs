@@ -243,7 +243,7 @@ impl ClaudeTeam {
         self.lead_cwd.as_deref()
     }
 
-    /// Active non-lead members only.
+    /// Non-lead members, including retained inactive members.
     #[must_use]
     pub fn members(&self) -> &[ClaudeTeamMember] {
         &self.members
@@ -262,12 +262,13 @@ impl fmt::Debug for ClaudeTeam {
     }
 }
 
-/// One active Claude team member.
+/// One retained Claude team member.
 pub struct ClaudeTeamMember {
     subject: NativeSessionKey,
     name: BoundedText<256>,
     agent_type: Option<BoundedText<256>>,
     cwd: Option<PathBuf>,
+    is_active: bool,
 }
 
 impl ClaudeTeamMember {
@@ -294,6 +295,12 @@ impl ClaudeTeamMember {
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
     }
+
+    /// Whether Claude currently marks the member active.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.is_active
+    }
 }
 
 impl fmt::Debug for ClaudeTeamMember {
@@ -304,6 +311,7 @@ impl fmt::Debug for ClaudeTeamMember {
             .field("name", &self.name)
             .field("agent_type", &self.agent_type)
             .field("has_cwd", &self.cwd.is_some())
+            .field("is_active", &self.is_active)
             .finish()
     }
 }
@@ -340,9 +348,6 @@ pub fn parse_team_config(input: &[u8]) -> Result<ClaudeTeam, ClaudeParseError> {
             lead_cwd = path(member.cwd);
             continue;
         }
-        if !member.is_active {
-            continue;
-        }
         let subject = native_key(required(member.agent_id.as_deref(), "agentId")?)?;
         let name_value = required(member.name.as_deref(), "name")?;
         let name = BoundedText::new("name", name_value)?;
@@ -356,6 +361,7 @@ pub fn parse_team_config(input: &[u8]) -> Result<ClaudeTeam, ClaudeParseError> {
             name,
             agent_type,
             cwd: path(member.cwd),
+            is_active: member.is_active,
         });
     }
     Ok(ClaudeTeam {

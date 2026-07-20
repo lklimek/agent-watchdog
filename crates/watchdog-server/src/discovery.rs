@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    io::Read as _,
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
@@ -12,7 +12,7 @@ use watchdog_domain::ProcessId;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, Clock, DetailedState, EvidenceTrust, NativeSessionKey,
     ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource, RuntimeKind,
-    SessionId, SessionKind, TimePoint,
+    SessionId, SessionIdentity, SessionKind, TimePoint,
 };
 use watchdog_runtime::{
     CapabilityRoot, DirectoryScanner, FileCursor, FileIdentity, IncrementalReader, ReadBudget,
@@ -38,7 +38,11 @@ const CODEX_ROLLOUT_PARSER_VERSION: u32 = 1;
 const MAX_CODEX_ROLLOUT_BATCHES: usize = 4;
 const MAX_CODEX_ROLLOUT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CODEX_ROLLOUT_RECORDS: usize = 128;
+const MAX_CODEX_BOOTSTRAP_TAIL_BYTES: usize = 1_024 * 1_024;
+const MAX_CODEX_CORRELATION_LOG_CACHE: usize = 2_048;
 const COMPANION_LOG_CURSOR_VERSION: u32 = 1;
+const COMPANION_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_GIT_CONFIG_BYTES: usize = 64 * 1_024;
 
 /// Explicit projection from a runtime-native host prefix to its read-only
 /// mount inside the supported Docker container.
@@ -263,19 +267,41 @@ impl ClaudeTranscriptCandidate {
             })
     }
 
-    fn bind_team_member(&mut self, alias: &ClaudeTeamTranscriptAlias) {
+    fn bind_team_alias(&mut self, alias: &ClaudeTeamTranscriptAlias) {
         self.subject = alias.subject.clone();
-        self.parent = Some(alias.parent.clone());
-        self.kind = SessionKind::Child;
+        self.parent.clone_from(&alias.parent);
+        self.kind = if alias.parent.is_some() {
+            SessionKind::Child
+        } else {
+            SessionKind::Main
+        };
     }
 }
 
 #[derive(Clone)]
 struct ClaudeTeamTranscriptAlias {
     subject: NativeSessionKey,
-    parent: NativeSessionKey,
-    agent_type: String,
+    parent: Option<NativeSessionKey>,
+    agent_type: Option<String>,
     cwd: PathBuf,
+}
+
+impl ClaudeTeamTranscriptAlias {
+    const fn basis(&self) -> &'static str {
+        if self.parent.is_some() {
+            "team_member_agent_type_and_cwd"
+        } else {
+            "unique_team_lead_cwd"
+        }
+    }
+
+    const fn confidence(&self) -> &'static str {
+        if self.parent.is_some() {
+            "high"
+        } else {
+            "medium"
+        }
+    }
 }
 
 #[derive(Default)]
@@ -283,25 +309,87 @@ struct ClaudeTeamTranscriptAliases(Vec<ClaudeTeamTranscriptAlias>);
 
 impl ClaudeTeamTranscriptAliases {
     fn extend(&mut self, team: &watchdog_claude::ClaudeTeam) {
+        if let Some(cwd) = team.lead_cwd() {
+            self.0.push(ClaudeTeamTranscriptAlias {
+                subject: team.lead().clone(),
+                parent: None,
+                agent_type: None,
+                cwd: cwd.to_path_buf(),
+            });
+        }
         self.0.extend(team.members().iter().filter_map(|member| {
             Some(ClaudeTeamTranscriptAlias {
                 subject: member.subject().clone(),
-                parent: team.lead().clone(),
-                agent_type: member.agent_type()?.to_owned(),
+                parent: Some(team.lead().clone()),
+                agent_type: Some(member.agent_type()?.to_owned()),
                 cwd: member.cwd()?.to_path_buf(),
             })
         }));
     }
 
     fn resolve(&self, bootstrap: &ClaudeTranscriptBootstrap) -> Option<&ClaudeTeamTranscriptAlias> {
-        let title = bootstrap.title.as_deref()?;
         let cwd = bootstrap.cwd.as_deref()?;
-        let mut candidates = self
+        if let Some(title) = bootstrap.title.as_deref() {
+            let mut member_candidates = self
+                .0
+                .iter()
+                .filter(|alias| alias.agent_type.as_deref() == Some(title) && alias.cwd == cwd);
+            if let Some(matched) = member_candidates.next() {
+                return member_candidates.next().is_none().then_some(matched);
+            }
+        }
+        let mut lead_candidates = self
             .0
             .iter()
-            .filter(|alias| alias.agent_type == title && alias.cwd == cwd);
-        let matched = candidates.next()?;
-        candidates.next().is_none().then_some(matched)
+            .filter(|alias| alias.parent.is_none() && alias.cwd == cwd);
+        let matched = lead_candidates.next()?;
+        lead_candidates.next().is_none().then_some(matched)
+    }
+}
+
+/// Bounded in-process aliases from wrapper-native sessions to canonical
+/// discovered sessions. Claude reconciliation repopulates it before Companion
+/// reconciliation on every server start.
+#[derive(Clone, Default)]
+pub struct DiscoveryAliasRegistry {
+    aliases: Arc<Mutex<HashMap<NativeSessionKey, Option<SessionId>>>>,
+}
+
+impl DiscoveryAliasRegistry {
+    fn bind(&self, alias: NativeSessionKey, canonical: SessionId) {
+        let mut aliases = self
+            .aliases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if aliases.len() >= MAX_CLAUDE_ALIAS_CACHE && !aliases.contains_key(&alias) {
+            aliases.clear();
+        }
+        match aliases.entry(alias) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(canonical));
+            }
+            Entry::Occupied(mut entry) if entry.get() != &Some(canonical) => {
+                entry.insert(None);
+            }
+            Entry::Occupied(_) => {}
+        }
+    }
+
+    fn resolve(&self, alias: &NativeSessionKey) -> Option<SessionId> {
+        self.aliases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(alias)
+            .copied()
+            .flatten()
+    }
+}
+
+impl std::fmt::Debug for DiscoveryAliasRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryAliasRegistry")
+            .finish_non_exhaustive()
     }
 }
 
@@ -389,6 +477,7 @@ pub struct ClaudeDiscovery {
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
     alias_cache: Arc<Mutex<HashMap<String, ClaudeTeamTranscriptAlias>>>,
+    native_aliases: DiscoveryAliasRegistry,
 }
 
 impl std::fmt::Debug for ClaudeDiscovery {
@@ -403,11 +492,23 @@ impl ClaudeDiscovery {
     /// Construct discovery over the shared durable ingestion service.
     #[must_use]
     pub fn new(api: AgentApi, store: WatchdogStore, clock: Arc<dyn Clock>) -> Self {
+        Self::with_alias_registry(api, store, clock, DiscoveryAliasRegistry::default())
+    }
+
+    /// Construct discovery with aliases shared with Companion reconciliation.
+    #[must_use]
+    pub fn with_alias_registry(
+        api: AgentApi,
+        store: WatchdogStore,
+        clock: Arc<dyn Clock>,
+        native_aliases: DiscoveryAliasRegistry,
+    ) -> Self {
         Self {
             api,
             store,
             clock,
             alias_cache: Arc::new(Mutex::new(HashMap::new())),
+            native_aliases,
         }
     }
 
@@ -463,6 +564,14 @@ impl ClaudeDiscovery {
                         continue;
                     }
                 };
+                if !recent_capability_file(
+                    root,
+                    &config,
+                    self.clock.now().wall_time().value(),
+                    CLAUDE_BOOTSTRAP_WINDOW_MS,
+                ) {
+                    continue;
+                }
                 let Ok(team) = watchdog_claude::parse_team_config(&bytes) else {
                     report.warn();
                     continue;
@@ -554,10 +663,52 @@ impl ClaudeDiscovery {
             {
                 log_reconcile_failure(RuntimeKind::ClaudeCode, "child", &error);
                 report.warn();
-            } else if children.insert(child_id) {
-                report.child_sessions = report.child_sessions.saturating_add(1);
+            } else {
+                if !member.is_active()
+                    && self
+                        .ingest_inactive_team_member(member, child_id)
+                        .await
+                        .is_err()
+                {
+                    report.warn();
+                }
+                if children.insert(child_id) {
+                    report.child_sessions = report.child_sessions.saturating_add(1);
+                }
             }
         }
+    }
+
+    async fn ingest_inactive_team_member(
+        &self,
+        member: &watchdog_claude::ClaudeTeamMember,
+        session_id: SessionId,
+    ) -> Result<(), ()> {
+        let event_key = format!("{session_id}:inactive");
+        let observation = ObservationEnvelope::new(
+            ObservationId::from_native(RuntimeKind::ClaudeCode, "team-inactive", event_key)
+                .map_err(|_| ())?,
+            member.subject().clone(),
+            self.clock.now(),
+            ObservationSource::new(
+                AdapterIdentity::new(
+                    RuntimeKind::ClaudeCode,
+                    watchdog_claude::TESTED_CLAUDE_VERSION,
+                )
+                .map_err(|_| ())?,
+                "team-config:inactive",
+                EvidenceTrust::Corroborating,
+                None,
+            )
+            .map_err(|_| ())?,
+            ObservationPayload::NativeState(DetailedState::Completed),
+        )
+        .map_err(|_| ())?;
+        self.api
+            .ingest_native_observation(observation)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     async fn reconcile_team_tasks(
@@ -607,6 +758,14 @@ impl ClaudeDiscovery {
                 };
                 if matching_members.next().is_some() {
                     report.warn();
+                    continue;
+                }
+                if !member.is_active()
+                    && !matches!(
+                        task.state(),
+                        DetailedState::Completed | DetailedState::Failed | DetailedState::Cancelled
+                    )
+                {
                     continue;
                 }
                 let Some(modified_ns) = task_modified_ns(root, &relative) else {
@@ -808,9 +967,24 @@ impl ClaudeDiscovery {
         };
         if candidate.kind == SessionKind::Main {
             if let Some(alias) = cached_alias {
-                candidate.bind_team_member(&alias);
+                candidate.bind_team_alias(&alias);
+                self.native_aliases.bind(
+                    candidate.transcript_session.clone(),
+                    SessionId::from_native(&candidate.subject),
+                );
             } else if let Some(alias) = aliases.resolve(&bootstrap) {
-                candidate.bind_team_member(alias);
+                tracing::info!(
+                    event = "discovery.correlation_selected",
+                    runtime = RuntimeKind::ClaudeCode.as_str(),
+                    correlation_basis = alias.basis(),
+                    confidence = alias.confidence(),
+                    "Selected unique Claude transcript correlation"
+                );
+                candidate.bind_team_alias(alias);
+                self.native_aliases.bind(
+                    candidate.transcript_session.clone(),
+                    SessionId::from_native(&candidate.subject),
+                );
                 self.cache_alias(&candidate.path_key, alias.clone());
             }
         }
@@ -1281,13 +1455,30 @@ pub struct CompanionDiscovery {
     api: AgentApi,
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
+    native_aliases: DiscoveryAliasRegistry,
 }
 
 impl CompanionDiscovery {
     /// Construct discovery over the shared durable ingestion service.
     #[must_use]
     pub fn new(api: AgentApi, store: WatchdogStore, clock: Arc<dyn Clock>) -> Self {
-        Self { api, store, clock }
+        Self::with_alias_registry(api, store, clock, DiscoveryAliasRegistry::default())
+    }
+
+    /// Construct discovery with aliases shared from Claude reconciliation.
+    #[must_use]
+    pub fn with_alias_registry(
+        api: AgentApi,
+        store: WatchdogStore,
+        clock: Arc<dyn Clock>,
+        native_aliases: DiscoveryAliasRegistry,
+    ) -> Self {
+        Self {
+            api,
+            store,
+            clock,
+            native_aliases,
+        }
     }
 
     /// Scan bounded workspace summaries, tolerate absent/pruned detail files,
@@ -1354,6 +1545,17 @@ impl CompanionDiscovery {
                         report.warn();
                         continue;
                     };
+                    match self
+                        .should_reconcile_companion_job(&root, relative, reconciled.job())
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(()) => {
+                            report.warn();
+                            continue;
+                        }
+                    }
                     if reconciled.consistency()
                         == watchdog_companion::CompanionConsistency::Conflicted
                     {
@@ -1384,6 +1586,44 @@ impl CompanionDiscovery {
         report
     }
 
+    async fn should_reconcile_companion_job(
+        &self,
+        root: &CapabilityRoot,
+        workspace_relative: &Path,
+        job: &watchdog_companion::CompanionJob,
+    ) -> Result<bool, ()> {
+        if !matches!(
+            job.state(),
+            DetailedState::Completed
+                | DetailedState::Failed
+                | DetailedState::Cancelled
+                | DetailedState::Disappeared
+        ) {
+            return Ok(true);
+        }
+        if self
+            .store
+            .session_by_id(SessionId::from_native(job.subject()))
+            .await
+            .map_err(|_| ())?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if !safe_native_filename(job.subject().native_id()) {
+            return Ok(false);
+        }
+        let detail = workspace_relative
+            .join("jobs")
+            .join(format!("{}.json", job.subject().native_id()));
+        Ok(recent_capability_file(
+            root,
+            &detail,
+            self.clock.now().wall_time().value(),
+            COMPANION_BOOTSTRAP_WINDOW_MS,
+        ))
+    }
+
     async fn reconcile_companion_job(
         &self,
         parser: &watchdog_companion::CompanionParser,
@@ -1397,31 +1637,39 @@ impl CompanionDiscovery {
             report.warn();
             return false;
         };
-        let parent_id = SessionId::from_native(parent);
-        if let Err(error) = self
-            .api
-            .discover_session(DiscoveredSession {
-                runtime: RuntimeKind::ClaudeCode,
-                native_id: parent.native_id().to_owned(),
-                kind: SessionKind::Main,
-                parent: None,
-                event_key: discovery_key("companion-parent", parent_id),
-                adapter_version: format!(
-                    "companion-{}",
-                    watchdog_companion::TESTED_COMPANION_VERSION
-                ),
-                evidence_source: "companion:parent-summary".to_owned(),
-                title: None,
-                startup_directory: None,
-            })
-            .await
-        {
-            log_reconcile_failure(RuntimeKind::CodexCompanion, "parent", &error);
-            report.warn();
-            return false;
-        }
-        if mains.insert(parent_id) {
-            report.main_sessions = report.main_sessions.saturating_add(1);
+        let aliased_parent = self.native_aliases.resolve(parent);
+        let parent_id = aliased_parent.unwrap_or_else(|| SessionId::from_native(parent));
+        if aliased_parent.is_some() {
+            if !matches!(self.store.session_by_id(parent_id).await, Ok(Some(_))) {
+                report.warn();
+                return false;
+            }
+        } else {
+            if let Err(error) = self
+                .api
+                .discover_session(DiscoveredSession {
+                    runtime: RuntimeKind::ClaudeCode,
+                    native_id: parent.native_id().to_owned(),
+                    kind: SessionKind::Main,
+                    parent: None,
+                    event_key: discovery_key("companion-parent", parent_id),
+                    adapter_version: format!(
+                        "companion-{}",
+                        watchdog_companion::TESTED_COMPANION_VERSION
+                    ),
+                    evidence_source: "companion:parent-summary".to_owned(),
+                    title: None,
+                    startup_directory: None,
+                })
+                .await
+            {
+                log_reconcile_failure(RuntimeKind::CodexCompanion, "parent", &error);
+                report.warn();
+                return false;
+            }
+            if mains.insert(parent_id) {
+                report.main_sessions = report.main_sessions.saturating_add(1);
+            }
         }
 
         let child_id = SessionId::from_native(reconciled.subject());
@@ -1658,19 +1906,117 @@ fn safe_native_filename(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+#[derive(Default)]
+struct ClaudeParentIndex {
+    candidates: Vec<ClaudeParentCandidate>,
+}
+
+struct ClaudeParentCandidate {
+    session: SessionId,
+    startup_directory: String,
+    repository: Option<String>,
+}
+
+impl ClaudeParentIndex {
+    fn resolve(
+        &self,
+        rollout: &watchdog_codex::CodexRolloutEvidence,
+    ) -> (Option<SessionId>, &'static str, &'static str) {
+        if rollout.originator() != Some("Claude Code") {
+            return (None, "not_claude_originated", "none");
+        }
+        let Some(codex_cwd) = rollout.cwd() else {
+            return (None, "claude_origin_without_cwd", "low");
+        };
+        let exact = self
+            .candidates
+            .iter()
+            .filter(|candidate| Path::new(&candidate.startup_directory) == codex_cwd)
+            .map(|candidate| candidate.session)
+            .collect::<Vec<_>>();
+        if let Some(selected) = one_candidate(&exact) {
+            return (Some(selected), "claude_origin_and_unique_cwd", "high");
+        }
+        if exact.len() > 1 {
+            return (None, "claude_origin_and_ambiguous_cwd", "low");
+        }
+        let Some(repository) = rollout
+            .repository_url()
+            .and_then(GitHubEnricher::canonical_remote)
+        else {
+            return (None, "claude_origin_without_unique_parent", "low");
+        };
+        let candidates = self
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.repository.as_deref() == Some(repository.as_str()))
+            .map(|candidate| candidate.session)
+            .collect::<Vec<_>>();
+        if let Some(selected) = one_candidate(&candidates) {
+            (
+                Some(selected),
+                "claude_origin_and_unique_repository",
+                "medium",
+            )
+        } else {
+            (None, "claude_origin_without_unique_parent", "low")
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct CodexCorrelationLogCache {
+    outcomes: Arc<Mutex<HashMap<SessionId, CodexCorrelationLogOutcome>>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CodexCorrelationLogOutcome {
+    selected: Option<SessionId>,
+    basis: &'static str,
+}
+
+impl CodexCorrelationLogCache {
+    fn changed(
+        &self,
+        subject: SessionId,
+        selected: Option<SessionId>,
+        basis: &'static str,
+    ) -> bool {
+        let outcome = CodexCorrelationLogOutcome { selected, basis };
+        let mut outcomes = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outcomes.get(&subject) == Some(&outcome) {
+            return false;
+        }
+        if outcomes.len() >= MAX_CODEX_CORRELATION_LOG_CACHE && !outcomes.contains_key(&subject) {
+            outcomes.clear();
+        }
+        outcomes.insert(subject, outcome);
+        true
+    }
+}
+
 /// Automatic bounded Codex thread/spawn-edge discovery from read-only state.
 #[derive(Clone)]
 pub struct CodexDiscovery {
     api: AgentApi,
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
+    correlation_logs: CodexCorrelationLogCache,
 }
 
 impl CodexDiscovery {
     /// Construct discovery over the shared durable ingestion service.
     #[must_use]
     pub fn new(api: AgentApi, store: WatchdogStore, clock: Arc<dyn Clock>) -> Self {
-        Self { api, store, clock }
+        Self {
+            api,
+            store,
+            clock,
+            correlation_logs: CodexCorrelationLogCache::default(),
+        }
     }
 
     /// Reconcile recent unarchived threads and exact native spawn edges.
@@ -1763,6 +2109,12 @@ impl CodexDiscovery {
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
     ) {
+        let parent_index = if let Ok(index) = self.claude_parent_index(worktree_mappings).await {
+            index
+        } else {
+            report.warn();
+            ClaudeParentIndex::default()
+        };
         let Ok(budget) = ScanBudget::new(MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES)
         else {
             report.warn();
@@ -1792,6 +2144,7 @@ impl CodexDiscovery {
                 };
                 self.reconcile_rollout_candidate(
                     &candidate,
+                    &parent_index,
                     worktree_mappings,
                     report,
                     mains,
@@ -1805,6 +2158,7 @@ impl CodexDiscovery {
     async fn reconcile_rollout_candidate(
         &self,
         candidate: &CodexRolloutCandidate,
+        parent_index: &ClaudeParentIndex,
         worktree_mappings: &[WorktreePathMapping],
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
@@ -1818,11 +2172,11 @@ impl CodexDiscovery {
                 return;
             }
         };
-        let Some(kind) = metadata.kind() else {
+        let Some(mut kind) = metadata.kind() else {
             report.warn();
             return;
         };
-        let parent = match metadata.parent() {
+        let mut parent = match metadata.parent() {
             Some(parent) => {
                 let parent_id = SessionId::from_native(parent);
                 if !mains.contains(&parent_id) {
@@ -1852,9 +2206,16 @@ impl CodexDiscovery {
             }
             None => None,
         };
+        if parent.is_none()
+            && kind == SessionKind::Main
+            && let Some(inferred_parent) = self.infer_claude_parent(&metadata, parent_index)
+        {
+            kind = SessionKind::Child;
+            parent = Some(inferred_parent);
+        }
         let session_id = SessionId::from_native(metadata.subject());
         let startup_directory = validated_directory(metadata.cwd(), worktree_mappings, report);
-        if self
+        let Ok(view) = self
             .api
             .discover_session(DiscoveredSession {
                 runtime: RuntimeKind::CodexCli,
@@ -1868,19 +2229,24 @@ impl CodexDiscovery {
                 startup_directory,
             })
             .await
+        else {
+            report.warn();
+            return;
+        };
+        if self
+            .enrich_rollout_repository(view.session, &metadata)
+            .await
             .is_err()
         {
             report.warn();
-            return;
         }
-        match kind {
-            SessionKind::Main if mains.insert(session_id) => {
-                report.main_sessions = report.main_sessions.saturating_add(1);
-            }
-            SessionKind::Child if children.insert(session_id) => {
-                report.child_sessions = report.child_sessions.saturating_add(1);
-            }
-            SessionKind::Main | SessionKind::Child => {}
+        record_rollout_session(kind, session_id, mains, children, report);
+        if self
+            .reconcile_codex_bootstrap_tail(candidate, metadata.subject())
+            .await
+            .is_err()
+        {
+            report.warn();
         }
         self.reconcile_codex_rollout_source(
             metadata.subject(),
@@ -1891,6 +2257,134 @@ impl CodexDiscovery {
             report,
         )
         .await;
+    }
+
+    async fn reconcile_codex_bootstrap_tail(
+        &self,
+        candidate: &CodexRolloutCandidate,
+        subject: &NativeSessionKey,
+    ) -> Result<(), ()> {
+        if self
+            .store
+            .file_cursor(&candidate.path_key)
+            .await
+            .map_err(|_| ())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(evidence) = parse_codex_rollout_tail(candidate, subject, self.clock.now())? else {
+            return Ok(());
+        };
+        self.api
+            .ingest_native_observation(evidence.observation().clone())
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    async fn enrich_rollout_repository(
+        &self,
+        session: SessionIdentity,
+        metadata: &watchdog_codex::CodexRolloutEvidence,
+    ) -> Result<(), ()> {
+        self.api
+            .enrich_repository_metadata(
+                session,
+                RepositoryMetadata {
+                    remote: metadata
+                        .repository_url()
+                        .and_then(GitHubEnricher::canonical_remote),
+                    ..RepositoryMetadata::default()
+                },
+            )
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn claude_parent_index(
+        &self,
+        worktree_mappings: &[WorktreePathMapping],
+    ) -> Result<ClaudeParentIndex, ()> {
+        let mains = self
+            .store
+            .sessions_by_kind(SessionKind::Main, MAX_CODEX_THREADS)
+            .await
+            .map_err(|_| ())?;
+        let mut candidates = Vec::new();
+        for main in mains {
+            if main.native.runtime() != RuntimeKind::ClaudeCode {
+                continue;
+            }
+            let Some(snapshot) = self.store.snapshot(main.session).await.map_err(|_| ())? else {
+                continue;
+            };
+            if matches!(
+                snapshot.state(),
+                DetailedState::Completed
+                    | DetailedState::Failed
+                    | DetailedState::Cancelled
+                    | DetailedState::Disappeared
+            ) {
+                continue;
+            }
+            let Some(metadata) = self
+                .store
+                .session_metadata(main.session)
+                .await
+                .map_err(|_| ())?
+            else {
+                continue;
+            };
+            let Some(startup_directory) = metadata.startup_directory() else {
+                continue;
+            };
+            let repository = metadata
+                .repository_remote()
+                .and_then(GitHubEnricher::canonical_remote)
+                .or_else(|| {
+                    repository_for_native_directory(Path::new(startup_directory), worktree_mappings)
+                });
+            candidates.push(ClaudeParentCandidate {
+                session: main.session.session_id(),
+                startup_directory: startup_directory.to_owned(),
+                repository,
+            });
+        }
+        Ok(ClaudeParentIndex { candidates })
+    }
+
+    fn infer_claude_parent(
+        &self,
+        rollout: &watchdog_codex::CodexRolloutEvidence,
+        parent_index: &ClaudeParentIndex,
+    ) -> Option<SessionId> {
+        let (selected, basis, confidence) = parent_index.resolve(rollout);
+        if basis == "not_claude_originated" {
+            return None;
+        }
+        let subject = SessionId::from_native(rollout.subject());
+        if !self.correlation_logs.changed(subject, selected, basis) {
+            return selected;
+        }
+        if selected.is_some() {
+            tracing::info!(
+                event = "discovery.correlation_selected",
+                runtime = RuntimeKind::CodexCli.as_str(),
+                correlation_basis = basis,
+                confidence,
+                "Selected unique Claude parent for Claude-originated Codex thread"
+            );
+        } else {
+            tracing::warn!(
+                event = "discovery.correlation_ambiguous",
+                runtime = RuntimeKind::CodexCli.as_str(),
+                correlation_basis = basis,
+                confidence,
+                "Claude-originated Codex thread has no unique Claude parent"
+            );
+        }
+        selected
     }
 
     async fn reconcile_codex_threads(
@@ -2170,6 +2664,16 @@ impl CodexDiscovery {
         mains: &mut BTreeSet<SessionId>,
     ) {
         let main_id = SessionId::from_native(thread.subject());
+        if self
+            .store
+            .session_by_id(main_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.session.kind() == SessionKind::Child)
+        {
+            return;
+        }
         let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
         let Ok(view) = self
             .api
@@ -2384,6 +2888,69 @@ fn parse_codex_rollout_metadata(
     }
 }
 
+fn parse_codex_rollout_tail(
+    candidate: &CodexRolloutCandidate,
+    subject: &NativeSessionKey,
+    observed_at: TimePoint,
+) -> Result<Option<watchdog_codex::CodexRolloutEvidence>, ()> {
+    let mut file = candidate
+        .root
+        .open_file(&candidate.relative)
+        .map_err(|_| ())?;
+    let length = file.metadata().map_err(|_| ())?.len();
+    let start = length.saturating_sub(MAX_CODEX_BOOTSTRAP_TAIL_BYTES as u64);
+    file.seek(SeekFrom::Start(start)).map_err(|_| ())?;
+    let mut bytes = Vec::new();
+    file.take((MAX_CODEX_BOOTSTRAP_TAIL_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() > MAX_CODEX_BOOTSTRAP_TAIL_BYTES {
+        return Err(());
+    }
+    let complete = if let Some(complete) = bytes.strip_suffix(b"\n") {
+        complete
+    } else if let Some(boundary) = bytes.iter().rposition(|byte| *byte == b'\n') {
+        &bytes[..boundary]
+    } else {
+        return Ok(None);
+    };
+    let complete = if start == 0 {
+        complete
+    } else if let Some(offset) = complete.iter().position(|byte| *byte == b'\n') {
+        &complete[offset + 1..]
+    } else {
+        return Ok(None);
+    };
+    let parser = watchdog_codex::CodexRolloutParser::new(watchdog_codex::TESTED_CODEX_VERSION)
+        .map_err(|_| ())?;
+    for (index, record) in complete
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .filter(|record| !record.is_empty())
+        .take(MAX_CODEX_ROLLOUT_RECORDS)
+        .enumerate()
+    {
+        if record.len() > watchdog_codex::MAX_ROLLOUT_RECORD_BYTES {
+            continue;
+        }
+        let event_key = format!(
+            "{}:bootstrap-tail:{length}:{index}",
+            candidate.path_key.as_str()
+        );
+        let Ok(evidence) = parser.parse_record(record, Some(subject), &event_key, observed_at)
+        else {
+            continue;
+        };
+        if matches!(
+            evidence.observation().payload(),
+            ObservationPayload::NativeState(DetailedState::Running | DetailedState::Completed)
+        ) {
+            return Ok(Some(evidence));
+        }
+    }
+    Ok(None)
+}
+
 fn recent_capability_file(
     root: &CapabilityRoot,
     relative: &Path,
@@ -2403,6 +2970,70 @@ fn recent_capability_file(
         return false;
     };
     modified_ms >= now_ms.saturating_sub(window_ms)
+}
+
+fn one_candidate(candidates: &[SessionId]) -> Option<SessionId> {
+    (candidates.len() == 1).then(|| candidates[0])
+}
+
+fn record_rollout_session(
+    kind: SessionKind,
+    session_id: SessionId,
+    mains: &mut BTreeSet<SessionId>,
+    children: &mut BTreeSet<SessionId>,
+    report: &mut RuntimeDiscoveryReport,
+) {
+    match kind {
+        SessionKind::Main if mains.insert(session_id) => {
+            report.main_sessions = report.main_sessions.saturating_add(1);
+        }
+        SessionKind::Child if children.insert(session_id) => {
+            report.child_sessions = report.child_sessions.saturating_add(1);
+        }
+        SessionKind::Main | SessionKind::Child => {}
+    }
+}
+
+fn repository_for_native_directory(
+    native_directory: &Path,
+    mappings: &[WorktreePathMapping],
+) -> Option<String> {
+    let (_, mounted_directory) = mappings
+        .iter()
+        .find_map(|mapping| mapping.project_native_directory(native_directory))?;
+    let root = CapabilityRoot::new(mounted_directory).ok()?;
+    let mut config = root.open_file(Path::new(".git/config")).ok()?;
+    if config.metadata().ok()?.len() > MAX_GIT_CONFIG_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    config
+        .by_ref()
+        .take((MAX_GIT_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_GIT_CONFIG_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut origin = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            origin = line.eq_ignore_ascii_case("[remote \"origin\"]");
+            continue;
+        }
+        if !origin {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("url") {
+            return GitHubEnricher::canonical_remote(value.trim());
+        }
+    }
+    None
 }
 
 fn codex_rollout_bootstrap_reader() -> IncrementalReader {
@@ -2535,7 +3166,43 @@ fn is_concrete_absolute(path: &Path) -> bool {
 mod tests {
     use std::{fs, os::unix::fs::symlink, path::Path};
 
-    use super::WorktreePathMapping;
+    use watchdog_domain::{NativeSessionKey, RuntimeKind, SessionId};
+
+    use super::{CodexCorrelationLogCache, DiscoveryAliasRegistry, WorktreePathMapping};
+
+    fn session(runtime: RuntimeKind, native_id: &str) -> SessionId {
+        SessionId::from_native(
+            &NativeSessionKey::new(runtime, native_id).expect("valid native session key"),
+        )
+    }
+
+    #[test]
+    fn codex_correlation_logging_only_repeats_when_the_outcome_changes() {
+        let cache = CodexCorrelationLogCache::default();
+        let subject = session(RuntimeKind::CodexCli, "codex-child");
+        let parent = session(RuntimeKind::ClaudeCode, "claude-parent");
+
+        assert!(cache.changed(subject, None, "claude_origin_without_unique_parent"));
+        assert!(!cache.changed(subject, None, "claude_origin_without_unique_parent"));
+        assert!(cache.changed(subject, Some(parent), "claude_origin_and_unique_cwd"));
+        assert!(!cache.changed(subject, Some(parent), "claude_origin_and_unique_cwd"));
+    }
+
+    #[test]
+    fn conflicting_native_alias_remains_ambiguous_across_repeated_scans() {
+        let aliases = DiscoveryAliasRegistry::default();
+        let wrapper =
+            NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper").expect("valid wrapper");
+        let first = session(RuntimeKind::ClaudeCode, "first");
+        let second = session(RuntimeKind::ClaudeCode, "second");
+
+        aliases.bind(wrapper.clone(), first);
+        aliases.bind(wrapper.clone(), second);
+        assert_eq!(aliases.resolve(&wrapper), None);
+
+        aliases.bind(wrapper.clone(), first);
+        assert_eq!(aliases.resolve(&wrapper), None);
+    }
 
     #[test]
     fn worktree_projection_rejects_traversal_and_symlink_escape() {

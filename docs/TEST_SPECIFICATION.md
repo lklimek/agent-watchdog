@@ -82,6 +82,14 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-DIS-010 | Native session ID repeats in two runtimes. | Watchdog identities remain distinct. | FR-DIS-004 |
 | T-DIS-011 | Codex SQLite contains recent, old, and archived threads plus an exact spawn edge. | Only recent unarchived threads bootstrap; the exact edge is retained. | FR-DIS-002, FR-DIS-006 |
 | T-DIS-012 | Current Codex rollout metadata exists while SQLite is absent or behind its WAL. | Recent main/child hierarchy and subsequent activity are discovered from bounded rollout reads. | FR-DIS-001, FR-DIS-002, FR-DIS-006 |
+| T-DIS-013 | Codex rollout emits `event_msg.payload.type=task_started`, then `task_complete`. | The child transitions running then completed; transcript content is neither retained nor logged. | FR-DIS-010, FR-SEC-001 |
+| T-DIS-014 | A recent Claude transcript and exactly one recent team lead have the same validated cwd but different session IDs. | Only the configured lead is a main session and transcript activity advances it; two matching leads remain unaliased. | FR-DIS-005, FR-DIS-011 |
+| T-DIS-015 | A Claude team member changes from active to inactive without a hook record. | The retained child becomes completed in the next reconciliation and cannot age into stalled. | FR-DIS-012, FR-STA-006 |
+| T-DIS-016 | Codex metadata says `originator=Claude Code` and exactly one active Claude main matches its directory or repository. | Codex is registered beneath that Claude root with logged correlation basis/confidence; ambiguous candidates are not joined. | FR-DIS-005, FR-DIS-006, FR-DIS-013 |
+| T-DIS-017 | A team config is older than the 24-hour bootstrap window in a fresh store. | It does not create a main or child; a recent config still does. | FR-DIS-014, FR-EVD-008 |
+| T-DIS-018 | A Companion job names a wrapper session whose recent Claude transcript uniquely aliases to a team member. | The job reuses the Claude team root; no wrapper main is created. | FR-DIS-005, FR-DIS-015 |
+| T-DIS-019 | One old terminal Companion job and one active job exist in a fresh store. | Only the active job bootstraps; a tracked job can still accept a later summary-only terminal transition. | FR-DIS-016, FR-EVD-008 |
+| T-DIS-020 | Watchdog first sees a Codex rollout after its final `task_complete` was already written, or while that final JSON object lacks its newline boundary. | One bounded tail read recovers only a complete terminal record before the durable EOF cursor is initialized; a partial final record is ignored and subsequent scans remain incremental. | FR-DIS-010, FR-EVD-002, FR-EVD-004, FR-EVD-008 |
 
 ### 5.2 Filesystem ingestion and native parsing
 
@@ -197,6 +205,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-UI-008 | Keyboard-only and screen-reader smoke. | Logical focus, visible focus, labels, headings, live status, and non-color state cues pass. | UX §13 |
 | T-UI-009 | Light/dark and reduced-motion preferences vary. | Content remains legible and motion preference is honored. | UX §13 |
 | T-UI-010 | Main has children in several states. | Text counts match snapshot; child cards do not appear. | FR-UI-001, FR-UI-004 |
+| T-UI-011 | Claude and Codex adapters are degraded simultaneously. | Each page warning includes its human-readable runtime label and remains accessible. | FR-EVD-011, FR-UI-006 |
 
 ### 5.9 Notifications
 
@@ -217,7 +226,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-OPS-003 | Inspect container security context. | Non-root, capabilities dropped, no-new-privileges, read-only root filesystem. | FR-OPS-001 |
 | T-OPS-004 | One adapter crashes or rejects schema. | Its health/sessions degrade; other runtime and server remain available. | FR-OPS-005, FR-COMP-002 |
 | T-OPS-005 | Critical database/reducer/process/auth component fails. | Readiness fails and termination is globally suspended. | FR-OPS-005 |
-| T-OPS-006 | Generate operational errors and transitions. | `tracing` output is structured, bounded, and secret/transcript free. | FR-OPS-006 |
+| T-OPS-006 | Generate operational errors, transitions, and repeated identical correlation outcomes. | `tracing` output is structured, bounded, and secret/transcript free; an unchanged correlation outcome logs once and logs again only after it changes. | FR-OPS-006 |
 | T-OPS-007 | Query deployment for metrics endpoint/exporter. | None is required or exposed in v1. | FR-OPS-007 |
 | T-OPS-008 | Run the target synthetic population. | 50 mains/500 total agents converge with bounded resources and no transcript rescans. | FR-OPS-003 |
 | T-SEC-001 | Paths contain `..`, symlink escape, race replacement, or non-UTF-8 components. | Capability-root access prevents escape; errors remain bounded. | FR-SEC-002 |

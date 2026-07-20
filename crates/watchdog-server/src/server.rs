@@ -32,10 +32,10 @@ use crate::watch_paths::WatchPathRegistry;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, ClaudeHookService,
     CodexDiscovery, CodexHookService, CompanionDiscovery, DashboardOutboxDispatcher,
-    DashboardService, FilesystemActivityReconciler, GitHubEnricher, HealthService, HumanNotifier,
-    HumanOutboxDispatcher, NotificationEndpoints, RepositoryMetadata, RuntimeDiscoveryReport,
-    SystemClock, TerminationConfig, WebhookEndpoint, claude_hook_router, codex_hook_router,
-    dashboard_router, health_router, mcp_router,
+    DashboardService, DiscoveryAliasRegistry, FilesystemActivityReconciler, GitHubEnricher,
+    HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints, RepositoryMetadata,
+    RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint, claude_hook_router,
+    codex_hook_router, dashboard_router, health_router, mcp_router,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
@@ -640,10 +640,21 @@ fn start_discovery(
     requested: mpsc::Receiver<()>,
     filesystem_uncertainty_generation: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
+    let aliases = DiscoveryAliasRegistry::default();
     let discoveries = RuntimeDiscoveries {
-        claude: ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone()),
+        claude: ClaudeDiscovery::with_alias_registry(
+            api.clone(),
+            store.clone(),
+            clock.clone(),
+            aliases.clone(),
+        ),
         codex: CodexDiscovery::new(api.clone(), store.clone(), clock.clone()),
-        companion: CompanionDiscovery::new(api, store.clone(), clock.clone()),
+        companion: CompanionDiscovery::with_alias_registry(
+            api,
+            store.clone(),
+            clock.clone(),
+            aliases,
+        ),
     };
     spawn_discovery_worker(
         config,

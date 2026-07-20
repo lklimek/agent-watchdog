@@ -95,7 +95,7 @@ fn subagent_hooks_create_an_exact_parent_relation_and_terminal_state() {
 }
 
 #[test]
-fn team_config_discovers_active_members_without_newest_session_guessing() {
+fn team_config_retains_active_and_inactive_members_without_newest_session_guessing() {
     let team = parse_team_config(
         br#"{
             "name":"watchdog-team",
@@ -112,9 +112,12 @@ fn team_config_discovers_active_members_without_newest_session_guessing() {
 
     assert_eq!(team.name(), Some("watchdog-team"));
     assert_eq!(team.lead().native_id(), "lead-1");
-    assert_eq!(team.members().len(), 1);
+    assert_eq!(team.members().len(), 2);
     assert_eq!(team.members()[0].subject().native_id(), "child-1");
     assert_eq!(team.members()[0].name(), "bilby");
+    assert!(team.members()[0].is_active());
+    assert_eq!(team.members()[1].subject().native_id(), "child-2");
+    assert!(!team.members()[1].is_active());
     assert_eq!(
         team.lead_cwd().expect("lead cwd should exist").to_str(),
         Some("/work/main")

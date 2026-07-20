@@ -1,10 +1,11 @@
 # Final QA report
 
-Date: 2026-07-18 UTC
+Date: 2026-07-18 UTC; corrective addendum 2026-07-20 UTC
 
 Branch: `feat/implementation`
 
-Status: Linux release gates passed; two explicit external limitations remain
+Status: Linux release gates passed; live corrective regressions passed; two
+explicit external limitations remain
 
 ## Passed gates
 
@@ -27,13 +28,47 @@ Status: Linux release gates passed; two explicit external limitations remain
 
 ## Explicit limitations
 
-### Live runtime matrix not run
+### Formal isolated live runtime matrix not run
 
 Installed Claude Code 2.1.214, Codex CLI 0.144.5, and Companion 1.0.6 metadata
 were verified without opening user sessions. No disposable credentialed runtime
 account was available. Codex `--ephemeral` writes no discoverable session state,
 so it cannot validate disk discovery. The live matrix is recorded as not run,
 not silently passed; it must never borrow operator transcripts or credentials.
+
+The product owner later authorized a read-only corrective probe of the existing
+local runtime state. That evidence is recorded below, but it does not replace a
+repeatable isolated credentialed matrix.
+
+## 2026-07-20 live corrective addendum
+
+The owner-authorized probe exposed mismatches that synthetic tests had not:
+post-reset Claude transcript/team IDs, inactive members, retained Companion
+history, wrapper-to-team aliasing, Claude-origin Codex launches, and terminal
+Codex records written before the first cursor. T-DIS-013 through T-DIS-020,
+T-UI-011, and the strengthened T-OPS-006 cover the fixes.
+
+A fresh-volume Compose stack (`agent-watchdog-qa3`, port 8083) read the real
+runtime roots through the supported read-only mounts. Its durable database
+contained three Codex CLI children beneath their correct Claude mains:
+
+- thread `019f7e7b…` beneath Claude lead `8a852e11…`;
+- thread `019f7ef7…` beneath Claude lead `11ed5789…`;
+- thread `019f7ef8…` beneath Claude lead `b1a25d6a…`, with its startup directory
+  projected from `/data/git-worktrees`.
+
+The `8a852e11…` main appeared once with four finished children. Companion jobs
+whose wrapper transcript uniquely identified a Claude team member stayed in the
+same Claude tree. A retained worktree Codex rollout remained a separate main
+where repository evidence matched multiple active Claude mains; this is the
+required ambiguity-safe result. Identical Codex correlation outcomes logged
+once after startup rather than once per inotify-triggered reconciliation.
+
+The watcher reported the documented bounded-capacity degradation because both
+configured worktree prefixes exceed 4,096 directories within the scan depth.
+The service stayed ready and automatic termination remained suspended. Claude
+and Codex adapters also reported best-effort `UPGRADE` degradation for records
+outside the tested parser set; Companion remained healthy.
 
 ### macOS build result pending CI
 

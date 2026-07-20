@@ -19,6 +19,8 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
     assert!(!app.contains("/var/run/docker.sock"));
     assert!(!app.contains("target: /home"));
     assert!(!app.contains("target: /\n"));
+    assert!(app.contains("source: ${WATCHDOG_AGENT_WORKTREE_ROOT_PATH"));
+    assert!(app.contains("target: /monitored/agent-worktrees"));
     assert!(
         !app.contains("nocopy: true"),
         "the image must initialize named-volume permissions for the configured UID"

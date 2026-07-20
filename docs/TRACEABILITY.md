@@ -24,16 +24,24 @@ not accepted deferrals.
 | FR-DIS-007 | T-DIS-006, T-DIS-007 | Durable scoped `register_watch_path`, capability projection, prioritized watcher rebuild, and exact child ownership | Automated |
 | FR-DIS-008 | T-DIS-008 | Tracked standard path templates, explicit Compose binds, and tested coexistence of standard/additional native-to-mounted TOML mappings | Automated |
 | FR-DIS-009 | T-DIS-002 | Startup-directory/worktree metadata, root-scoped stores, dashboard cards, and ambiguity-safe worktree activity | Automated |
+| FR-DIS-010 | T-DIS-013, T-DIS-020 | Typed Codex rollout lifecycle transitions and bounded terminal bootstrap | Automated and live-verified |
+| FR-DIS-011 | T-DIS-014 | Unique retained-team lead alias; ambiguous matches fail open | Automated and live-verified |
+| FR-DIS-012 | T-DIS-015 | Inactive Claude member terminal reconciliation | Automated and live-verified |
+| FR-DIS-013 | T-DIS-016 | Explicit Claude-origin Codex child correlation | Automated and live-verified |
+| FR-DIS-014 | T-DIS-017 | Recent-only team-config bootstrap | Automated and fresh-volume verified |
+| FR-DIS-015 | T-DIS-018 | Shared Claude/Companion wrapper alias registry | Automated and live-verified |
+| FR-DIS-016 | T-DIS-019 | Recent terminal Companion bootstrap with tracked-job exception | Automated and fresh-volume verified |
 | FR-EVD-001 | T-EVD-001 | Linux `WatchService`, targeted invalidation, server watcher supervisor | Automated |
 | FR-EVD-002 | T-EVD-001 | Durable incremental cursor and complete-record reader; huge sparse-file test | Automated |
 | FR-EVD-003 | T-EVD-003, T-EVD-004 | File identity/truncation reconciliation, watcher uncertainty, generation-guarded health | Automated |
-| FR-EVD-004 | T-EVD-002, T-EVD-005 | Partial-record cursor behavior and adapter parse containment | Automated |
+| FR-EVD-004 | T-DIS-020, T-EVD-002, T-EVD-005 | Partial-record cursor/tail behavior and adapter parse containment | Automated |
 | FR-EVD-005 | T-EVD-007 | `FilesystemActivityMonitor`; single-owner activity test | Automated |
 | FR-EVD-006 | T-EVD-008, T-EVD-009 | `WorktreeOwners` ambiguity policy and filesystem-activity integration | Automated |
 | FR-EVD-007 | T-CPU-001, T-CPU-002, T-CPU-006, T-CPU-008 | Process-tree sampler and server process monitor; synthetic/live-helper CPU and descendant tests | Automated |
 | FR-EVD-008 | T-EVD-001, T-EVD-006 | Record, directory depth/entry/path-byte, queue, and wall-time budgets; scan/incremental tests | Automated |
 | FR-EVD-009 | T-CPU-009, T-EVD-004, T-EVD-010 | Provenance-aware reducer conflict state, watcher degradation, process-race containment | Automated |
 | FR-EVD-010 | T-CPU-001–005, T-CPU-007 | Four `/proc` CPU counters, prior-snapshot delta model, strong/neutral/uncertain tests | Automated |
+| FR-EVD-011 | T-UI-011 | Runtime-labelled page degradation warnings | Automated and browser-verified |
 
 ## State, termination, and agent API
 
@@ -99,7 +107,7 @@ not accepted deferrals.
 | FR-OPS-003 | T-OPS-008 | 50-main/500-session production-service load and restart test | Explicit load target passed |
 | FR-OPS-004 | T-EVD-006 | Event-driven workers, bounded queues/scans/records, degradation health; isolated 500-session container gate | Automated; ten-minute CPU averaged 0.000% at Docker precision and burst p99 was 65.732 ms |
 | FR-OPS-005 | T-OPS-004, T-OPS-005 | Component health registry, isolated adapter degradation, critical readiness failure | Automated |
-| FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests | Automated; final container logs inspected without warnings/errors |
+| FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests, bounded change-only correlation log cache | Automated and live reconciliation noise-checked |
 | FR-OPS-007 | T-OPS-007 | Health/log interface only; no metrics route or exporter | Automated route/Compose inspection |
 | FR-SEC-001 | T-CFG-004, T-CPU-010, T-HTTP-001, T-MCP-001 | Constant-time bounded credentials, secret wrappers, redacted errors/debug | Automated |
 | FR-SEC-002 | T-DIS-007, T-SEC-001 | Linux capability roots, canonical mappings, openat2/no-symlink tests, and rejected MCP traversal/out-of-prefix/symlink registrations | Automated |
@@ -109,9 +117,9 @@ not accepted deferrals.
 
 | Requirement | Acceptance tests | Implementation and test evidence | Status |
 |---|---|---|---|
-| FR-COMP-001 | T-COMP-001 | Version-guarded adapters and documented observed versions | **Pending isolated current-runtime matrix** |
+| FR-COMP-001 | T-COMP-001 | Version-guarded adapters and documented observed versions | Automated; owner-authorized live probe passed best-effort discovery, formal isolated matrix pending |
 | FR-COMP-002 | T-COMP-002, T-EVD-005, T-KILL-012, T-OPS-004 | Per-adapter/session `UPGRADE`, best-effort state, termination suspension | Automated |
-| FR-COMP-003 | T-COMP-004 | Synthetic adapters exist; real runtime tests must use dedicated roots; Claudius transfer pitfalls audited | **Pending isolated live QA; current uncredentialed environment recorded as not run** |
+| FR-COMP-003 | T-COMP-004 | Synthetic adapters exist; Claudius transfer pitfalls audited; owner-authorized corrective live probe recorded separately from the formal matrix | **Corrective live evidence passed; formal isolated live QA pending** |
 | FR-COMP-004 | T-COMP-005 | Reducer/correlation/timer/safety slices have synthetic typed-event TDD evidence and final diff self-review | Complete |
 | FR-COMP-005 | T-COMP-006 | Per-commit formatter, targeted tests, strict Clippy, audit/deny, Compose/image/browser release evidence | Final Linux engineering gates passed |
 
@@ -131,9 +139,9 @@ not accepted deferrals.
 | T-LOAD-002 | Huge sparse transcript incremental-read test | Automated |
 | T-LOAD-003 | Watcher saturation tests, a 12,000-file live Compose burst, and 500-event production-hook burst | Passed; hook burst p99 65.732 ms and service remained ready |
 | T-LOAD-004 | Lagging SSE, durable inbox, and hanging one-attempt webhook tests | Automated |
-| T-LIVE-CLAUDE-001/002 | No real user state may be inspected | **Pending isolated live QA** |
-| T-LIVE-CODEX-001/002 | No real user state may be inspected | **Pending isolated live QA** |
-| T-LIVE-COMP-001/002 | No real user state may be inspected | **Pending isolated live QA** |
+| T-LIVE-CLAUDE-001/002 | Formal cases require disposable roots; a separate owner-authorized read-only corrective probe verified team/member hierarchy | **Corrective evidence passed; isolated cases pending** |
+| T-LIVE-CODEX-001/002 | Formal cases require disposable roots; a separate owner-authorized read-only probe verified three Claude-originated threads | **Corrective evidence passed; isolated cases pending** |
+| T-LIVE-COMP-001/002 | Formal cases require disposable roots; a separate owner-authorized read-only probe verified wrapper aliasing and retained state | **Corrective evidence passed; isolated cases pending** |
 
 ## Open closure work
 

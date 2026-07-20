@@ -72,7 +72,10 @@ monitored user; it is not an implicit mount or a broad home-directory scan.
 persist in their state, in the same order. For example, map host
 `/home/example/git` to mounted `/monitored/worktrees`; the service validates
 native paths through this projection while retaining the host path for the UI
-and notifications. The `native_claude_roots`, `native_codex_roots`, and
+and notifications. The standard template also maps the dedicated agent prefix
+`/data/git-worktrees` to `/monitored/agent-worktrees`; both mappings are concrete
+read-only allowlist entries, not a broad `/data` mount. The
+`native_claude_roots`, `native_codex_roots`, and
 `native_companion_roots` arrays likewise correspond positionally to their
 mounted adapter roots. These exact mappings let the server follow native file
 paths recorded in runtime state without mounting a home directory. A missing or
@@ -216,6 +219,14 @@ components are healthy again.
 bounded activity queue was saturated. Monitoring continues and a full bounded
 runtime reconciliation is requested. Automated termination remains suspended
 until that reconciliation finishes without a newer filesystem uncertainty.
+`watcher` degradation with a message about directories not fitting within bounds
+means a configured prefix exceeded the 4,096-target/depth/byte safety budget or
+the host inotify backend rejected a target. The server remains available and
+continues bounded best-effort reconciliation, but it does not claim complete
+filesystem coverage and automatic termination stays suspended. Prefer narrower
+concrete worktree prefixes or explicit MCP `register_watch_path` entries; those
+registrations receive watcher-budget priority. Raising host inotify limits does
+not bypass the application's own bounded target policy.
 `dashboard_delivery` is independent: a lagging or failed browser/SSE delivery
 cannot authorize or suspend process signals.
 
