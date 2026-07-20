@@ -2435,14 +2435,17 @@ impl CodexDiscovery {
         }
         record_rollout_session(kind, session_id, mains, children, report);
         if self
-            .reconcile_codex_bootstrap_tail(candidate, metadata.subject())
+            .reconcile_codex_bootstrap_tail(candidate, metadata.subject(), kind)
             .await
             .is_err()
         {
             report.warn();
         }
         self.reconcile_codex_rollout_source(
-            metadata.subject(),
+            CodexRolloutTarget {
+                subject: metadata.subject(),
+                kind,
+            },
             watchdog_codex::TESTED_CODEX_VERSION,
             &candidate.root,
             &candidate.relative,
@@ -2456,6 +2459,7 @@ impl CodexDiscovery {
         &self,
         candidate: &CodexRolloutCandidate,
         subject: &NativeSessionKey,
+        kind: SessionKind,
     ) -> Result<(), ()> {
         if self
             .store
@@ -2470,7 +2474,10 @@ impl CodexDiscovery {
             return Ok(());
         };
         self.api
-            .ingest_native_observation(evidence.observation().clone())
+            .ingest_native_observation(codex_rollout_observation_for_kind(
+                evidence.observation(),
+                kind,
+            )?)
             .await
             .map(|_| ())
             .map_err(|_| ())
@@ -2632,7 +2639,10 @@ impl CodexDiscovery {
             return;
         };
         self.reconcile_codex_rollout_source(
-            thread.subject(),
+            CodexRolloutTarget {
+                subject: thread.subject(),
+                kind: thread.kind(),
+            },
             thread.cli_version(),
             &root,
             &relative,
@@ -2644,7 +2654,7 @@ impl CodexDiscovery {
 
     async fn reconcile_codex_rollout_source(
         &self,
-        subject: &NativeSessionKey,
+        target: CodexRolloutTarget<'_>,
         adapter_version: &str,
         root: &CapabilityRoot,
         relative: &Path,
@@ -2676,8 +2686,9 @@ impl CodexDiscovery {
             return;
         };
         self.tail_codex_rollout(
-            subject,
+            target.subject,
             adapter_version,
+            target.kind,
             report,
             root,
             relative,
@@ -2697,6 +2708,7 @@ impl CodexDiscovery {
         &self,
         subject: &NativeSessionKey,
         adapter_version: &str,
+        kind: SessionKind,
         report: &mut RuntimeDiscoveryReport,
         root: &CapabilityRoot,
         relative: &Path,
@@ -2736,7 +2748,7 @@ impl CodexDiscovery {
                 let event_key = format!("{}:{complete_offset}", subject.native_id());
                 let result = self
                     .ingest_codex_rollout_record(
-                        subject,
+                        CodexRolloutTarget { subject, kind },
                         adapter_version,
                         parser,
                         record,
@@ -2769,18 +2781,20 @@ impl CodexDiscovery {
 
     async fn ingest_codex_rollout_record(
         &self,
-        subject: &NativeSessionKey,
+        target: CodexRolloutTarget<'_>,
         adapter_version: &str,
         parser: &watchdog_codex::CodexRolloutParser,
         record: &[u8],
         event_key: &str,
         report: &mut RuntimeDiscoveryReport,
     ) -> Result<Option<ObservationId>, ()> {
-        match parser.parse_record(record, Some(subject), event_key, self.clock.now()) {
+        match parser.parse_record(record, Some(target.subject), event_key, self.clock.now()) {
             Ok(evidence) => {
-                let observation_id = evidence.observation().observation_id();
+                let observation =
+                    codex_rollout_observation_for_kind(evidence.observation(), target.kind)?;
+                let observation_id = observation.observation_id();
                 self.api
-                    .ingest_native_observation(evidence.observation().clone())
+                    .ingest_native_observation(observation)
                     .await
                     .map_err(|_| ())?;
                 Ok(Some(observation_id))
@@ -2789,7 +2803,7 @@ impl CodexDiscovery {
                 report.warn();
                 Ok(self
                     .emit_codex_compatibility_warning(
-                        subject,
+                        target.subject,
                         adapter_version,
                         event_key,
                         error.compatibility_warning_for_version(adapter_version),
@@ -3024,6 +3038,12 @@ struct CodexRolloutCandidate {
     path_key: BoundedText<4_096>,
 }
 
+#[derive(Clone, Copy)]
+struct CodexRolloutTarget<'a> {
+    subject: &'a NativeSessionKey,
+    kind: SessionKind,
+}
+
 impl CodexRolloutCandidate {
     fn from_file(
         root: &CapabilityRoot,
@@ -3148,6 +3168,29 @@ fn parse_codex_rollout_tail(
         }
     }
     Ok(None)
+}
+
+fn codex_rollout_observation_for_kind(
+    observation: &ObservationEnvelope,
+    kind: SessionKind,
+) -> Result<ObservationEnvelope, ()> {
+    let payload = if kind == SessionKind::Main
+        && matches!(
+            observation.payload(),
+            ObservationPayload::NativeState(DetailedState::Completed)
+        ) {
+        ObservationPayload::NativeState(DetailedState::WaitingForUser)
+    } else {
+        observation.payload().clone()
+    };
+    ObservationEnvelope::new(
+        observation.observation_id(),
+        observation.subject().clone(),
+        observation.observed_at(),
+        observation.source().clone(),
+        payload,
+    )
+    .map_err(|_| ())
 }
 
 fn recent_capability_file(

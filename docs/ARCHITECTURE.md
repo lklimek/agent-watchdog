@@ -325,11 +325,12 @@ Evidence precedence:
 5. timestamp heuristics.
 
 Rollout `event_msg` records are decoded one level further for the supported
-`task_started` and `task_complete` lifecycle markers. Those records produce typed
-running/completed state; other supported rollout records remain content-free
-progress observations. On first sight only, discovery also inspects at most the
-last 1 MiB/128 complete records for the newest supported lifecycle marker before
-placing the durable cursor at EOF. This recovers a completion written before
+`task_started` and `task_complete` lifecycle markers. A started task is running.
+A completed main-session turn is waiting for user, while a completed child task
+is terminal. Other supported rollout records remain content-free progress
+observations. On first sight only, discovery also inspects at most the last 1
+MiB/128 complete records for the newest supported lifecycle marker before
+placing the durable cursor at EOF. This recovers a turn boundary written before
 Watchdog started without replaying a huge transcript; later scans read only
 appended complete records.
 
