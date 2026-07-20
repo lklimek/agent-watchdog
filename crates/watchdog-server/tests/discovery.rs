@@ -1513,16 +1513,7 @@ async fn codex_rollout_metadata_discovers_live_hierarchy_without_sqlite_visibili
     assert_eq!(mains.len(), 1);
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].root, mains[0].root);
-    let child_metadata = store
-        .session_metadata(children[0].session)
-        .await
-        .expect("metadata should query")
-        .expect("metadata should exist");
-    assert_eq!(child_metadata.title(), Some("reviewer"));
-    assert_eq!(
-        child_metadata.startup_directory(),
-        Some("/host/repositories/child")
-    );
+    assert_codex_child_metadata(&store, children[0].session).await;
 
     append_rollout_activity(&rollout_root.join("rollout-child.jsonl"));
     clock.advance(DurationMs::new(1_000));
@@ -1557,10 +1548,34 @@ async fn codex_rollout_metadata_discovers_live_hierarchy_without_sqlite_visibili
         )
         .await;
     assert_session_state(&store, children[0].session, DetailedState::Completed).await;
+
+    append_rollout_completion(&rollout_root.join("rollout-main.jsonl"));
+    clock.advance(DurationMs::new(1_000));
+    discovery
+        .reconcile(
+            std::slice::from_ref(&rollout_root),
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&mapping),
+        )
+        .await;
+    assert_session_state(&store, mains[0].session, DetailedState::WaitingForUser).await;
+}
+
+async fn assert_codex_child_metadata(store: &WatchdogStore, session: SessionIdentity) {
+    let child_metadata = store
+        .session_metadata(session)
+        .await
+        .expect("metadata should query")
+        .expect("metadata should exist");
+    assert_eq!(child_metadata.title(), Some("reviewer"));
+    assert_eq!(
+        child_metadata.startup_directory(),
+        Some("/host/repositories/child")
+    );
 }
 
 #[tokio::test]
-async fn codex_rollout_bootstrap_recovers_a_terminal_tail_record() {
+async fn codex_rollout_bootstrap_recovers_main_turn_completion_as_waiting_for_user() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let rollouts = fixture.path().join("rollouts");
     let worktrees = fixture.path().join("worktrees");
@@ -1598,7 +1613,7 @@ async fn codex_rollout_bootstrap_recovers_a_terminal_tail_record() {
         .await
         .expect("mains should query");
     assert_eq!(mains.len(), 1);
-    assert_session_state(&store, mains[0].session, DetailedState::Completed).await;
+    assert_session_state(&store, mains[0].session, DetailedState::WaitingForUser).await;
     assert!(!format!("{:?}", load_snapshot(&store, mains[0].session).await).contains("SECRET"));
 }
 
