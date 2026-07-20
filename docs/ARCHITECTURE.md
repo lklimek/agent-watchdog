@@ -721,9 +721,11 @@ POST /mcp                     Bearer-authenticated MCP transport
 ```
 
 The server renders the approved card markup with Maud. A small dependency-free
-script opens SSE, applies revisioned events, filters completed sessions, and
-sorts cards. Initial HTML contains the snapshot, so the page remains useful if
-JavaScript or SSE fails. If an SSE client falls behind, the server sends a
+script opens SSE, applies revisioned events, filters cards using the server's
+per-card active-scope decision, and sorts cards. The marker is present in the
+all-session SSE projection so a live update cannot resurrect retained,
+restart-unreconciled sessions in the default view. Initial HTML contains the
+snapshot, so the page remains useful if JavaScript or SSE fails. If an SSE client falls behind, the server sends a
 `resync_required` event; the client reconnects for a fresh snapshot. There is no
 polling fallback.
 

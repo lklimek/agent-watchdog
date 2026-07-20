@@ -259,6 +259,7 @@ async fn active_projection_excludes_unreconciled_retained_mains() {
         .await
         .expect("history snapshot should render");
     assert_eq!(history.sessions.len(), 1);
+    assert!(!history.sessions[0].in_active_scope);
 }
 
 #[tokio::test]

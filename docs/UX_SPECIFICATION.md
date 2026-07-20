@@ -96,8 +96,10 @@ provides the former. It does not silently change the normalized state.
 
 After a server restart, retained main sessions remain out of the default active
 view until current native evidence reconciles them. They remain available in the
-all-session history. Re-observing a current Claude team config clears this gate
-without pretending that configuration presence is agent progress.
+all-session history. The live client follows the server-provided active-scope
+marker rather than inferring eligibility from terminal state alone. Re-observing
+a current Claude team config clears this gate without pretending that
+configuration presence is agent progress.
 
 ## 7. Desktop wireframe
 

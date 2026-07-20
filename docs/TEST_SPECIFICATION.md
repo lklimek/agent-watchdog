@@ -214,7 +214,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-UI-009 | Light/dark and reduced-motion preferences vary. | Content remains legible and motion preference is honored. | UX §13 |
 | T-UI-010 | Main has children in several states. | Text counts match snapshot; child cards do not appear. | FR-UI-001, FR-UI-004 |
 | T-UI-011 | Claude and Codex adapters are degraded simultaneously. | Each page warning includes its human-readable runtime label and remains accessible. | FR-EVD-011, FR-UI-006 |
-| T-UI-012 | Retained nonterminal mains require reconciliation after restart. | They are absent from the active projection and remain available in the all-session history. | FR-UI-001, FR-DATA-001 |
+| T-UI-012 | Retained nonterminal mains require reconciliation after restart, then the browser receives the all-session SSE projection. | They are absent from the active view, carry a false active-scope marker in retained history, and cannot be restored by a live update. | FR-UI-001, FR-UI-007, FR-DATA-001 |
 
 ### 5.9 Notifications
 

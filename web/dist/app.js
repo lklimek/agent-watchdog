@@ -67,7 +67,7 @@ function render() {
         return;
     const scope = selectedScope();
     const sort = selectedSort();
-    const cards = latest.sessions.filter((card) => scope === "all" || !isTerminal(card.state));
+    const cards = latest.sessions.filter((card) => scope === "all" || card.in_active_scope);
     cards.sort((left, right) => compareCards(left, right, sort));
     sessionList.replaceChildren(...(cards.length > 0 ? cards.map(createCard) : [createEmpty(scope)]));
     sessionList.dataset.revision = String(latest.revision);
@@ -208,6 +208,7 @@ function isCard(value) {
         && optionalString(candidate.pull_request_url)
         && detailedStates.has(candidate.state)
         && compactStates.has(candidate.compact_state)
+        && typeof candidate.in_active_scope === "boolean"
         && typeof candidate.last_activity_ms === "number"
         && isChildCounts(candidate.child_counts)
         && isWarning(candidate.warning);
@@ -282,9 +283,6 @@ function attentionRank(state) {
     if (state === "idle")
         return 1;
     return 2;
-}
-function isTerminal(state) {
-    return state === "completed" || state === "failed" || state === "cancelled" || state === "disappeared";
 }
 function humanEvent(state) {
     return state === "waiting_for_user" || state === "stalled" || state === "completed";
