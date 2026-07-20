@@ -86,6 +86,7 @@ not accepted deferrals.
 | FR-UI-007 | T-HTTP-004, T-UI-007 | SSE-only live delivery, stale/reconnecting state, resync-on-lag | Automated and browser-verified |
 | FR-UI-008 | T-HTTP-001 | Basic Auth plus Traefik source allowlist; no published application port | Automated Compose/auth contract |
 | FR-UI-009 | T-NOT-004 | Bounded human payload contains only issue/title/startup directory | Automated |
+| FR-UI-010 | T-HTTP-006 | Authenticated root redirects to `/ui` without bypassing the Basic Auth challenge | Automated |
 | FR-NOT-001 | T-NOT-001, T-NOT-002 | Main-impacting human destinations and child-only suppression in outbox policy | Automated |
 | FR-NOT-002 | T-NOT-001 | SSE/web center, browser notifications, Home Assistant, and generic webhook dispatch | Automated; browser permission behavior manually verified |
 | FR-NOT-003 | T-NOT-003 | Bounded one-attempt webhook delivery, timeout/redirect/error audit | Automated |

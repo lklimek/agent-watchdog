@@ -217,6 +217,39 @@ impl DashboardFixture {
 }
 
 #[tokio::test]
+async fn authenticated_root_redirects_to_dashboard() {
+    let fixture = DashboardFixture::new().await;
+    let router = fixture.router();
+
+    let unauthorized = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
+    let authorized = router
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(authorized.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(authorized.headers()[header::LOCATION], "/ui");
+    assert_eq!(authorized.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
 async fn projection_filters_sorts_and_aggregates_main_session_cards() {
     let fixture = DashboardFixture::new().await;
     fixture.seed_projection_scenario().await;

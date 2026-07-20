@@ -216,6 +216,7 @@ The v1 MCP tool set is:
 | FR-UI-007 | SSE provides live updates. If disconnected, the UI shows the condition and continuously retries; it does not poll. | Stale data remains visible with a disconnected indicator until SSE recovers. |
 | FR-UI-008 | The UI uses shared Basic Auth and is exposed only through Traefik on a trusted LAN/VPN allowlist. | Direct server ports are not published in the supported Compose configuration. |
 | FR-UI-009 | Human alerts are concise and identify the main-session title, startup directory, and issue. | Detailed PID/evidence is absent from browser/webhook messages. |
+| FR-UI-010 | The authenticated HTTP root redirects to the dashboard at `/ui`. | A valid Basic Auth request to `/` receives a fixed temporary redirect to `/ui`; unauthenticated requests remain challenged. |
 
 ### 8.7 Human notifications
 

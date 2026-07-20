@@ -31,9 +31,12 @@ The dashboard is not an agent debugger or transcript browser in v1. It is a comp
 
 ## 3. Information architecture
 
-V1 has one authenticated dashboard route:
+V1 has one authenticated dashboard route. Visiting the authenticated deployment
+root redirects to `/ui`:
 
 ```text
+/
+└── redirects to /ui
 /ui
 └── Active main sessions
     ├── attention sessions: waiting, stalled

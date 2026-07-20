@@ -132,10 +132,11 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Both containers must become `healthy`. Open `/ui` on the configured HTTP bind
-address and port. `/health` is the authenticated detailed health report;
-`/health/live` is intentionally minimal but remains protected by Traefik on the
-published listener. MCP clients connect to `/mcp` with the shared Bearer token.
+Both containers must become `healthy`. Open the configured HTTP bind address and
+port; the authenticated root redirects to `/ui`. `/health` is the authenticated
+detailed health report; `/health/live` is intentionally minimal but remains
+protected by Traefik on the published listener. MCP clients connect to `/mcp`
+with the shared Bearer token.
 
 The application database lives in the Compose-managed `watchdog-data` volume.
 On its first mount, Docker copies a sticky world-writable directory scaffold so

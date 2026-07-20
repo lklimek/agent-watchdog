@@ -6,7 +6,7 @@ use axum::{
     extract::{Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{IntoResponse, Redirect, Response, Sse, sse::Event},
     routing::get,
 };
 use futures::{Stream, StreamExt as _, stream};
@@ -29,6 +29,7 @@ const JAVASCRIPT: &str = include_str!("../../../../web/dist/app.js");
 /// Build authenticated dashboard, read-only JSON, assets, and SSE routes.
 pub fn dashboard_router(service: DashboardService, authenticator: BasicAuthenticator) -> Router {
     Router::new()
+        .route("/", get(root))
         .route("/ui", get(ui))
         .route("/ui/assets/app.css", get(css))
         .route("/ui/assets/app.js", get(javascript))
@@ -42,6 +43,10 @@ pub fn dashboard_router(service: DashboardService, authenticator: BasicAuthentic
             },
         ))
         .layer(middleware::from_fn(security_headers))
+}
+
+async fn root() -> Redirect {
+    Redirect::temporary("/ui")
 }
 
 async fn ui(
