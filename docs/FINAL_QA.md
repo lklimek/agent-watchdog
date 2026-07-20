@@ -64,11 +64,34 @@ where repository evidence matched multiple active Claude mains; this is the
 required ambiguity-safe result. Identical Codex correlation outcomes logged
 once after startup rather than once per inotify-triggered reconciliation.
 
-The watcher reported the documented bounded-capacity degradation because both
-configured worktree prefixes exceed 4,096 directories within the scan depth.
-The service stayed ready and automatic termination remained suspended. Claude
-and Codex adapters also reported best-effort `UPGRADE` degradation for records
-outside the tested parser set; Companion remained healthy.
+The initial watcher reported bounded-capacity degradation because both configured
+worktree prefixes exceeded 4,096 directories within the scan depth. The later
+targeted watcher addendum below supersedes the interpretation of that result.
+Claude and Codex adapters also reported best-effort `UPGRADE` degradation for
+records outside the tested parser set; Companion remained healthy.
+
+## 2026-07-20 targeted watcher addendum
+
+The fresh QA4 Compose stack on port 8084 validated the runtime-first targeted
+watcher against the same read-only local mounts. The broad `/home/ubuntu/git`
+and `/data/git-worktrees` prefixes were not enumerated and could not consume the
+4,096 inotify-target budget. More than 4,096 ordinary Claude transcript/task
+files also did not consume directory-watch capacity because enumeration and
+inotify target budgets are now independent.
+
+After startup, debug evidence showed Codex invalidations reconciling Codex only,
+Claude invalidations reconciling Claude only, and Companion invalidations
+reconciling Companion only. Runtime bursts coalesce through lossless per-runtime
+request bits and a one-second window. The current Codex main for
+`/home/ubuntu/git/agent-watchdog` appeared as `running` with recent activity.
+
+Watcher health remained noncritical degraded for a different, actionable reason:
+several uniquely-owned active repositories exceed the bounded exact-worktree
+depth, elapsed, or target budget. Structured `watcher.coverage_incomplete` logs
+identify the worktree scope and stable reason without exposing a path. Two active
+Claude children sharing `/home/ubuntu/git/claudius` allocated no automatic
+worktree watch because changes there cannot identify one child. The server stayed
+ready and filesystem reconciliation stayed healthy.
 
 ### macOS build result pending CI
 

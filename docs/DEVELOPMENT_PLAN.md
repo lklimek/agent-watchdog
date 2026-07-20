@@ -570,3 +570,25 @@ Execute this increment in the normal TDD order:
 The existing production-like database is not rewritten or auto-pruned by this
 increment. Fresh-volume validation proves bootstrap behavior; operators may use
 the documented manual wipe for already-retained duplicate/history records.
+
+## 22. Targeted watcher corrective increment
+
+The 2026-07-20 live probe showed that broad worktree prefixes consumed the
+4,096-target budget before runtime roots, delaying a Codex `task_started` until
+a later global reconciliation. Every watched event also requested all three
+adapters, producing 180 reconciliation summaries in 15 minutes.
+
+Execute this increment in the normal TDD order:
+
+1. Add RED regressions T-EVD-011 through T-EVD-013.
+2. Separate configured capability prefixes from exact worktree watch targets.
+3. Allocate runtime-root watches before durable registered and ephemeral active-
+   child worktrees.
+4. Refresh ephemeral paths from nonterminal child metadata after discovery.
+5. Attach a typed adapter/worktree destination to every watch target and route
+   ordinary events without global reconciliation.
+6. Retain all-adapter reconciliation for startup, configuration changes,
+   overflow/uncertainty, and the five-minute recovery interval.
+7. Run focused watcher/server tests and strict Clippy, then rebuild a fresh live
+   Compose instance and confirm immediate Codex lifecycle updates plus quiet
+   adapter logs.

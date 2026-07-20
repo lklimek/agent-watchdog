@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     io::{Read as _, Write as _},
@@ -7,19 +7,22 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use axum::Router;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 use watchdog_domain::{AdapterIdentity, BoundedText, Clock as _, RuntimeKind, SecretText};
 use watchdog_runtime::{
-    CapabilityRoot, ComponentId, ComponentStatus, DirectoryScanner, ScanBudget, WatchService,
-    WatchSignal, WatchTargetId,
+    CapabilityRoot, ComponentId, ComponentStatus, DirectoryScanner, ScanBudget, ScanUncertainty,
+    WatchService, WatchSignal, WatchTargetId,
 };
 use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
 
@@ -41,13 +44,73 @@ use crate::{
 const MAX_ENV_PATH_BYTES: usize = 4_096;
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
 const WATCH_TARGET_LIMIT: usize = 4_096;
+const WATCH_SCAN_DEPTH: usize = 8;
+const WATCH_SCAN_ENTRY_LIMIT: usize = 65_536;
 const FILESYSTEM_ACTIVITY_QUEUE_CAPACITY: usize = 64;
 const MAX_GITHUB_SESSIONS: u32 = 1_000;
 const GITHUB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
 const NOTIFICATION_DELIVERY_LIMIT: u32 = 128;
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
+const DISCOVERY_EVENT_COALESCE: Duration = Duration::from_secs(1);
 const TIMER_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
+const CLAUDE_DISCOVERY_BIT: u8 = 1 << 0;
+const CODEX_DISCOVERY_BIT: u8 = 1 << 1;
+const COMPANION_DISCOVERY_BIT: u8 = 1 << 2;
+const ALL_DISCOVERY_BITS: u8 = CLAUDE_DISCOVERY_BIT | CODEX_DISCOVERY_BIT | COMPANION_DISCOVERY_BIT;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiscoveryRequest(u8);
+
+impl DiscoveryRequest {
+    const fn none() -> Self {
+        Self(0)
+    }
+
+    const fn all() -> Self {
+        Self(ALL_DISCOVERY_BITS)
+    }
+
+    const fn for_runtime(runtime: RuntimeKind) -> Self {
+        match runtime {
+            RuntimeKind::ClaudeCode => Self(CLAUDE_DISCOVERY_BIT),
+            RuntimeKind::CodexCli => Self(CODEX_DISCOVERY_BIT),
+            RuntimeKind::CodexCompanion => Self(COMPANION_DISCOVERY_BIT),
+            RuntimeKind::OpenCode => Self::none(),
+        }
+    }
+
+    const fn includes(self, runtime: RuntimeKind) -> bool {
+        self.0 & Self::for_runtime(runtime).0 != 0
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+#[derive(Clone, Default)]
+struct DiscoveryScheduler {
+    pending: Arc<AtomicU8>,
+    wake: Arc<Notify>,
+}
+
+impl DiscoveryScheduler {
+    fn request(&self, request: DiscoveryRequest) {
+        if !request.is_empty() {
+            self.pending.fetch_or(request.0, Ordering::AcqRel);
+            self.wake.notify_one();
+        }
+    }
+
+    fn take(&self) -> DiscoveryRequest {
+        DiscoveryRequest(self.pending.swap(0, Ordering::AcqRel))
+    }
+}
 
 /// Initialize structured JSON tracing using `RUST_LOG` or a safe info default.
 ///
@@ -164,16 +227,19 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         bootstrap.bearer_auth.clone(),
     );
 
-    let (reconcile_tx, reconcile_rx) = mpsc::channel(1);
+    let discovery = DiscoveryScheduler::default();
     let filesystem_uncertainty_generation = Arc::new(AtomicU64::new(0));
     let discovery_worker = start_discovery(
-        config.clone(),
         api.clone(),
-        store.clone(),
-        Arc::clone(&clock),
-        health.clone(),
-        reconcile_rx,
-        Arc::clone(&filesystem_uncertainty_generation),
+        DiscoveryWorkerContext {
+            config: config.clone(),
+            store: store.clone(),
+            clock: Arc::clone(&clock),
+            health: health.clone(),
+            requested: discovery.clone(),
+            filesystem_uncertainty_generation: Arc::clone(&filesystem_uncertainty_generation),
+            watch_paths: watch_paths.clone(),
+        },
     );
     let watcher_stop = Arc::new(AtomicBool::new(false));
     let (filesystem_activity_tx, filesystem_activity_worker) =
@@ -184,7 +250,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         config.clone(),
         health.clone(),
         Arc::clone(&watcher_stop),
-        reconcile_tx,
+        discovery,
         filesystem_activity_tx,
         filesystem_uncertainty_generation,
         watch_paths,
@@ -631,40 +697,34 @@ async fn reconcile_process_before_timers(monitor: &ProcessMonitor, health: &Heal
     }
 }
 
-fn start_discovery(
+struct DiscoveryWorkerContext {
     config: ConfigManager,
-    api: AgentApi,
     store: WatchdogStore,
     clock: Arc<SystemClock>,
     health: HealthService,
-    requested: mpsc::Receiver<()>,
+    requested: DiscoveryScheduler,
     filesystem_uncertainty_generation: Arc<AtomicU64>,
-) -> JoinHandle<()> {
+    watch_paths: WatchPathRegistry,
+}
+
+fn start_discovery(api: AgentApi, context: DiscoveryWorkerContext) -> JoinHandle<()> {
     let aliases = DiscoveryAliasRegistry::default();
     let discoveries = RuntimeDiscoveries {
         claude: ClaudeDiscovery::with_alias_registry(
             api.clone(),
-            store.clone(),
-            clock.clone(),
+            context.store.clone(),
+            context.clock.clone(),
             aliases.clone(),
         ),
-        codex: CodexDiscovery::new(api.clone(), store.clone(), clock.clone()),
+        codex: CodexDiscovery::new(api.clone(), context.store.clone(), context.clock.clone()),
         companion: CompanionDiscovery::with_alias_registry(
             api,
-            store.clone(),
-            clock.clone(),
+            context.store.clone(),
+            context.clock.clone(),
             aliases,
         ),
     };
-    spawn_discovery_worker(
-        config,
-        discoveries,
-        store,
-        clock,
-        health,
-        requested,
-        filesystem_uncertainty_generation,
-    )
+    spawn_discovery_worker(discoveries, context)
 }
 
 struct RuntimeDiscoveries {
@@ -674,30 +734,39 @@ struct RuntimeDiscoveries {
 }
 
 fn spawn_discovery_worker(
-    config: ConfigManager,
     discoveries: RuntimeDiscoveries,
-    store: WatchdogStore,
-    clock: Arc<SystemClock>,
-    health: HealthService,
-    mut requested: mpsc::Receiver<()>,
-    filesystem_uncertainty_generation: Arc<AtomicU64>,
+    context: DiscoveryWorkerContext,
 ) -> JoinHandle<()> {
+    let DiscoveryWorkerContext {
+        config,
+        store,
+        clock,
+        health,
+        requested,
+        filesystem_uncertainty_generation,
+        watch_paths,
+    } = context;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PERIODIC_RECONCILIATION);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                signal = requested.recv() => {
-                    if signal.is_none() {
-                        return;
-                    }
+            let request = tokio::select! {
+                _ = interval.tick() => {
+                    let _ = requested.take();
+                    DiscoveryRequest::all()
                 }
+                () = requested.wake.notified() => {
+                    tokio::time::sleep(DISCOVERY_EVENT_COALESCE).await;
+                    requested.take()
+                },
+            };
+            if request.is_empty() {
+                continue;
             }
             let reconciliation_generation =
                 filesystem_uncertainty_generation.load(Ordering::Acquire);
             let current = config.current();
-            if current.adapters().claude() {
+            if request.includes(RuntimeKind::ClaudeCode) && current.adapters().claude() {
                 let report = discoveries
                     .claude
                     .reconcile(
@@ -716,7 +785,7 @@ fn spawn_discovery_worker(
                 )
                 .await;
             }
-            if current.adapters().codex() {
+            if request.includes(RuntimeKind::CodexCli) && current.adapters().codex() {
                 let report = discoveries
                     .codex
                     .reconcile(
@@ -735,7 +804,7 @@ fn spawn_discovery_worker(
                 )
                 .await;
             }
-            if current.adapters().companion() {
+            if request.includes(RuntimeKind::CodexCompanion) && current.adapters().companion() {
                 let report = discoveries
                     .companion
                     .reconcile(current.companion_roots(), current.worktree_mappings())
@@ -749,6 +818,17 @@ fn spawn_discovery_worker(
                     report,
                 )
                 .await;
+            }
+            if watch_paths.refresh_active().await.is_err() {
+                health.record(
+                    ComponentId::Watcher,
+                    ComponentStatus::Degraded,
+                    Some("Active worktree watch paths could not be refreshed"),
+                );
+                tracing::warn!(
+                    event = "watcher.active_paths_refresh_failed",
+                    "Active worktree watch paths could not be refreshed"
+                );
             }
             mark_filesystem_reconciliation_complete(
                 &health,
@@ -820,7 +900,7 @@ async fn record_discovery_health(
             "Adapter health persistence failed"
         );
     } else {
-        tracing::info!(
+        tracing::debug!(
             event = "adapter.reconciled",
             runtime = runtime.as_str(),
             main_sessions = report.main_sessions(),
@@ -909,7 +989,7 @@ fn spawn_watcher_supervisor(
     config: ConfigManager,
     health: HealthService,
     stop: Arc<AtomicBool>,
-    reconcile: mpsc::Sender<()>,
+    discovery: DiscoveryScheduler,
     filesystem_activity: mpsc::Sender<Vec<PathBuf>>,
     filesystem_uncertainty_generation: Arc<AtomicU64>,
     watch_paths: WatchPathRegistry,
@@ -918,7 +998,7 @@ fn spawn_watcher_supervisor(
         let mut applied = config.current();
         let mut applied_watch_generation = watch_paths.generation();
         let mut watcher = build_watcher(&applied, &health, &watch_paths);
-        let _ = reconcile.try_send(());
+        discovery.request(DiscoveryRequest::all());
         while !stop.load(Ordering::Acquire) {
             let candidate = config.current();
             let watch_generation = watch_paths.generation();
@@ -926,7 +1006,7 @@ fn spawn_watcher_supervisor(
                 watcher = build_watcher(&candidate, &health, &watch_paths);
                 applied = candidate;
                 applied_watch_generation = watch_generation;
-                let _ = reconcile.try_send(());
+                discovery.request(DiscoveryRequest::all());
             }
             if let Some(signal) = watcher
                 .as_ref()
@@ -938,7 +1018,7 @@ fn spawn_watcher_supervisor(
                             watcher.as_ref(),
                             &targets,
                             &health,
-                            &reconcile,
+                            &discovery,
                             &filesystem_activity,
                             &filesystem_uncertainty_generation,
                         );
@@ -948,7 +1028,7 @@ fn spawn_watcher_supervisor(
                             watcher.as_ref(),
                             &targets,
                             &health,
-                            &reconcile,
+                            &discovery,
                             &filesystem_activity,
                             &filesystem_uncertainty_generation,
                         );
@@ -961,7 +1041,7 @@ fn spawn_watcher_supervisor(
                             ComponentStatus::Degraded,
                             Some("Filesystem events were lost; reconciliation is required"),
                         );
-                        let _ = reconcile.try_send(());
+                        discovery.request(DiscoveryRequest::all());
                     }
                 }
             }
@@ -974,18 +1054,19 @@ fn reconcile_watch_targets(
     watcher: Option<&WatchRegistry>,
     targets: &[WatchTargetId],
     health: &HealthService,
-    reconcile: &mpsc::Sender<()>,
+    discovery: &DiscoveryScheduler,
     filesystem_activity: &mpsc::Sender<Vec<PathBuf>>,
     filesystem_uncertainty_generation: &AtomicU64,
 ) {
-    let _ = reconcile.try_send(());
-    let paths = watcher.map_or_else(Vec::new, |registry| {
-        targets
-            .iter()
-            .filter_map(|target| registry.worktree_paths.get(target).cloned())
-            .collect()
+    let actions = watcher.map_or_else(WatchTargetActions::default, |registry| {
+        registry.routes.actions(targets)
     });
-    if !paths.is_empty() && filesystem_activity.try_send(paths).is_err() {
+    discovery.request(actions.discovery);
+    if !actions.worktree_paths.is_empty()
+        && filesystem_activity
+            .try_send(actions.worktree_paths)
+            .is_err()
+    {
         filesystem_uncertainty_generation.fetch_add(1, Ordering::AcqRel);
         health.record(
             ComponentId::FilesystemReconciliation,
@@ -1045,15 +1126,55 @@ fn spawn_filesystem_activity_worker(
     })
 }
 
+#[derive(Default)]
+struct WatchTargetRoutes {
+    runtimes: BTreeMap<WatchTargetId, RuntimeKind>,
+    worktree_paths: BTreeMap<WatchTargetId, PathBuf>,
+}
+
+impl WatchTargetRoutes {
+    fn actions(&self, targets: &[WatchTargetId]) -> WatchTargetActions {
+        let mut discovery = DiscoveryRequest::none();
+        let mut worktree_paths = BTreeSet::new();
+        for target in targets {
+            if let Some(runtime) = self.runtimes.get(target) {
+                discovery.insert(DiscoveryRequest::for_runtime(*runtime));
+            }
+            if let Some(path) = self.worktree_paths.get(target) {
+                worktree_paths.insert(path.clone());
+            }
+        }
+        WatchTargetActions {
+            discovery,
+            worktree_paths: worktree_paths.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WatchTargetActions {
+    discovery: DiscoveryRequest,
+    worktree_paths: Vec<PathBuf>,
+}
+
 struct WatchRegistry {
     service: WatchService,
-    worktree_paths: BTreeMap<WatchTargetId, PathBuf>,
+    routes: WatchTargetRoutes,
 }
 
 fn build_watcher(
     config: &RuntimeConfig,
     health: &HealthService,
     registered: &WatchPathRegistry,
+) -> Option<WatchRegistry> {
+    build_watcher_with_limit(config, health, registered, WATCH_TARGET_LIMIT)
+}
+
+fn build_watcher_with_limit(
+    config: &RuntimeConfig,
+    health: &HealthService,
+    registered: &WatchPathRegistry,
+    target_limit: usize,
 ) -> Option<WatchRegistry> {
     let Ok(mut watcher) = WatchService::new(WATCH_QUEUE_CAPACITY) else {
         health.record(
@@ -1063,43 +1184,64 @@ fn build_watcher(
         );
         return None;
     };
-    let mut roots = Vec::new();
-    roots.extend(
-        config
-            .allowed_worktree_roots()
-            .iter()
-            .cloned()
-            .map(|root| (root, true)),
-    );
-    roots.extend(
-        config
-            .claude_roots()
-            .iter()
-            .chain(config.codex_roots())
-            .chain(config.companion_roots())
-            .cloned()
-            .map(|root| (root, false)),
-    );
-    let Ok(scan_budget) = ScanBudget::new(4, WATCH_TARGET_LIMIT, 4 * 1_024 * 1_024) else {
+    let Ok(scan_budget) =
+        ScanBudget::new(WATCH_SCAN_DEPTH, WATCH_SCAN_ENTRY_LIMIT, 4 * 1_024 * 1_024)
+    else {
+        health.record(
+            ComponentId::Watcher,
+            ComponentStatus::Degraded,
+            Some("Filesystem watch target budget is invalid"),
+        );
         return None;
     };
     let scanner = DirectoryScanner::new(scan_budget);
     let mut next_target = 1_u64;
-    let mut worktree_paths = BTreeMap::new();
-    let mut degraded = add_registered_watch_paths(
+    let mut routes = WatchTargetRoutes::default();
+    let mut degraded = false;
+    let runtime_roots = [
+        (
+            config.adapters().claude(),
+            RuntimeKind::ClaudeCode,
+            config.claude_roots(),
+        ),
+        (
+            config.adapters().codex(),
+            RuntimeKind::CodexCli,
+            config.codex_roots(),
+        ),
+        (
+            config.adapters().companion(),
+            RuntimeKind::CodexCompanion,
+            config.companion_roots(),
+        ),
+    ];
+    for descendants_only in [false, true] {
+        for (enabled, runtime, roots) in runtime_roots {
+            if !enabled {
+                continue;
+            }
+            add_runtime_watch_paths(
+                &mut watcher,
+                config,
+                runtime,
+                roots,
+                &scanner,
+                target_limit,
+                descendants_only,
+                &mut next_target,
+                &mut routes,
+                &mut degraded,
+            );
+        }
+    }
+    add_exact_worktree_watch_paths(
         &mut watcher,
         config,
         registered,
-        &mut next_target,
-        &mut worktree_paths,
-    );
-    add_configured_watch_paths(
-        &mut watcher,
-        config,
-        roots,
         &scanner,
+        target_limit,
         &mut next_target,
-        &mut worktree_paths,
+        &mut routes,
         &mut degraded,
     );
     if degraded {
@@ -1113,96 +1255,57 @@ fn build_watcher(
     }
     Some(WatchRegistry {
         service: watcher,
-        worktree_paths,
+        routes,
     })
 }
 
-fn add_registered_watch_paths(
-    watcher: &mut WatchService,
-    config: &RuntimeConfig,
-    registered: &WatchPathRegistry,
-    next_target: &mut u64,
-    worktree_paths: &mut BTreeMap<WatchTargetId, PathBuf>,
-) -> bool {
-    let mut degraded = false;
-    match registered.projected_paths(config) {
-        Ok((paths, incomplete)) => {
-            degraded |= incomplete;
-            for (record, directory) in paths {
-                if usize::try_from(*next_target).map_or(true, |target| target > WATCH_TARGET_LIMIT)
-                {
-                    degraded = true;
-                    break;
-                }
-                let Some(mapping) = config
-                    .worktree_mappings()
-                    .iter()
-                    .filter(|mapping| directory.starts_with(mapping.mounted_root()))
-                    .max_by_key(|mapping| mapping.mounted_root().components().count())
-                else {
-                    degraded = true;
-                    continue;
-                };
-                let Ok(root) = CapabilityRoot::new(mapping.mounted_root()) else {
-                    degraded = true;
-                    continue;
-                };
-                let Ok(relative) = directory.strip_prefix(root.path()) else {
-                    degraded = true;
-                    continue;
-                };
-                let Ok(target) = WatchTargetId::new(*next_target) else {
-                    degraded = true;
-                    continue;
-                };
-                *next_target = (*next_target).saturating_add(1);
-                if watcher.add_target(target, &root, relative).is_err() {
-                    degraded = true;
-                    continue;
-                }
-                worktree_paths.insert(target, PathBuf::from(record.native_path()));
-            }
-        }
-        Err(_) => degraded = true,
-    }
-    degraded
-}
-
 #[allow(clippy::too_many_arguments)]
-fn add_configured_watch_paths(
+fn add_runtime_watch_paths(
     watcher: &mut WatchService,
     config: &RuntimeConfig,
-    roots: Vec<(PathBuf, bool)>,
+    runtime: RuntimeKind,
+    roots: &[PathBuf],
     scanner: &DirectoryScanner,
+    target_limit: usize,
+    descendants_only: bool,
     next_target: &mut u64,
-    worktree_paths: &mut BTreeMap<WatchTargetId, PathBuf>,
+    routes: &mut WatchTargetRoutes,
     degraded: &mut bool,
 ) {
     let exclusions = config.exclusions();
-    for (configured_root, is_worktree) in roots
-        .into_iter()
-        .filter(|(root, _)| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
+    for configured_root in roots
+        .iter()
+        .filter(|root| !exclusions.iter().any(|excluded| root.starts_with(excluded)))
     {
-        let Ok(root) = CapabilityRoot::new(configured_root) else {
+        let Ok(root) = CapabilityRoot::new(configured_root.clone()) else {
             *degraded = true;
+            log_runtime_watch_issue(runtime, "capability_root_rejected");
             continue;
         };
-        let scan = scanner.scan(&root, Path::new("."));
-        let directories = if let Ok(scan) = scan {
-            *degraded |= scan.uncertainty().is_some();
-            scan.directories().to_vec()
+        let candidates = if descendants_only {
+            let scan = scanner.scan(&root, Path::new("."));
+            if let Ok(scan) = scan {
+                if let Some(uncertainty) = scan.uncertainty() {
+                    *degraded = true;
+                    log_runtime_watch_issue(runtime, watch_uncertainty_code(uncertainty));
+                }
+                scan.directories().to_vec()
+            } else {
+                *degraded = true;
+                log_runtime_watch_issue(runtime, "scan_failed");
+                Vec::new()
+            }
         } else {
-            *degraded = true;
-            Vec::new()
+            vec![root.path().to_owned()]
         };
-        let candidates = std::iter::once(root.path().to_owned()).chain(directories);
-        for directory in candidates.filter(|directory| {
+        for directory in candidates.into_iter().filter(|directory| {
             !exclusions
                 .iter()
                 .any(|excluded| directory.starts_with(excluded))
         }) {
-            if usize::try_from(*next_target).map_or(true, |target| target > WATCH_TARGET_LIMIT) {
+            if target_budget_exhausted(*next_target, target_limit) {
                 *degraded = true;
+                log_runtime_watch_issue(runtime, "target_budget");
                 break;
             }
             let Ok(relative) = directory.strip_prefix(root.path()) else {
@@ -1217,15 +1320,142 @@ fn add_configured_watch_paths(
             };
             if watcher.add_target(target, &root, relative).is_err() {
                 *degraded = true;
+                log_runtime_watch_issue(runtime, "backend_rejected_target");
                 continue;
             }
-            if is_worktree
-                && let Some(native_path) =
-                    native_worktree_path(&directory, config.worktree_mappings())
-            {
-                worktree_paths.insert(target, native_path);
+            routes.runtimes.insert(target, runtime);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_exact_worktree_watch_paths(
+    watcher: &mut WatchService,
+    config: &RuntimeConfig,
+    registered: &WatchPathRegistry,
+    scanner: &DirectoryScanner,
+    target_limit: usize,
+    next_target: &mut u64,
+    routes: &mut WatchTargetRoutes,
+    degraded: &mut bool,
+) {
+    let Ok((paths, incomplete)) = registered.projected_paths(config) else {
+        *degraded = true;
+        log_worktree_watch_issue("registry_unavailable");
+        return;
+    };
+    *degraded |= incomplete;
+    if incomplete {
+        log_worktree_watch_issue("projection_incomplete");
+    }
+    for projected in paths {
+        if target_budget_exhausted(*next_target, target_limit) {
+            *degraded = true;
+            log_worktree_watch_issue("target_budget");
+            break;
+        }
+        let directory = projected.mounted_path();
+        let Some(mapping) = config
+            .worktree_mappings()
+            .iter()
+            .filter(|mapping| directory.starts_with(mapping.mounted_root()))
+            .max_by_key(|mapping| mapping.mounted_root().components().count())
+        else {
+            *degraded = true;
+            log_worktree_watch_issue("mapping_unavailable");
+            continue;
+        };
+        let Ok(root) = CapabilityRoot::new(mapping.mounted_root()) else {
+            *degraded = true;
+            log_worktree_watch_issue("capability_root_rejected");
+            continue;
+        };
+        let Ok(relative) = directory.strip_prefix(root.path()) else {
+            *degraded = true;
+            continue;
+        };
+        let scan = scanner.scan(&root, relative);
+        let directories = if let Ok(scan) = scan {
+            if let Some(uncertainty) = scan.uncertainty() {
+                *degraded = true;
+                log_worktree_watch_issue(watch_uncertainty_code(uncertainty));
+            }
+            scan.directories().to_vec()
+        } else {
+            *degraded = true;
+            log_worktree_watch_issue("scan_failed");
+            Vec::new()
+        };
+        let candidates = std::iter::once(directory.to_path_buf()).chain(directories);
+        for candidate in candidates.filter(|candidate| {
+            !config
+                .exclusions()
+                .iter()
+                .any(|excluded| candidate.starts_with(excluded))
+        }) {
+            if target_budget_exhausted(*next_target, target_limit) {
+                *degraded = true;
+                log_worktree_watch_issue("target_budget");
+                break;
+            }
+            let Ok(relative) = candidate.strip_prefix(root.path()) else {
+                *degraded = true;
+                continue;
+            };
+            let Ok(target) = WatchTargetId::new(*next_target) else {
+                *degraded = true;
+                continue;
+            };
+            *next_target = (*next_target).saturating_add(1);
+            if watcher.add_target(target, &root, relative).is_err() {
+                *degraded = true;
+                log_worktree_watch_issue("backend_rejected_target");
+                continue;
+            }
+            let native_path = if candidate == directory {
+                Some(PathBuf::from(projected.native_path()))
+            } else {
+                native_worktree_path(&candidate, config.worktree_mappings())
+            };
+            if let Some(native_path) = native_path {
+                routes.worktree_paths.insert(target, native_path);
+            } else {
+                *degraded = true;
             }
         }
+    }
+}
+
+fn target_budget_exhausted(next_target: u64, target_limit: usize) -> bool {
+    usize::try_from(next_target).map_or(true, |target| target > target_limit)
+}
+
+fn log_runtime_watch_issue(runtime: RuntimeKind, reason: &'static str) {
+    tracing::warn!(
+        event = "watcher.coverage_incomplete",
+        scope = "runtime",
+        runtime = runtime.as_str(),
+        reason,
+        "Runtime watch coverage is incomplete"
+    );
+}
+
+fn log_worktree_watch_issue(reason: &'static str) {
+    tracing::warn!(
+        event = "watcher.coverage_incomplete",
+        scope = "worktree",
+        reason,
+        "Exact worktree watch coverage is incomplete"
+    );
+}
+
+const fn watch_uncertainty_code(uncertainty: ScanUncertainty) -> &'static str {
+    match uncertainty {
+        ScanUncertainty::DepthBudget => "depth_budget",
+        ScanUncertainty::EntryBudget => "entry_budget",
+        ScanUncertainty::PathByteBudget => "path_byte_budget",
+        ScanUncertainty::TimeBudget => "time_budget",
+        ScanUncertainty::PathRace => "path_race",
     }
 }
 
@@ -1233,10 +1463,17 @@ fn native_worktree_path(
     mounted_path: &Path,
     mappings: &[crate::WorktreePathMapping],
 ) -> Option<PathBuf> {
-    mappings.iter().find_map(|mapping| {
-        let relative = mounted_path.strip_prefix(mapping.mounted_root()).ok()?;
-        Some(mapping.native_root().join(relative))
-    })
+    mappings
+        .iter()
+        .filter_map(|mapping| {
+            let relative = mounted_path.strip_prefix(mapping.mounted_root()).ok()?;
+            Some((
+                mapping.mounted_root().components().count(),
+                mapping.native_root().join(relative),
+            ))
+        })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, path)| path)
 }
 
 async fn shutdown_signal() {
@@ -1433,7 +1670,7 @@ impl ServerError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         ffi::OsString,
         io::{Read as _, Write as _},
         net::TcpListener,
@@ -1445,15 +1682,16 @@ mod tests {
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use watchdog_domain::{TimePoint, WallTimeMs};
+    use watchdog_domain::{RuntimeKind, TimePoint, WallTimeMs};
     use watchdog_runtime::{ComponentId, ComponentStatus};
     use watchdog_testkit::FakeClock;
 
     use super::{
-        BootstrapConfig, check_liveness, mark_filesystem_reconciliation_complete,
+        BootstrapConfig, ConfigManager, DiscoveryRequest, WatchTargetRoutes,
+        build_watcher_with_limit, check_liveness, mark_filesystem_reconciliation_complete,
         native_worktree_path,
     };
-    use crate::HealthService;
+    use crate::{HealthService, watch_paths::WatchPathRegistry};
 
     #[test]
     fn internal_healthcheck_accepts_only_a_successful_liveness_response() {
@@ -1559,6 +1797,126 @@ mod tests {
         mark_filesystem_reconciliation_complete(&health, &generation, 2);
         assert_eq!(
             health.component_status(ComponentId::FilesystemReconciliation),
+            Some(ComponentStatus::Healthy)
+        );
+    }
+
+    #[test]
+    fn watch_targets_route_only_to_the_affected_runtime_or_worktree() {
+        let codex = watchdog_runtime::WatchTargetId::new(1).expect("valid Codex target");
+        let worktree = watchdog_runtime::WatchTargetId::new(2).expect("valid worktree target");
+        let routes = WatchTargetRoutes {
+            runtimes: BTreeMap::from([(codex, RuntimeKind::CodexCli)]),
+            worktree_paths: BTreeMap::from([(
+                worktree,
+                std::path::PathBuf::from("/host/repository"),
+            )]),
+        };
+
+        let codex_actions = routes.actions(&[codex]);
+        assert_eq!(
+            codex_actions.discovery,
+            DiscoveryRequest::for_runtime(RuntimeKind::CodexCli)
+        );
+        assert!(codex_actions.worktree_paths.is_empty());
+
+        let worktree_actions = routes.actions(&[worktree]);
+        assert_eq!(worktree_actions.discovery, DiscoveryRequest::none());
+        assert_eq!(
+            worktree_actions.worktree_paths,
+            vec![std::path::PathBuf::from("/host/repository")]
+        );
+    }
+
+    #[test]
+    fn discovery_scheduler_coalesces_runtime_requests_without_losing_a_runtime() {
+        let scheduler = super::DiscoveryScheduler::default();
+        scheduler.request(DiscoveryRequest::for_runtime(RuntimeKind::ClaudeCode));
+        scheduler.request(DiscoveryRequest::for_runtime(RuntimeKind::CodexCli));
+
+        let request = scheduler.take();
+        assert!(request.includes(RuntimeKind::ClaudeCode));
+        assert!(request.includes(RuntimeKind::CodexCli));
+        assert!(!request.includes(RuntimeKind::CodexCompanion));
+        assert_eq!(scheduler.take(), DiscoveryRequest::none());
+    }
+
+    #[tokio::test]
+    async fn broad_worktree_allowlist_cannot_starve_runtime_watch_roots() {
+        let fixture = tempfile::tempdir().expect("fixture root should exist");
+        let worktrees = fixture.path().join("worktrees");
+        let claude = fixture.path().join("claude");
+        let codex = fixture.path().join("codex");
+        let companion = fixture.path().join("companion");
+        for path in [&worktrees, &claude, &codex, &companion] {
+            std::fs::create_dir(path).expect("watch root should exist");
+        }
+        for index in 0..16 {
+            std::fs::create_dir(worktrees.join(format!("repository-{index}")))
+                .expect("broad worktree fixture should exist");
+            std::fs::write(claude.join(format!("transcript-{index}.jsonl")), "fixture")
+                .expect("runtime file fixture should exist");
+        }
+        let config_path = fixture.path().join("watchdog.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[paths]
+allowed_worktree_roots = ["{}"]
+native_worktree_roots = ["/host/repositories"]
+claude_roots = ["{}"]
+codex_roots = ["{}"]
+companion_roots = ["{}"]
+exclusions = []
+
+[adapters]
+claude = true
+codex = true
+companion = true
+
+[github]
+enabled = false
+
+[termination]
+automation_enabled = false
+sigkill_enabled = false
+"#,
+                worktrees.display(),
+                claude.display(),
+                codex.display(),
+                companion.display(),
+            ),
+        )
+        .expect("config should write");
+        let config = ConfigManager::load(&config_path).expect("config should load");
+        let store = watchdog_store::WatchdogStore::open(&fixture.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(WallTimeMs::new(100), 100)));
+        let watch_paths = WatchPathRegistry::load(store, clock.clone(), config.clone())
+            .await
+            .expect("watch paths should load");
+        let health = HealthService::new(clock);
+
+        let watcher = build_watcher_with_limit(&config.current(), &health, &watch_paths, 3)
+            .expect("runtime roots should fit exactly");
+        assert_eq!(watcher.routes.runtimes.len(), 3);
+        assert_eq!(
+            watcher
+                .routes
+                .runtimes
+                .values()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                RuntimeKind::ClaudeCode,
+                RuntimeKind::CodexCli,
+                RuntimeKind::CodexCompanion,
+            ])
+        );
+        assert!(watcher.routes.worktree_paths.is_empty());
+        assert_eq!(
+            health.component_status(ComponentId::Watcher),
             Some(ComponentStatus::Healthy)
         );
     }

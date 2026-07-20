@@ -40,7 +40,6 @@ impl AdapterConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeConfig {
-    allowed_worktree_roots: Vec<PathBuf>,
     worktree_mappings: Vec<WorktreePathMapping>,
     claude_roots: Vec<PathBuf>,
     claude_path_mappings: Vec<WorktreePathMapping>,
@@ -60,10 +59,6 @@ pub(crate) struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub(crate) fn allowed_worktree_roots(&self) -> &[PathBuf] {
-        &self.allowed_worktree_roots
-    }
-
     pub(crate) fn worktree_mappings(&self) -> &[WorktreePathMapping] {
         &self.worktree_mappings
     }
@@ -281,7 +276,6 @@ impl RawConfig {
             DeadlinePolicy::new(stalled_after, terminate_after_stalled, action_grace)?;
 
         Ok(RuntimeConfig {
-            allowed_worktree_roots,
             worktree_mappings,
             claude_roots,
             claude_path_mappings,
@@ -528,10 +522,6 @@ mod tests {
         let manager = ConfigManager::load(&fixture.config_path).expect("valid configuration");
         let config = manager.current();
 
-        assert_eq!(
-            config.allowed_worktree_roots(),
-            [fixture.worktrees.as_path()]
-        );
         assert_eq!(
             config.worktree_mappings()[0].native_root(),
             std::path::Path::new("/host/repositories")

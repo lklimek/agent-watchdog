@@ -75,3 +75,27 @@ The prior Python watchdog was intentionally treated only as requirements
 evidence. Its deferred knowledge-transfer audit is recorded in
 `spikes/claudius-knowledge-transfer-audit.md`; the Rust implementation was
 checked against those pitfalls only during final QA, as requested.
+
+## Separate capabilities, watch targets, and event destinations
+
+- Configured worktree prefixes are read capabilities, not requests to recursively
+  watch every repository below them. Enumerating a broad prefix before runtime
+  roots can consume every inotify target and delay lifecycle evidence until the
+  periodic fallback.
+- Linux inotify has no recursive directory mark for this unprivileged container,
+  so runtime roots and exact worktrees require bounded existing-directory
+  enumeration once at watcher construction and again only after topology or
+  target-registry changes. Ordinary file appends do not rebuild the registry.
+- Enumeration entries and inotify directory targets need separate limits.
+  Thousands of transcript files must be inspected while finding directories but
+  do not themselves consume watch targets.
+- Watch targets carry typed destinations. Runtime changes request only the owning
+  adapter; worktree changes request only ownership attribution; overflow,
+  startup, configuration changes, and the five-minute fallback may request all
+  adapters. Atomic runtime bits plus a one-second window coalesce append bursts
+  without losing a different runtime's request.
+- An automatic active-worktree watch requires exactly one active child owner.
+  Shared worktrees cannot identify one child and are omitted unless a narrower
+  durable MCP registration supplies exact ownership. Oversized exact unique
+  worktrees remain actionable bounded-coverage degradation rather than silently
+  claiming complete filesystem evidence.

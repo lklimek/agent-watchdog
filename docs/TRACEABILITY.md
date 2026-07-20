@@ -42,6 +42,8 @@ not accepted deferrals.
 | FR-EVD-009 | T-CPU-009, T-EVD-004, T-EVD-010 | Provenance-aware reducer conflict state, watcher degradation, process-race containment | Automated |
 | FR-EVD-010 | T-CPU-001–005, T-CPU-007 | Four `/proc` CPU counters, prior-snapshot delta model, strong/neutral/uncertain tests | Automated |
 | FR-EVD-011 | T-UI-011 | Runtime-labelled page degradation warnings | Automated and browser-verified |
+| FR-EVD-012 | T-EVD-011, T-EVD-013, T-EVD-014 | Runtime-first watch allocation plus ephemeral uniquely-owned active-child and durable registered exact paths | Automated; live Compose validation pending |
+| FR-EVD-013 | T-EVD-012 | Typed watch destinations and lossless coalesced adapter-specific discovery requests | Automated; live Compose validation pending |
 
 ## State, termination, and agent API
 

@@ -170,27 +170,39 @@ impl WatchdogStore {
         .bind(session.session_id().to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
-            let pull_request_number: Option<i64> = row.try_get("pull_request_number")?;
-            let pull_request_number = pull_request_number
-                .map(|value| {
-                    u64::try_from(value)
-                        .map_err(|_| StoreError::CorruptValue("invalid pull request number"))
-                })
-                .transpose()?;
-            SessionMetadataRecord::new(
-                session,
-                row.try_get("title")?,
-                row.try_get("startup_directory")?,
-                row.try_get("repository_remote")?,
-                row.try_get("branch")?,
-                pull_request_number,
-                row.try_get("pull_request_url")?,
-                watchdog_domain::WallTimeMs::new(row.try_get("updated_at_ms")?),
-            )
-            .map_err(|_| StoreError::CorruptValue("invalid session metadata"))
-        })
-        .transpose()
+        row.map(|row| decode_session_metadata(&row, session))
+            .transpose()
+    }
+
+    /// Load bounded metadata for nonterminal child sessions in one snapshot query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an invalid limit, corrupt identity/metadata,
+    /// or `SQLite` failure.
+    pub async fn active_child_metadata(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<SessionMetadataRecord>, StoreError> {
+        validate_limit(limit)?;
+        let rows = sqlx::query(
+            "SELECT s.session_id, s.kind, s.root_session_id, s.runtime, s.native_id, \
+             s.title, s.startup_directory, s.repository_remote, s.branch, \
+             s.pull_request_number, s.pull_request_url, s.updated_at_ms \
+             FROM sessions s JOIN session_snapshots ss ON ss.session_id = s.session_id \
+             WHERE s.kind = 'child' AND s.startup_directory IS NOT NULL \
+             AND ss.detailed_state NOT IN ('completed', 'failed', 'cancelled', 'disappeared') \
+             ORDER BY s.created_at_ms, s.session_id LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let session = decode_session_row(row, None)?.session;
+                decode_session_metadata(row, session)
+            })
+            .collect()
     }
 
     /// Load stable native identity and tree placement for one session.
@@ -874,6 +886,30 @@ fn decode_session_row(
         root: MainSessionId::from(root_id),
         native,
     })
+}
+
+fn decode_session_metadata(
+    row: &sqlx::sqlite::SqliteRow,
+    session: SessionIdentity,
+) -> Result<SessionMetadataRecord, StoreError> {
+    let pull_request_number: Option<i64> = row.try_get("pull_request_number")?;
+    let pull_request_number = pull_request_number
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::CorruptValue("invalid pull request number"))
+        })
+        .transpose()?;
+    SessionMetadataRecord::new(
+        session,
+        row.try_get("title")?,
+        row.try_get("startup_directory")?,
+        row.try_get("repository_remote")?,
+        row.try_get("branch")?,
+        pull_request_number,
+        row.try_get("pull_request_url")?,
+        watchdog_domain::WallTimeMs::new(row.try_get("updated_at_ms")?),
+    )
+    .map_err(|_| StoreError::CorruptValue("invalid session metadata"))
 }
 
 fn load_json_rows<T: serde::de::DeserializeOwned>(
