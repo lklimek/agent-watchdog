@@ -8,14 +8,15 @@ remain normative.
 ## Repository state
 
 - Working branch: `feat/implementation`.
-- Latest committed checkpoint before the final-QA slice:
-  `6504412 docs: record production capacity gates`.
+- Latest corrective implementation commit:
+  `9fccb9c fix(runtime): reconcile live agent lifecycle and hierarchy`.
 - No implementation commits in this phase have been pushed. Pushing remains an
   explicit user decision; never push implicitly or directly to `main`.
-- The final-QA slice includes a Companion ownership correction, release-license
-  packaging, a build-only macOS CI job, final evidence, and handoff documents.
-- Implementation, Linux final QA, self-review, and lessons learned are complete.
-  Only the explicitly external closure items listed below remain.
+- The 2026-07-20 corrective slice fixes live Claude/Codex/Companion identity,
+  hierarchy, bootstrap lifecycle, deployment-path, warning-label, and log-noise
+  defects found by an owner-authorized probe of local runtime state.
+- Implementation and automated Linux verification are complete and saved in a
+  local commit. Pushing remains an explicit user decision.
 - macOS runtime compatibility remains unsupported; only the end-of-project
   build-only CI claim was added.
 
@@ -48,6 +49,14 @@ remain normative.
 
 ## Latest integration-hardening slices
 
+- `9fccb9c`: typed Codex start/complete records;
+  inactive Claude member completion; recent-only team bootstrap; retained-lead
+  transcript aliasing; unique Claude-origin Codex parent inference; shared
+  Claude/Companion aliases; recent-only terminal Companion bootstrap; bounded
+  first-seen Codex lifecycle tail recovery; runtime-labelled UI warnings; the
+  current Companion state path; an additional concrete agent-worktree mount;
+  and bounded change-only Codex correlation logging.
+
 - `abe0242`: explicit 50-main/500-session restart soak (ten reopen/reconcile
   cycles) added to the production-service load target.
 - `21bf7a0`: hanging webhook gate proves the five-second production timeout does
@@ -74,6 +83,12 @@ remain normative.
   functional gaps.
 
 ## Verification already completed
+
+- After `9fccb9c`, `cargo fmt --all -- --check`, full workspace/all-target/all-
+  feature tests, strict workspace Clippy with warnings denied, `docker compose
+  config --quiet`, and `git diff --check` all passed. Release-only load and
+  slow-webhook tests remained explicitly ignored in the default workspace run;
+  their prior release-gate results remain recorded below.
 
 - Exact Playwright binary:
   `/home/ubuntu/.nvm/versions/node/v22.23.1/bin/playwright`.
@@ -126,6 +141,25 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
 
 ## QA environments and evidence
 
+- The product owner explicitly authorized a read-only live probe of existing
+  local Codex, Claude, and Companion runtime state on 2026-07-20. This overrides
+  the earlier no-operator-state constraint only for this corrective probe; the
+  formal repeatable live matrix still requires disposable roots.
+- A fresh-volume `agent-watchdog-qa3` stack on port 8083 discovered seven main
+  cards. SQLite inspection confirmed three Claude-originated Codex CLI threads
+  attached to the correct Claude roots, including one using a
+  `/data/git-worktrees` startup directory. The retained standalone worktree
+  rollout remained separate because multiple active Claude mains matched its
+  repository, as required by the ambiguity policy.
+- The fresh stack recovered terminal child counts, did not recreate the
+  post-reset team lead as a duplicate main, kept Companion under aliased Claude
+  members, and emitted each unchanged Codex parent-selection/ambiguity outcome
+  once across repeated reconciliations.
+- The live host's `/home/ubuntu/git` and `/data/git-worktrees` prefixes each
+  contain more directories within depth four than the 4,096-target safety cap.
+  Watcher health therefore degrades visibly and termination remains suspended;
+  this is the specified bounded behavior, not silent full-prefix coverage.
+
 - The earlier Compose/Playwright scratch environment beneath
   `/data/tmp/agent-watchdog-compose-qa` did not survive the host reboot. Its
   durable screenshots/results remain under the artifact path below; recreate
@@ -170,9 +204,9 @@ CLAUDIUS_CACHE_DIR=/data/tmp/agent-watchdog-claudius-cache \
 
 ## Remaining external closure work
 
-1. Run the explicitly isolated live-runtime matrix only if a disposable
-   credentialed runtime environment is supplied. Never inspect existing user
-   sessions; otherwise retain the recorded not-run release limitation.
+1. Run the formal isolated live-runtime matrix if a disposable credentialed
+   runtime environment is supplied. The owner-authorized 2026-07-20 corrective
+   probe supplies real hierarchy evidence but is not a repeatable isolated test.
 2. Obtain an actual macOS CI result after the branch is pushed; the Linux
    cross-check cannot compile bundled SQLite without an Apple SDK.
 3. Stop for the user's explicit push decision. Never push implicitly or
