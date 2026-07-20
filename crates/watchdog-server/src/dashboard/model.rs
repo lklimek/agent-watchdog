@@ -77,6 +77,8 @@ pub struct DashboardCard {
     pub state: DetailedState,
     /// Main session's own compact state.
     pub compact_state: CompactState,
+    /// Whether this card belongs in the default active-session projection.
+    pub in_active_scope: bool,
     /// Latest trustworthy activity wall time.
     pub last_activity_ms: i64,
     /// Child counts by compact status; children never become top-level cards.
@@ -148,11 +150,9 @@ impl DashboardService {
                 .await?
                 .ok_or(DashboardError::MissingSnapshot)?;
             let reducer = snapshot.reducer_snapshot();
-            if query.scope == DashboardScope::Active
-                && (terminal(snapshot.state())
-                    || reducer
-                        .is_some_and(watchdog_domain::SessionSnapshot::reconciliation_required))
-            {
+            let in_active_scope = !terminal(snapshot.state())
+                && !reducer.is_some_and(watchdog_domain::SessionSnapshot::reconciliation_required);
+            if query.scope == DashboardScope::Active && !in_active_scope {
                 continue;
             }
             let metadata = self.store.session_metadata(main.session).await?;
@@ -216,6 +216,7 @@ impl DashboardService {
                     .map(ToOwned::to_owned),
                 state: snapshot.state(),
                 compact_state: snapshot.state().compact(),
+                in_active_scope,
                 last_activity_ms,
                 child_counts,
                 warning,

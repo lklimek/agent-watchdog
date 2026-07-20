@@ -19,6 +19,7 @@ interface Card {
   pull_request_url: string | null;
   state: DetailedState;
   compact_state: CompactState;
+  in_active_scope: boolean;
   last_activity_ms: number;
   child_counts: Partial<Record<CompactState, number>>;
   warning: Warning | null;
@@ -100,7 +101,7 @@ function render(): void {
   if (latest === null) return;
   const scope = selectedScope();
   const sort = selectedSort();
-  const cards = latest.sessions.filter((card) => scope === "all" || !isTerminal(card.state));
+  const cards = latest.sessions.filter((card) => scope === "all" || card.in_active_scope);
   cards.sort((left, right) => compareCards(left, right, sort));
   sessionList.replaceChildren(...(cards.length > 0 ? cards.map(createCard) : [createEmpty(scope)]));
   sessionList.dataset.revision = String(latest.revision);
@@ -242,6 +243,7 @@ function isCard(value: unknown): value is Card {
     && optionalString(candidate.pull_request_url)
     && detailedStates.has(candidate.state)
     && compactStates.has(candidate.compact_state)
+    && typeof candidate.in_active_scope === "boolean"
     && typeof candidate.last_activity_ms === "number"
     && isChildCounts(candidate.child_counts)
     && isWarning(candidate.warning);
@@ -316,10 +318,6 @@ function attentionRank(state: CompactState): number {
   if (state === "waiting" || state === "stalled") return 0;
   if (state === "idle") return 1;
   return 2;
-}
-
-function isTerminal(state: DetailedState): boolean {
-  return state === "completed" || state === "failed" || state === "cancelled" || state === "disappeared";
 }
 
 function humanEvent(state: DetailedState): boolean {
