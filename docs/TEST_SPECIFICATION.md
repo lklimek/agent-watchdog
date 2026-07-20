@@ -105,6 +105,10 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-EVD-008 | Multiple children share a worktree; attribution is absent. | No child activity clock advances. | FR-EVD-006 |
 | T-EVD-009 | Multiple children share a worktree; one process has attributable file evidence. | Only that child advances. | FR-EVD-006 |
 | T-EVD-010 | Filesystem and authoritative native state materially disagree. | Session becomes unknown and termination is suspended. | FR-EVD-009 |
+| T-EVD-011 | An allowed worktree prefix exceeds the global watch-target cap while each runtime root has few directories but may have more transcript files than that cap. | Runtime directories are watched first and an appended Codex lifecycle record schedules Codex reconciliation without waiting for periodic recovery; ordinary files do not consume directory-watch capacity; the broad prefix is not recursively enumerated. | FR-EVD-001, FR-EVD-008, FR-EVD-012 |
+| T-EVD-012 | Emit one Codex target event and one exact worktree target event. | The Codex event requests only Codex discovery; the worktree event requests only filesystem attribution. Overflow still requests all adapters. | FR-EVD-003, FR-EVD-013 |
+| T-EVD-013 | Discovery adds an active child with a validated worktree, then the child becomes terminal. | The exact worktree and its bounded existing subdirectories gain watches while active and are removed from the ephemeral watch set after terminal reconciliation. | FR-DIS-007, FR-EVD-005, FR-EVD-012 |
+| T-EVD-014 | Two active children advertise the same worktree without a narrower MCP registration. | The shared worktree is omitted from automatic watch targets because its events cannot identify one child. | FR-EVD-006, FR-EVD-012 |
 
 ### 5.3 Process and CPU evidence
 

@@ -8,15 +8,16 @@ remain normative.
 ## Repository state
 
 - Working branch: `feat/implementation`.
-- Latest corrective implementation commit:
-  `9fccb9c fix(runtime): reconcile live agent lifecycle and hierarchy`.
+- Latest saved runtime corrective implementation commit before this watcher
+  increment: `9fccb9c fix(runtime): reconcile live agent lifecycle and hierarchy`.
 - No implementation commits in this phase have been pushed. Pushing remains an
   explicit user decision; never push implicitly or directly to `main`.
 - The 2026-07-20 corrective slice fixes live Claude/Codex/Companion identity,
   hierarchy, bootstrap lifecycle, deployment-path, warning-label, and log-noise
   defects found by an owner-authorized probe of local runtime state.
-- Implementation and automated Linux verification are complete and saved in a
-  local commit. Pushing remains an explicit user decision.
+- The targeted watcher corrective increment is implemented and Linux-verified.
+  Inspect the current branch HEAD and working tree before continuing. Pushing
+  remains an explicit user decision.
 - macOS runtime compatibility remains unsupported; only the end-of-project
   build-only CI claim was added.
 
@@ -48,6 +49,16 @@ remain normative.
   enhancements.
 
 ## Latest integration-hardening slices
+
+- 2026-07-20 watcher corrective increment: broad worktree roots are capability
+  allowlists rather than recursive watch requests; runtime roots receive target
+  priority; durable MCP and uniquely-owned active child paths supply exact
+  bounded worktree watches; shared worktrees are omitted; typed target routing
+  runs only the affected adapter or filesystem attribution; lossless atomic
+  request bits and a one-second event window coalesce bursts; enumeration and
+  inotify target budgets are independent; active child paths refresh through one
+  bounded nonterminal-session query; structured degradation logs report scope
+  and bounded reason without paths.
 
 - `9fccb9c`: typed Codex start/complete records;
   inactive Claude member completion; recent-only team bootstrap; retained-lead
@@ -83,6 +94,20 @@ remain normative.
   functional gaps.
 
 ## Verification already completed
+
+- The watcher increment passed all `watchdog-server` tests (release-only load and
+  slow-peer cases remained intentionally ignored), strict all-target/all-feature
+  Clippy, formatting, `git diff --check`, and `docker compose config --quiet`.
+  The final release image built and ran in the fresh QA4 Compose stack on port
+  8084. Runtime-root events updated the current Codex main to `running` and debug
+  evidence showed post-startup events routed to their owning runtime rather than
+  all adapters.
+- QA4 proved that the two broad worktree prefixes no longer consume watch
+  targets. Watcher degradation that remains on this live host is scoped to exact
+  uniquely-owned active repositories and logs `depth_budget`, `time_budget`, or
+  `target_budget`; this is actionable bounded-coverage behavior, not a prefix
+  crawl. Two active Claude children sharing `/home/ubuntu/git/claudius` did not
+  allocate an automatic filesystem target.
 
 - After `9fccb9c`, `cargo fmt --all -- --check`, full workspace/all-target/all-
   feature tests, strict workspace Clippy with warnings denied, `docker compose

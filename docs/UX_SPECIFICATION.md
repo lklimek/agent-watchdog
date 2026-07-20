@@ -208,6 +208,12 @@ Prepare release
 - The accessible badge description states which watchdog adapter needs an update.
 - Best-effort state continues to render.
 - MCP includes the full warning field so the parent can tell the operator what failed.
+- A broad configured worktree allowlist does not by itself produce a degraded
+  watcher badge. Watcher degradation means a runtime root or exact uniquely-owned
+  active/registered worktree lacks bounded coverage, so the warning remains
+  actionable. A shared active worktree is intentionally omitted, not degraded.
+- Runtime lifecycle updates should appear after the owning inotify event; the UI
+  must not normally wait for the five-minute recovery scan.
 
 ## 10. Empty, loading, and error states
 

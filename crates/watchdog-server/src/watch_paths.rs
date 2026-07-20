@@ -14,6 +14,7 @@ use watchdog_store::{RegisteredWatchPathRecord, StoreError, WatchdogStore};
 use crate::config::{ConfigManager, RuntimeConfig};
 
 const MAX_REGISTERED_WATCH_PATHS: u32 = 4_096;
+const MAX_ACTIVE_WATCH_PATHS: u32 = 4_096;
 
 /// Durable agent-registered paths shared with the filesystem watcher.
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub(crate) struct WatchPathRegistry {
     clock: Arc<dyn Clock>,
     config: ConfigManager,
     records: Arc<RwLock<BTreeMap<(SessionId, String), RegisteredWatchPathRecord>>>,
+    active: Arc<RwLock<BTreeMap<SessionId, String>>>,
     registration: Arc<tokio::sync::Mutex<()>>,
     generation: Arc<AtomicU64>,
 }
@@ -55,6 +57,7 @@ impl WatchPathRegistry {
             clock,
             config,
             records: Arc::new(RwLock::new(records)),
+            active: Arc::new(RwLock::new(BTreeMap::new())),
             registration: Arc::new(tokio::sync::Mutex::new(())),
             generation: Arc::new(AtomicU64::new(1)),
         })
@@ -128,20 +131,93 @@ impl WatchPathRegistry {
         self.generation.load(Ordering::Acquire)
     }
 
+    pub(crate) async fn refresh_active(&self) -> Result<(), WatchPathError> {
+        let sessions = self
+            .store
+            .active_child_metadata(MAX_ACTIVE_WATCH_PATHS.saturating_add(1))
+            .await?;
+        if sessions.len() > MAX_ACTIVE_WATCH_PATHS as usize {
+            return Err(WatchPathError::Capacity);
+        }
+        let mut candidates = BTreeMap::new();
+        for metadata in sessions {
+            let Some(path) = metadata.startup_directory() else {
+                continue;
+            };
+            if concrete_native_path(Path::new(path)) {
+                candidates.insert(metadata.session().session_id(), path.to_owned());
+            }
+        }
+        let mut ownership_counts = BTreeMap::<String, usize>::new();
+        for path in candidates.values() {
+            let count = ownership_counts.entry(path.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        let refreshed = candidates
+            .into_iter()
+            .filter(|(_, path)| ownership_counts.get(path) == Some(&1))
+            .collect();
+        let mut active = self.active.write().map_err(|_| WatchPathError::State)?;
+        if *active != refreshed {
+            *active = refreshed;
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
     pub(crate) fn projected_paths(
         &self,
         config: &RuntimeConfig,
-    ) -> Result<(Vec<(RegisteredWatchPathRecord, PathBuf)>, bool), WatchPathError> {
+    ) -> Result<(Vec<ProjectedWatchPath>, bool), WatchPathError> {
         let records = self.records.read().map_err(|_| WatchPathError::State)?;
-        let mut projected = Vec::with_capacity(records.len());
+        let active = self.active.read().map_err(|_| WatchPathError::State)?;
+        let durable_paths = records
+            .values()
+            .map(|record| record.native_path().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let active_paths = active
+            .values()
+            .filter(|path| !durable_paths.contains(*path))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let path_count = durable_paths.len().saturating_add(active_paths.len());
+        let native_paths = durable_paths.into_iter().chain(active_paths);
+        let mut projected = Vec::with_capacity(path_count);
         let mut incomplete = false;
-        for record in records.values() {
-            match project_path(Path::new(record.native_path()), config) {
-                Ok((_, mounted)) => projected.push((record.clone(), mounted)),
-                Err(_) => incomplete = true,
+        for native_path in native_paths {
+            match project_path(Path::new(&native_path), config) {
+                Ok((native_path, mounted_path))
+                    if mounted_path.is_dir()
+                        && !config
+                            .exclusions()
+                            .iter()
+                            .any(|excluded| mounted_path.starts_with(excluded)) =>
+                {
+                    projected.push(ProjectedWatchPath {
+                        native_path,
+                        mounted_path,
+                    });
+                }
+                _ => incomplete = true,
             }
         }
         Ok((projected, incomplete))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedWatchPath {
+    native_path: String,
+    mounted_path: PathBuf,
+}
+
+impl ProjectedWatchPath {
+    pub(crate) fn native_path(&self) -> &str {
+        &self.native_path
+    }
+
+    pub(crate) fn mounted_path(&self) -> &Path {
+        &self.mounted_path
     }
 }
 
@@ -289,7 +365,10 @@ mod tests {
             .expect("registry should project");
         assert!(!incomplete);
         assert_eq!(projected.len(), 1);
-        assert_eq!(projected[0].1, fixture.worktrees.join("inside"));
+        assert_eq!(
+            projected[0].mounted_path(),
+            fixture.worktrees.join("inside")
+        );
 
         let restored = WatchPathRegistry::load(store, clock, config)
             .await
@@ -297,10 +376,130 @@ mod tests {
         assert_eq!(restored.records.read().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn active_child_worktree_is_ephemeral_and_removed_at_terminal_state() {
+        let fixture = WatchPathFixture::new();
+        let config = ConfigManager::load(&fixture.config_path).expect("config should load");
+        let store = WatchdogStore::open(&fixture.root.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(
+            WallTimeMs::new(10_000),
+            5_000,
+        )));
+        let registry = WatchPathRegistry::load(store.clone(), clock.clone(), config.clone())
+            .await
+            .expect("registry should load");
+        let api = AgentApi::new(store, clock)
+            .await
+            .expect("API should initialize");
+        let main = api
+            .discover_session(discovery("main", SessionKind::Main, None))
+            .await
+            .expect("main should discover");
+        let child = api
+            .discover_session(discovery_with_directory(
+                "child",
+                SessionKind::Child,
+                Some(main.session.session_id()),
+                Some("/host/repositories/active"),
+            ))
+            .await
+            .expect("child should discover");
+        let transport = TransportKey::new("active-watch-test").expect("valid transport");
+        api.register_session(
+            &transport,
+            RegisterSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: "main".to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "bind-main".to_owned(),
+            },
+        )
+        .await
+        .expect("main should bind transport");
+
+        registry.refresh_active().await.expect("active refresh");
+        let (projected, incomplete) = registry
+            .projected_paths(&config.current())
+            .expect("active path should project");
+        assert!(!incomplete);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected[0].mounted_path(),
+            fixture.worktrees.join("active")
+        );
+
+        api.complete_session(
+            &transport,
+            child.session.session_id(),
+            "complete-child",
+            crate::CompletionOutcome::Completed,
+        )
+        .await
+        .expect("child should complete");
+        registry.refresh_active().await.expect("terminal refresh");
+        let (projected, incomplete) = registry
+            .projected_paths(&config.current())
+            .expect("terminal path should be removed");
+        assert!(!incomplete);
+        assert!(projected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_active_worktree_is_excluded_from_automatic_watch_paths() {
+        let fixture = WatchPathFixture::new();
+        let config = ConfigManager::load(&fixture.config_path).expect("config should load");
+        let store = WatchdogStore::open(&fixture.root.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(
+            WallTimeMs::new(10_000),
+            5_000,
+        )));
+        let registry = WatchPathRegistry::load(store.clone(), clock.clone(), config.clone())
+            .await
+            .expect("registry should load");
+        let api = AgentApi::new(store, clock)
+            .await
+            .expect("API should initialize");
+        let main = api
+            .discover_session(discovery("main", SessionKind::Main, None))
+            .await
+            .expect("main should discover");
+        for native_id in ["child-one", "child-two"] {
+            api.discover_session(discovery_with_directory(
+                native_id,
+                SessionKind::Child,
+                Some(main.session.session_id()),
+                Some("/host/repositories/active"),
+            ))
+            .await
+            .expect("child should discover");
+        }
+
+        registry.refresh_active().await.expect("active refresh");
+        let (projected, incomplete) = registry
+            .projected_paths(&config.current())
+            .expect("shared path should be omitted");
+        assert!(!incomplete);
+        assert!(projected.is_empty());
+    }
+
     fn discovery(
         native_id: &str,
         kind: SessionKind,
         parent: Option<SessionId>,
+    ) -> DiscoveredSession {
+        discovery_with_directory(native_id, kind, parent, None)
+    }
+
+    fn discovery_with_directory(
+        native_id: &str,
+        kind: SessionKind,
+        parent: Option<SessionId>,
+        startup_directory: Option<&str>,
     ) -> DiscoveredSession {
         DiscoveredSession {
             runtime: RuntimeKind::ClaudeCode,
@@ -311,7 +510,7 @@ mod tests {
             adapter_version: "test".to_owned(),
             evidence_source: "test:watch-path".to_owned(),
             title: None,
-            startup_directory: None,
+            startup_directory: startup_directory.map(ToOwned::to_owned),
         }
     }
 
@@ -333,6 +532,7 @@ mod tests {
             for path in [
                 &worktrees,
                 &worktrees.join("inside"),
+                &worktrees.join("active"),
                 &outside,
                 &claude,
                 &codex,

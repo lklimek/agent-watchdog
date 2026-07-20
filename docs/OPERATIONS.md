@@ -220,13 +220,17 @@ bounded activity queue was saturated. Monitoring continues and a full bounded
 runtime reconciliation is requested. Automated termination remains suspended
 until that reconciliation finishes without a newer filesystem uncertainty.
 `watcher` degradation with a message about directories not fitting within bounds
-means a configured prefix exceeded the 4,096-target/depth/byte safety budget or
-the host inotify backend rejected a target. The server remains available and
-continues bounded best-effort reconciliation, but it does not claim complete
-filesystem coverage and automatic termination stays suspended. Prefer narrower
-concrete worktree prefixes or explicit MCP `register_watch_path` entries; those
-registrations receive watcher-budget priority. Raising host inotify limits does
-not bypass the application's own bounded target policy.
+means an enabled runtime root or an exact uniquely-owned active/MCP-registered worktree exceeded
+the 4,096-target/depth/byte safety budget, could not be projected safely, or was
+rejected by the host inotify backend. Broad configured worktree prefixes are
+capability allowlists and are not recursively watched, so their repository count
+alone does not degrade health. The server remains available and continues
+bounded best-effort reconciliation, but automatic termination stays suspended
+when required exact coverage is incomplete. Runtime roots receive target
+priority, followed by explicit registrations and uniquely-owned active child
+worktrees. Shared active worktrees are omitted because their events cannot be
+attributed safely. Raising
+host inotify limits does not bypass the application's own bounded target policy.
 `dashboard_delivery` is independent: a lagging or failed browser/SSE delivery
 cannot authorize or suspend process signals.
 

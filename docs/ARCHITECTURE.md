@@ -400,12 +400,24 @@ not a schema or reducer redesign.
 
 ## 8. Filesystem ingestion
 
-The watch service uses the `notify` Linux inotify backend. It watches only
-capability roots constructed from concrete read-only mounts and configured
-allowlisted prefixes. Existing directories receive non-recursive watches under
-the global cap. A directory create/remove/rename event triggers one bounded
-registry rebuild so newly created session directories become observable;
-ordinary file appends only schedule targeted reconciliation.
+The watch service uses the `notify` Linux inotify backend. Configured worktree
+prefixes are capability boundaries, not requests to enumerate and watch every
+repository beneath them. Watch targets are installed in priority order: runtime
+roots, durable MCP registrations, then validated worktrees of active discovered
+children. Existing directories beneath each exact target receive non-recursive
+watches under the global cap because Linux inotify has no recursive watch flag.
+The bounded enumeration-entry budget is separate from the inotify target cap:
+transcript files must be inspected as directory entries but do not themselves
+consume directory-watch capacity.
+
+Each target carries a typed destination. Runtime file events schedule only the
+owning Claude, Codex, or Companion adapter. Worktree events schedule only
+filesystem ownership attribution. Runtime invalidations coalesce for one second so
+a burst of transcript appends produces one bounded adapter pass without losing
+another runtime's pending bit. A create/remove/rename event rebuilds the
+bounded registry so new subdirectories beneath that exact target become
+observable. Overflow and the five-minute recovery interval are the only normal
+causes of an all-adapter reconciliation.
 
 Each file cursor records device/inode identity, byte offset, last complete record
 boundary, parser version, and last observation ID. Appends read from the saved
@@ -420,6 +432,14 @@ never follows symlink entries, so a large history cannot cause an unbounded
 directory allocation.
 Periodic low-frequency reconciliation catches missed events; it is scoped to
 known runtime roots and active sessions, never a full home-directory crawl.
+After each reconciliation, an ephemeral registry is refreshed from nonterminal
+child metadata with one bounded joined store query, so retained terminal history
+does not add per-session reads or crowd out active agents. A path is automatic
+only while exactly one active child owns it;
+shared worktrees remain unwatched unless a narrower durable MCP registration can
+provide exact ownership. Terminal or absent children lose automatic worktree
+coverage; durable MCP registrations remain until the retained database is
+manually wiped.
 
 Worktree changes refresh a child only when ownership is unambiguous. With one
 child on a worktree, any in-root change is attributable, including changes in
