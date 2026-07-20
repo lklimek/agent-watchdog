@@ -11,11 +11,12 @@ use std::{
 use serde_json::json;
 use sqlx::sqlite::SqliteConnectOptions;
 use watchdog_domain::{
-    DetailedState, DurationMs, RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
+    DetailedState, DurationMs, RuntimeKind, SessionId, SessionIdentity, SessionKind, TimePoint,
+    WallTimeMs,
 };
 use watchdog_server::{
     AgentApi, ClaudeDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
-    DashboardService, DiscoveredSession, DiscoveryAliasRegistry, WorktreePathMapping,
+    DashboardService, DiscoveredSession, DiscoveryAliasRegistry, TransportKey, WorktreePathMapping,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
@@ -171,17 +172,7 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
         .await
         .expect("children should query");
     assert_eq!(children.len(), 1);
-    let metadata = store
-        .session_metadata(children[0].session)
-        .await
-        .expect("metadata should query")
-        .expect("metadata should exist");
-    assert_eq!(metadata.title(), Some("security-reviewer"));
-    assert_eq!(
-        metadata.startup_directory(),
-        Some("/host/repositories/child")
-    );
-    assert_eq!(metadata.branch(), Some("feat/claude"));
+    assert_claude_child_metadata(&store, children[0].session).await;
 
     let mut transcript = fs::OpenOptions::new()
         .append(true)
@@ -212,7 +203,7 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
     );
 
     transcript
-        .write_all(b"{\"type\":\"future-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\"}\n")
+        .write_all(b"{\"type\":\"future-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"version\":\"2.1.212\"}\n")
         .expect("future schema record should append");
     clock.advance(DurationMs::new(1_000));
     let drifted = reconcile_claude_fixture(
@@ -224,15 +215,74 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
     .await;
     assert_eq!(drifted.warning_count(), 1);
     let drifted_snapshot = load_snapshot(&store, children[0].session).await;
+    let warning = drifted_snapshot
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist")
+        .compatibility_warning()
+        .expect("schema drift should be actionable");
+    assert_upgrade_versions(warning, "Claude Code 2.1.212", "Claude Code 2.1.214");
+
+    assert_versionless_drift_preserves_detected_warning(
+        &mut transcript,
+        &clock,
+        &discovery,
+        &projects_root,
+        (&runtime_mapping, &worktree_mapping),
+        &store,
+        children[0].session,
+    )
+    .await;
+}
+
+async fn assert_claude_child_metadata(store: &WatchdogStore, session: SessionIdentity) {
+    let metadata = store
+        .session_metadata(session)
+        .await
+        .expect("metadata should query")
+        .expect("metadata should exist");
+    assert_eq!(metadata.title(), Some("security-reviewer"));
     assert_eq!(
-        drifted_snapshot
-            .reducer_snapshot()
-            .expect("reducer snapshot should exist")
-            .compatibility_warning()
-            .expect("schema drift should be actionable")
-            .badge(),
-        "UPGRADE"
+        metadata.startup_directory(),
+        Some("/host/repositories/child")
     );
+    assert_eq!(metadata.branch(), Some("feat/claude"));
+}
+
+async fn assert_versionless_drift_preserves_detected_warning(
+    transcript: &mut fs::File,
+    clock: &FakeClock,
+    discovery: &ClaudeDiscovery,
+    projects_root: &Path,
+    mappings: (&WorktreePathMapping, &WorktreePathMapping),
+    store: &WatchdogStore,
+    session: SessionIdentity,
+) {
+    transcript
+        .write_all(
+            b"{\"type\":\"another-future-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\"}\n",
+        )
+        .expect("versionless future schema record should append");
+    clock.advance(DurationMs::new(1_000));
+    let versionless_drift =
+        reconcile_claude_fixture(discovery, projects_root, mappings.0, mappings.1).await;
+    assert_eq!(versionless_drift.warning_count(), 1);
+    let preserved_snapshot = load_snapshot(store, session).await;
+    let warning = preserved_snapshot
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist")
+        .compatibility_warning()
+        .expect("schema drift should remain actionable");
+    assert_upgrade_versions(warning, "Claude Code 2.1.212", "Claude Code 2.1.214");
+}
+
+fn assert_upgrade_versions(
+    warning: &watchdog_domain::CompatibilityWarning,
+    detected: &str,
+    tested: &str,
+) {
+    assert_eq!(warning.badge(), "UPGRADE");
+    assert!(warning.message().contains(&format!("detected {detected}")));
+    assert!(warning.message().contains(&format!("tested with {tested}")));
 }
 
 #[tokio::test]
@@ -281,6 +331,28 @@ async fn claude_team_member_transcript_does_not_create_a_duplicate_main() {
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].native.native_id(), "team-worker");
 
+    api.mark_restarted()
+        .await
+        .expect("restart boundary should persist");
+    let restarted = ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone());
+    restarted
+        .reconcile(
+            &[projects.clone(), teams.clone()],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    for session in [mains[0].session, children[0].session] {
+        assert!(
+            !load_snapshot(&store, session)
+                .await
+                .reducer_snapshot()
+                .expect("reducer snapshot should exist")
+                .reconciliation_required(),
+            "current team config should clear the restart gate"
+        );
+    }
+
     append_claude_activity(&teammate_transcript, "teammate-session", None);
     clock.advance(DurationMs::new(1_000));
     let restarted = ClaudeDiscovery::new(api, store.clone(), clock.clone());
@@ -302,9 +374,75 @@ async fn claude_team_member_transcript_does_not_create_a_duplicate_main() {
 }
 
 #[tokio::test]
-async fn claude_team_lead_aliases_a_post_reset_transcript_by_unique_cwd() {
+async fn ambiguous_teammates_with_one_team_parent_do_not_create_a_main() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let (projects, teams, worktrees, _) = create_claude_team_alias_fixtures(fixture.path());
+    let config = teams.join("session-main/config.json");
+    let mut team: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config).expect("team config should read"))
+            .expect("team config should parse");
+    team["members"]
+        .as_array_mut()
+        .expect("members should be an array")
+        .push(json!({
+            "agentType": "claudius:developer",
+            "name": "worker-2",
+            "agentId": "team-worker-2",
+            "cwd": "/host/repositories/worker",
+            "isActive": true
+        }));
+    fs::write(
+        &config,
+        serde_json::to_vec(&team).expect("team config should serialize"),
+    )
+    .expect("team config should update");
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let runtime_mappings = [
+        WorktreePathMapping::new("/home/test/.claude/projects", projects.clone())
+            .expect("projects mapping should be valid"),
+        WorktreePathMapping::new("/home/test/.claude/teams", teams.clone())
+            .expect("teams mapping should be valid"),
+    ];
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", worktrees)
+        .expect("worktree mapping should be valid");
+
+    ClaudeDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[projects, teams],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(mains.len(), 1);
+    assert_eq!(mains[0].native.native_id(), "main-session");
+    assert_eq!(children.len(), 2);
+}
+
+#[tokio::test]
+async fn claude_team_lead_aliases_a_post_reset_transcript_by_unique_cwd() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let (projects, teams, worktrees, teammate_transcript) =
+        create_claude_team_alias_fixtures(fixture.path());
+    fs::remove_file(teammate_transcript).expect("unrelated teammate transcript should be removed");
     let config = teams.join("session-main/config.json");
     let mut team: serde_json::Value =
         serde_json::from_slice(&fs::read(&config).expect("team config should read"))
@@ -326,7 +464,7 @@ async fn claude_team_lead_aliases_a_post_reset_transcript_by_unique_cwd() {
     let api = AgentApi::new(store.clone(), clock.clone())
         .await
         .expect("API should initialize");
-    let discovery = ClaudeDiscovery::new(api, store.clone(), clock);
+    let discovery = ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone());
     let runtime_mappings = [
         WorktreePathMapping::new("/home/test/.claude/projects", projects.clone())
             .expect("projects mapping should be valid"),
@@ -338,6 +476,31 @@ async fn claude_team_lead_aliases_a_post_reset_transcript_by_unique_cwd() {
 
     discovery
         .reconcile(
+            std::slice::from_ref(&projects),
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    api.mark_restarted()
+        .await
+        .expect("restart boundary should persist");
+
+    let restarted = ClaudeDiscovery::new(api, store.clone(), clock.clone());
+    restarted
+        .reconcile(
+            &[projects.clone(), teams.clone()],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    append_claude_activity(
+        &projects.join("-host-repositories-main/main-session.jsonl"),
+        "main-session",
+        None,
+    );
+    clock.advance(DurationMs::new(1_000));
+    restarted
+        .reconcile(
             &[projects, teams],
             &runtime_mappings,
             std::slice::from_ref(&worktree_mapping),
@@ -348,8 +511,20 @@ async fn claude_team_lead_aliases_a_post_reset_transcript_by_unique_cwd() {
         .sessions_by_kind(SessionKind::Main, 10)
         .await
         .expect("mains should query");
-    assert_eq!(mains.len(), 1);
-    assert_eq!(mains[0].native.native_id(), "retained-team-lead");
+    assert_eq!(mains.len(), 2, "retained history must not be deleted");
+    let dashboard = DashboardService::new(store, clock)
+        .snapshot(DashboardQuery::default())
+        .await
+        .expect("dashboard should render");
+    assert_eq!(dashboard.sessions.len(), 1);
+    let canonical = mains
+        .iter()
+        .find(|main| main.native.native_id() == "retained-team-lead")
+        .expect("canonical lead should exist");
+    assert_eq!(
+        dashboard.sessions[0].session_id.session_id(),
+        canonical.root.session_id()
+    );
 }
 
 #[tokio::test]
@@ -639,6 +814,97 @@ async fn claude_originated_codex_rollout_does_not_guess_between_two_parents() {
             .await
             .expect("children should query")
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn claude_originated_codex_ignores_unreconciled_retained_parent() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let mounted = fixture.path().join("mounted");
+    let worktree = mounted.join("main");
+    let rollouts = fixture.path().join("rollouts");
+    fs::create_dir_all(&worktree).expect("worktree should exist");
+    fs::create_dir_all(&rollouts).expect("rollout root should exist");
+    fs::write(
+        rollouts.join("rollout-current.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-current\",\"cwd\":\"/host/main\",\"originator\":\"Claude Code\",\"source\":\"vscode\"}}\n",
+    )
+    .expect("rollout should write");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let mut current = None;
+    for native_id in ["claude-current", "claude-retained"] {
+        let view = api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: native_id.to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: format!("discover-{native_id}"),
+                adapter_version: "test".to_owned(),
+                evidence_source: "test".to_owned(),
+                title: None,
+                startup_directory: Some("/host/main".to_owned()),
+            })
+            .await
+            .expect("Claude main should register");
+        if native_id == "claude-current" {
+            current = Some(view.session.session_id());
+        }
+    }
+    api.mark_restarted()
+        .await
+        .expect("restart boundary should persist");
+    let transport = TransportKey::new("current-parent").expect("transport should be valid");
+    let current = current.expect("current main should exist");
+    api.bind_discovered_main(&transport, current)
+        .await
+        .expect("current main should bind");
+    api.report_progress(
+        &transport,
+        current,
+        "current-parent:progress",
+        "Current native evidence".to_owned(),
+        None,
+    )
+    .await
+    .expect("current main should reconcile");
+    let rollout_mapping = WorktreePathMapping::new("/state", rollouts.clone())
+        .expect("rollout mapping should be valid");
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", mounted).expect("worktree mapping should be valid");
+
+    CodexDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[rollouts],
+            std::slice::from_ref(&rollout_mapping),
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+
+    assert_eq!(
+        store
+            .sessions_by_kind(SessionKind::Main, 10)
+            .await
+            .expect("mains should query")
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .sessions_by_kind(SessionKind::Child, 10)
+            .await
+            .expect("children should query")
+            .len(),
+        1
     );
 }
 

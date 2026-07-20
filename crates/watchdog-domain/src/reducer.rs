@@ -318,7 +318,9 @@ fn apply_observation(
     if observation.source().trust() == EvidenceTrust::Uncertain {
         return;
     }
-    snapshot.reconciliation_required = false;
+    if observation_clears_reconciliation(observation.payload()) {
+        snapshot.reconciliation_required = false;
+    }
 
     match observation.payload() {
         ObservationPayload::NativeState(state) => {
@@ -401,6 +403,15 @@ fn apply_observation(
         }
         ObservationPayload::SchedulerTick => {}
     }
+}
+
+fn observation_clears_reconciliation(payload: &ObservationPayload) -> bool {
+    !matches!(
+        payload,
+        ObservationPayload::Compatibility(_)
+            | ObservationPayload::CompatibilityResolved
+            | ObservationPayload::SchedulerTick
+    )
 }
 
 fn apply_tick(

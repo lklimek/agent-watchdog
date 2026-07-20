@@ -31,6 +31,7 @@ not accepted deferrals.
 | FR-DIS-014 | T-DIS-017 | Recent-only team-config bootstrap | Automated and fresh-volume verified |
 | FR-DIS-015 | T-DIS-018 | Shared Claude/Companion wrapper alias registry | Automated and live-verified |
 | FR-DIS-016 | T-DIS-019 | Recent terminal Companion bootstrap with tracked-job exception | Automated and fresh-volume verified |
+| FR-DIS-017 | T-DIS-021 | Shared-team-parent transcript alias without false main promotion | Automated and live-derived regression |
 | FR-EVD-001 | T-EVD-001 | Linux `WatchService`, targeted invalidation, server watcher supervisor | Automated |
 | FR-EVD-002 | T-EVD-001 | Durable incremental cursor and complete-record reader; huge sparse-file test | Automated |
 | FR-EVD-003 | T-EVD-003, T-EVD-004 | File identity/truncation reconciliation, watcher uncertainty, generation-guarded health | Automated |
@@ -77,7 +78,7 @@ not accepted deferrals.
 
 | Requirement | Acceptance tests | Implementation and test evidence | Status |
 |---|---|---|---|
-| FR-UI-001 | T-STA-012, T-UI-001, T-UI-010 | Active-main default projection and child status aggregation | Automated and browser-verified |
+| FR-UI-001 | T-STA-012, T-STA-015, T-STA-016, T-UI-001, T-UI-010, T-UI-012 | Reconciled active-main projection and child status aggregation | Automated and browser-verified |
 | FR-UI-002 | T-UI-002 | Attention→idle→other deterministic card ordering | Automated |
 | FR-UI-003 | T-UI-003 | Case-insensitive startup-directory sort control | Automated |
 | FR-UI-004 | T-UI-004, T-UI-010 | Title/directory/branch-or-PR/activity/state/count card model; GitHub fallback/cache tests | Automated |
@@ -99,7 +100,7 @@ not accepted deferrals.
 
 | Requirement | Acceptance tests | Implementation and test evidence | Status |
 |---|---|---|---|
-| FR-DATA-001 | T-DATA-001–003, T-KILL-014, T-STA-010, T-STA-013, T-STA-014 | SQLite WAL store, atomic observation/snapshot/event/outbox writes, restart repositories | Automated |
+| FR-DATA-001 | T-DATA-001–003, T-KILL-014, T-STA-010, T-STA-013–016 | SQLite WAL store, atomic observation/snapshot/event/outbox writes, restart repositories | Automated |
 | FR-DATA-002 | T-DATA-004 | No pruning worker or retention delete path; history persists until wipe | Automated by store/restart behavior; final absence audit passed |
 | FR-DATA-003 | T-DATA-005 | Store-only manual wipe test and Compose volume wipe procedure | Automated |
 | FR-DATA-004 | T-DATA-005 | Disposable named volume and documented no-backup guarantee | Automated/manual contract |
@@ -121,7 +122,7 @@ not accepted deferrals.
 | Requirement | Acceptance tests | Implementation and test evidence | Status |
 |---|---|---|---|
 | FR-COMP-001 | T-COMP-001 | Version-guarded adapters and documented observed versions | Automated; owner-authorized live probe passed best-effort discovery, formal isolated matrix pending |
-| FR-COMP-002 | T-COMP-002, T-EVD-005, T-KILL-012, T-OPS-004 | Per-adapter/session `UPGRADE`, best-effort state, termination suspension | Automated |
+| FR-COMP-002 | T-COMP-002, T-EVD-005, T-KILL-012, T-OPS-004 | Version-explicit per-session `UPGRADE`, best-effort state, termination suspension | Automated |
 | FR-COMP-003 | T-COMP-004 | Synthetic adapters exist; Claudius transfer pitfalls audited; owner-authorized corrective live probe recorded separately from the formal matrix | **Corrective live evidence passed; formal isolated live QA pending** |
 | FR-COMP-004 | T-COMP-005 | Reducer/correlation/timer/safety slices have synthetic typed-event TDD evidence and final diff self-review | Complete |
 | FR-COMP-005 | T-COMP-006 | Per-commit formatter, targeted tests, strict Clippy, audit/deny, Compose/image/browser release evidence | Final Linux engineering gates passed |

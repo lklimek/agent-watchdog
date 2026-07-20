@@ -90,7 +90,14 @@ Zero-count groups are omitted. A child problem does not replace the main session
 | Finished | `✓` | Green/muted terminal treatment | 3 |
 | Unknown | `?` | Hatched/neutral warning treatment | 3 |
 
-`UPGRADE` is a separate actionable badge, with accessible text such as “Watchdog update required for Codex CLI 0.x.” It does not silently change the normalized state.
+`UPGRADE` is a separate actionable badge. Its accessible text names both the
+detected runtime version and the version tested by Watchdog when native evidence
+provides the former. It does not silently change the normalized state.
+
+After a server restart, retained main sessions remain out of the default active
+view until current native evidence reconciles them. They remain available in the
+all-session history. Re-observing a current Claude team config clears this gate
+without pretending that configuration presence is agent progress.
 
 ## 7. Desktop wireframe
 

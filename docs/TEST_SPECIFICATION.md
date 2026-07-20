@@ -83,13 +83,14 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-DIS-011 | Codex SQLite contains recent, old, and archived threads plus an exact spawn edge. | Only recent unarchived threads bootstrap; the exact edge is retained. | FR-DIS-002, FR-DIS-006 |
 | T-DIS-012 | Current Codex rollout metadata exists while SQLite is absent or behind its WAL. | Recent main/child hierarchy and subsequent activity are discovered from bounded rollout reads. | FR-DIS-001, FR-DIS-002, FR-DIS-006 |
 | T-DIS-013 | Codex rollout emits `event_msg.payload.type=task_started`, then `task_complete`. | The child transitions running then completed; transcript content is neither retained nor logged. | FR-DIS-010, FR-SEC-001 |
-| T-DIS-014 | A recent Claude transcript and exactly one recent team lead have the same validated cwd but different session IDs. | Only the configured lead is a main session and transcript activity advances it; two matching leads remain unaliased. | FR-DIS-005, FR-DIS-011 |
+| T-DIS-014 | A recent Claude transcript and exactly one recent team lead have the same validated cwd but different session IDs, including when the transcript identity was retained across a server restart. | Only the configured lead is an active main session and transcript activity advances it; the retained duplicate stays history-only, while two matching leads remain unaliased. | FR-DIS-005, FR-DIS-011, FR-UI-001 |
 | T-DIS-015 | A Claude team member changes from active to inactive without a hook record. | The retained child becomes completed in the next reconciliation and cannot age into stalled. | FR-DIS-012, FR-STA-006 |
-| T-DIS-016 | Codex metadata says `originator=Claude Code` and exactly one active Claude main matches its directory or repository. | Codex is registered beneath that Claude root with logged correlation basis/confidence; ambiguous candidates are not joined. | FR-DIS-005, FR-DIS-006, FR-DIS-013 |
+| T-DIS-016 | Codex metadata says `originator=Claude Code` and exactly one reconciled active Claude main matches its directory or repository. | Codex is registered beneath that Claude root with logged correlation basis/confidence; ambiguous candidates and restart-unreconciled retained roots are not joined. | FR-DIS-005, FR-DIS-006, FR-DIS-013 |
 | T-DIS-017 | A team config is older than the 24-hour bootstrap window in a fresh store. | It does not create a main or child; a recent config still does. | FR-DIS-014, FR-EVD-008 |
 | T-DIS-018 | A Companion job names a wrapper session whose recent Claude transcript uniquely aliases to a team member. | The job reuses the Claude team root; no wrapper main is created. | FR-DIS-005, FR-DIS-015 |
 | T-DIS-019 | One old terminal Companion job and one active job exist in a fresh store. | Only the active job bootstraps; a tracked job can still accept a later summary-only terminal transition. | FR-DIS-016, FR-EVD-008 |
 | T-DIS-020 | Watchdog first sees a Codex rollout after its final `task_complete` was already written, or while that final JSON object lacks its newline boundary. | One bounded tail read recovers only a complete terminal record before the durable EOF cursor is initialized; a partial final record is ignored and subsequent scans remain incremental. | FR-DIS-010, FR-EVD-002, FR-EVD-004, FR-EVD-008 |
+| T-DIS-021 | A root-level Claude transcript matches two same-type teammates with one common team lead. | The common lead remains the only main; ambiguous member identity does not create another card. | FR-DIS-005, FR-DIS-017 |
 
 ### 5.2 Filesystem ingestion and native parsing
 
@@ -143,6 +144,8 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-STA-012 | Child stalls while parent is active. | Parent state stays active; child count/badge changes. | §7.3, FR-UI-001 |
 | T-STA-013 | Server restarts with an expired wall deadline. | Fresh reconciliation is required before alert/termination. | FR-DATA-001, FR-KILL-002 |
 | T-STA-014 | A restarted process receives fresh evidence whose monotonic value is below the prior process's persisted value. | The durable restart boundary resets ordering; fresh evidence applies and clears reconciliation. | FR-DATA-001, FR-STA-009 |
+| T-STA-015 | A current Claude team config is re-observed after restart without new transcript activity. | The lead and listed members clear the restart gate without fabricating progress or changing native state. | FR-DIS-001, FR-DATA-001, FR-UI-001 |
+| T-STA-016 | Scheduler ticks and compatibility-only observations arrive for a retained session after restart. | Neither clears the restart gate; only fresh native/process reconciliation can return the session to the active projection. | FR-DATA-001, FR-UI-001 |
 
 ### 5.5 Termination safety
 
@@ -211,6 +214,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-UI-009 | Light/dark and reduced-motion preferences vary. | Content remains legible and motion preference is honored. | UX §13 |
 | T-UI-010 | Main has children in several states. | Text counts match snapshot; child cards do not appear. | FR-UI-001, FR-UI-004 |
 | T-UI-011 | Claude and Codex adapters are degraded simultaneously. | Each page warning includes its human-readable runtime label and remains accessible. | FR-EVD-011, FR-UI-006 |
+| T-UI-012 | Retained nonterminal mains require reconciliation after restart. | They are absent from the active projection and remain available in the all-session history. | FR-UI-001, FR-DATA-001 |
 
 ### 5.9 Notifications
 
@@ -237,7 +241,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-SEC-001 | Paths contain `..`, symlink escape, race replacement, or non-UTF-8 components. | Capability-root access prevents escape; errors remain bounded. | FR-SEC-002 |
 | T-SEC-002 | Transcript/MCP strings contain markup, shell syntax, control chars, or huge fields. | Input is bounded/escaped and never executed. | FR-SEC-003 |
 | T-COMP-001 | Supported runtime emits recognized current schema. | Adapter healthy with documented tested version. | FR-COMP-001 |
-| T-COMP-002 | One required native field changes/removes. | Affected sessions get `UPGRADE`; best effort and other adapters continue. | FR-COMP-002 |
+| T-COMP-002 | One required native field changes/removes, followed by versionless incompatible evidence. | Affected sessions get `UPGRADE` with detected and tested versions when available; later versionless evidence never downgrades that detail, while best effort and other adapters continue. | FR-COMP-002 |
 | T-COMP-003 | Build workspace on macOS target in CI where available. | It compiles with unsupported process/watchdog operation clearly gated. | Product summary |
 | T-COMP-004 | Run the explicitly enabled isolated live-runtime matrix. | Current supported child types are observed without reading real user data. | FR-COMP-003 |
 | T-COMP-005 | Review implementation PR evidence for pure logic. | Each reducer/timer/correlation/safety change shows a failing synthetic typed-event test before implementation. | FR-COMP-004 |

@@ -632,13 +632,33 @@ impl ClaudeParseError {
     /// Actionable compatibility warning for affected sessions/adapter health.
     #[must_use]
     pub fn compatibility_warning(&self) -> CompatibilityWarning {
-        CompatibilityWarning::new(
-            WarningKind::Upgrade,
-            format!(
-                "Update Agent Watchdog's Claude adapter; tested with Claude Code {TESTED_CLAUDE_VERSION}"
-            ),
-        )
-        .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))
+        Self::compatibility_warning_message(None)
+    }
+
+    /// Actionable compatibility warning including the detected native version.
+    #[must_use]
+    pub fn compatibility_warning_for_version(
+        &self,
+        detected_version: &str,
+    ) -> CompatibilityWarning {
+        Self::compatibility_warning_message(Some(detected_version))
+    }
+
+    fn compatibility_warning_message(detected_version: Option<&str>) -> CompatibilityWarning {
+        let message = detected_version.map_or_else(
+            || {
+                format!(
+                    "Update Agent Watchdog's Claude adapter; tested with Claude Code {TESTED_CLAUDE_VERSION}"
+                )
+            },
+            |detected_version| {
+                format!(
+                    "Update Agent Watchdog's Claude adapter; detected Claude Code {detected_version}, tested with Claude Code {TESTED_CLAUDE_VERSION}"
+                )
+            },
+        );
+        CompatibilityWarning::new(WarningKind::Upgrade, message)
+            .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))
     }
 }
 
@@ -689,6 +709,20 @@ struct RawTranscript {
     git_branch: Option<String>,
     #[serde(rename = "agentSetting", alias = "agent_setting")]
     agent_setting: Option<String>,
+    version: Option<String>,
+}
+
+/// Extract a bounded Claude Code version from a transcript record, including
+/// unsupported record kinds whose remaining content must not be interpreted.
+#[must_use]
+pub fn parse_transcript_version(input: &[u8]) -> Option<BoundedText<128>> {
+    if input.len() > MAX_TRANSCRIPT_RECORD_BYTES {
+        return None;
+    }
+    let raw: RawTranscript = serde_json::from_slice(input).ok()?;
+    raw.version
+        .filter(|value| !value.is_empty())
+        .and_then(|value| BoundedText::new("claude_version", value).ok())
 }
 
 #[derive(Deserialize)]

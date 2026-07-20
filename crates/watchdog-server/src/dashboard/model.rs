@@ -147,7 +147,12 @@ impl DashboardService {
                 .snapshot(main.session)
                 .await?
                 .ok_or(DashboardError::MissingSnapshot)?;
-            if query.scope == DashboardScope::Active && terminal(snapshot.state()) {
+            let reducer = snapshot.reducer_snapshot();
+            if query.scope == DashboardScope::Active
+                && (terminal(snapshot.state())
+                    || reducer
+                        .is_some_and(watchdog_domain::SessionSnapshot::reconciliation_required))
+            {
                 continue;
             }
             let metadata = self.store.session_metadata(main.session).await?;
@@ -163,7 +168,6 @@ impl DashboardService {
                     || fallback_title(&startup_directory, main.native.native_id()),
                     ToOwned::to_owned,
                 );
-            let reducer = snapshot.reducer_snapshot();
             let warning = reducer
                 .and_then(|snapshot| snapshot.compatibility_warning())
                 .map(|warning| DashboardWarning {
