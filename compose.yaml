@@ -65,6 +65,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ${WATCHDOG_CLAUDE_SESSIONS_PATH:?Set WATCHDOG_CLAUDE_SESSIONS_PATH}
+        target: /monitored/claude/sessions
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ${WATCHDOG_CODEX_STATE_DB_PATH:?Set WATCHDOG_CODEX_STATE_DB_PATH}
         target: /monitored/codex/state/state_5.sqlite
         read_only: true

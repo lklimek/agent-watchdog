@@ -39,6 +39,14 @@ directory. `WATCHDOG_WORKTREE_ROOT_PATH` is the narrow prefix under which
 repositories and Git worktrees may be monitored; it must never be `/` or an
 entire home directory.
 
+`WATCHDOG_CLAUDE_SESSIONS_PATH` must point to the monitored user's
+`~/.claude/sessions` directory. Watchdog mounts it read-only at
+`/monitored/claude/sessions`; list the matching native/mounted paths last in
+`native_claude_roots` and `claude_roots`. This process-scoped registry separates
+live interactive mains from retained transcripts. A malformed or incomplete
+registry degrades Claude discovery and suppresses absence inference; it never
+causes a mass terminal transition.
+
 Use distinct, long random values for `WATCHDOG_BASIC_PASSWORD` and
 `WATCHDOG_BEARER_TOKEN`. Create the Traefik password file with the same Basic
 username and password configured in `.env`, then restrict it to the monitored

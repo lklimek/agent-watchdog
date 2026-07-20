@@ -91,6 +91,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-DIS-019 | One old terminal Companion job and one active job exist in a fresh store. | Only the active job bootstraps; a tracked job can still accept a later summary-only terminal transition. | FR-DIS-016, FR-EVD-008 |
 | T-DIS-020 | Watchdog first sees a main Codex rollout after its final `task_complete` was already written, or while that final JSON object lacks its newline boundary. | One bounded tail read recovers only a complete turn boundary as waiting for user before the durable EOF cursor is initialized; a partial final record is ignored and subsequent scans remain incremental. | FR-DIS-010, FR-EVD-002, FR-EVD-004, FR-EVD-008 |
 | T-DIS-021 | A root-level Claude transcript matches two same-type teammates with one common team lead. | The common lead remains the only main; ambiguous member identity does not create another card. | FR-DIS-005, FR-DIS-017 |
+| T-DIS-022 | A complete Claude live registry contains one PID/start-verified main while a retained transcript main with the same cwd is absent; repeat with two valid live entries sharing that cwd and with malformed registry coverage. | The absent retained main becomes completed, every valid live entry remains distinct and receives exact process/state metadata, and malformed/uncertain coverage retires nothing. | FR-DIS-018, FR-DIS-006, FR-UI-001 |
 
 ### 5.2 Filesystem ingestion and native parsing
 

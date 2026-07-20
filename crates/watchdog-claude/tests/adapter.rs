@@ -1,8 +1,8 @@
 //! Claude hook and automatic team-discovery contracts.
 
 use watchdog_claude::{
-    ClaudeHookParser, ClaudeParseError, TESTED_CLAUDE_VERSION, parse_subagent_metadata,
-    parse_task_record, parse_team_config, parse_transcript_record,
+    ClaudeHookParser, ClaudeParseError, TESTED_CLAUDE_VERSION, parse_live_session_record,
+    parse_subagent_metadata, parse_task_record, parse_team_config, parse_transcript_record,
 };
 use watchdog_domain::{
     DetailedState, ObservationPayload, RuntimeKind, SessionKind, TimePoint, WallTimeMs,
@@ -187,6 +187,39 @@ fn current_metadata_records_are_recognized_but_do_not_invent_activity() {
         assert!(!signal.is_activity());
         assert!(!format!("{signal:?}").contains("SECRET_TRANSCRIPT_CONTENT"));
     }
+}
+
+#[test]
+fn live_session_registry_supplies_exact_main_and_process_identity() {
+    let session = parse_live_session_record(
+        br#"{
+            "pid":1841541,
+            "sessionId":"d7985879-1007-4682-a4c2-0b2cf8114a5b",
+            "cwd":"/home/ubuntu/git/dash-evo-tool-2",
+            "kind":"interactive",
+            "name":"dash-evo-tool-2-1c",
+            "procStart":"2593474",
+            "status":"idle",
+            "updatedAt":1784557311434,
+            "version":"2.1.215"
+        }"#,
+    )
+    .expect("current live-session record should parse");
+
+    assert_eq!(
+        session.subject().native_id(),
+        "d7985879-1007-4682-a4c2-0b2cf8114a5b"
+    );
+    assert_eq!(session.pid().value(), 1_841_541);
+    assert_eq!(session.process_start_ticks(), 2_593_474);
+    assert_eq!(session.state(), DetailedState::WaitingForUser);
+    assert_eq!(session.title(), Some("dash-evo-tool-2-1c"));
+    assert_eq!(session.version(), "2.1.215");
+    assert_eq!(session.updated_at_ms(), 1_784_557_311_434);
+    assert_eq!(
+        session.cwd().to_str(),
+        Some("/home/ubuntu/git/dash-evo-tool-2")
+    );
 }
 
 #[test]

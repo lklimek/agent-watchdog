@@ -132,6 +132,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-DIS-015 | A Companion wrapper `sessionId` that resolves through a uniquely aliased Claude transcript must reuse the canonical Claude tree. | Companion jobs launched by an aliased `codex:codex-rescue` member add children under the team lead and do not create a wrapper main card. |
 | FR-DIS-016 | Retained terminal Companion history must not bootstrap old wrapper sessions. | A new terminal job is admitted only from a recent detail file; a previously tracked job may still receive a summary-only terminal update. Active records remain visible regardless of age. |
 | FR-DIS-017 | A root-level Claude transcript matching multiple teammates under one unambiguous team lead must not become a separate main session. | The transcript aliases to the shared team root for hierarchy/activity purposes; candidates spanning multiple roots remain ambiguous. |
+| FR-DIS-018 | Claude interactive mains must be reconciled against the configured process-scoped live-session registry rather than treating every retained transcript as live. | Each valid registry entry supplies an exact session ID, PID/start identity, cwd, title, state, and version. A complete registry scan makes absent retained Claude mains terminal; uncertain, malformed, or PID-mismatched coverage fails open. Concurrent registry entries remain separate even when they share a directory. |
 
 ### 8.2 Evidence collection and performance
 
@@ -281,6 +282,7 @@ The architecture must preserve source provenance and use runtime-specific preced
 - Official lifecycle hooks expose `session_id`, `cwd`, transcript path, `agent_id`, agent type, and separate sub-agent transcript paths for `SubagentStart`/`SubagentStop`.
 - Claude agent-team configuration and tasks are generated under `~/.claude/teams/{team-name}/config.json` and `~/.claude/tasks/{team-name}/`; official documentation warns not to edit them.
 - Main transcripts live under `~/.claude/projects/<project>/<session-id>.jsonl` and may be disabled or removed by runtime configuration.
+- Current Claude Code installations also expose a process-scoped `~/.claude/sessions/<pid>.json` registry containing exact live session/process metadata. This internal format is not documented as a stable public API, so Watchdog bounds and version-guards it and treats malformed coverage as uncertainty rather than absence.
 - Team messages and idle notifications normally arrive automatically, which makes a missing update itself an important failure symptom.
 
 ### Native Codex CLI

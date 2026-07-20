@@ -11,15 +11,40 @@ use std::{
 use serde_json::json;
 use sqlx::sqlite::SqliteConnectOptions;
 use watchdog_domain::{
-    DetailedState, DurationMs, RuntimeKind, SessionId, SessionIdentity, SessionKind, TimePoint,
-    WallTimeMs,
+    DetailedState, DurationMs, MainSessionId, NativeSessionKey, ProcessId, RuntimeKind, SessionId,
+    SessionIdentity, SessionKind, TimePoint, WallTimeMs,
 };
+use watchdog_process::LinuxProcessSampler;
 use watchdog_server::{
     AgentApi, ClaudeDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
     DashboardService, DiscoveredSession, DiscoveryAliasRegistry, TransportKey, WorktreePathMapping,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
+
+struct ChildProcessGuard(std::process::Child);
+
+impl ChildProcessGuard {
+    fn spawn_sleep() -> Self {
+        Self(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("second live process should start"),
+        )
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[tokio::test]
 async fn claude_team_discovery_keeps_good_sessions_when_another_team_is_malformed() {
@@ -223,6 +248,200 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
         children[0].session,
     )
     .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn claude_live_registry_excludes_absent_retained_main_without_directory_deduplication() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let registry = fixture.path().join("sessions");
+    let worktrees = fixture.path().join("worktrees");
+    fs::create_dir_all(&registry).expect("registry should exist");
+    fs::create_dir_all(worktrees.join("repo")).expect("worktree should exist");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    api.discover_session(DiscoveredSession {
+        runtime: RuntimeKind::ClaudeCode,
+        native_id: "retained-main".to_owned(),
+        kind: SessionKind::Main,
+        parent: None,
+        event_key: "retained-main".to_owned(),
+        adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
+        evidence_source: "test:retained".to_owned(),
+        title: None,
+        startup_directory: Some("/host/repositories/repo".to_owned()),
+    })
+    .await
+    .expect("retained main should be discovered");
+
+    let pid = ProcessId::new(std::process::id()).expect("test PID should be valid");
+    let process = LinuxProcessSampler::new(1)
+        .expect("sampler should initialize")
+        .read_identity(pid)
+        .expect("test process should be readable");
+    write_live_claude_session(&registry, "live-main", "native title", "idle", &process);
+
+    let discovery = ClaudeDiscovery::new(api, store.clone(), clock);
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", worktrees)
+        .expect("worktree mapping should be valid");
+    let report = discovery
+        .reconcile(&[registry], &[], &[worktree_mapping])
+        .await;
+    assert_eq!(report.main_sessions(), 1);
+    let live = NativeSessionKey::new(RuntimeKind::ClaudeCode, "live-main")
+        .expect("live native ID should be valid");
+    assert_session_state(
+        &store,
+        SessionIdentity::Main(MainSessionId::from(SessionId::from_native(&live))),
+        DetailedState::WaitingForUser,
+    )
+    .await;
+    let live_snapshot = load_snapshot(
+        &store,
+        SessionIdentity::Main(MainSessionId::from(SessionId::from_native(&live))),
+    )
+    .await;
+    assert_eq!(
+        live_snapshot
+            .reducer_snapshot()
+            .expect("live reducer snapshot should exist")
+            .process_identity(),
+        Some(&process)
+    );
+    let retained = NativeSessionKey::new(RuntimeKind::ClaudeCode, "retained-main")
+        .expect("retained native ID should be valid");
+    assert_session_state(
+        &store,
+        SessionIdentity::Main(MainSessionId::from(SessionId::from_native(&retained))),
+        DetailedState::Completed,
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn claude_live_registry_keeps_concurrent_mains_in_one_directory_distinct() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let registry = fixture.path().join("sessions");
+    let worktrees = fixture.path().join("worktrees");
+    fs::create_dir_all(&registry).expect("registry should exist");
+    fs::create_dir_all(worktrees.join("repo")).expect("worktree should exist");
+    let second_process = ChildProcessGuard::spawn_sleep();
+    let sampler = LinuxProcessSampler::new(1).expect("sampler should initialize");
+    let first = sampler
+        .read_identity(ProcessId::new(std::process::id()).expect("test PID should be valid"))
+        .expect("test process should be readable");
+    let second = sampler
+        .read_identity(
+            ProcessId::new(second_process.id()).expect("second process PID should be valid"),
+        )
+        .expect("second process should be readable");
+    write_live_claude_session(&registry, "live-main-one", "first", "busy", &first);
+    write_live_claude_session(&registry, "live-main-two", "second", "idle", &second);
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let mapping = WorktreePathMapping::new("/host/repositories", worktrees)
+        .expect("worktree mapping should be valid");
+    let report = ClaudeDiscovery::new(api, store.clone(), clock)
+        .reconcile(&[registry], &[], &[mapping])
+        .await;
+    assert_eq!(report.main_sessions(), 2);
+    assert_eq!(
+        store
+            .sessions_by_kind(SessionKind::Main, 10)
+            .await
+            .expect("mains should query")
+            .len(),
+        2
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn malformed_claude_live_registry_never_retires_absent_mains() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let registry = fixture.path().join("sessions");
+    fs::create_dir_all(&registry).expect("registry should exist");
+    fs::write(registry.join("1.json"), b"{incomplete")
+        .expect("malformed registry record should be written");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    api.discover_session(DiscoveredSession {
+        runtime: RuntimeKind::ClaudeCode,
+        native_id: "retained-main".to_owned(),
+        kind: SessionKind::Main,
+        parent: None,
+        event_key: "retained-main".to_owned(),
+        adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
+        evidence_source: "test:retained".to_owned(),
+        title: None,
+        startup_directory: Some("/host/repositories/repo".to_owned()),
+    })
+    .await
+    .expect("retained main should be discovered");
+
+    let report = ClaudeDiscovery::new(api, store.clone(), clock)
+        .reconcile(&[registry], &[], &[])
+        .await;
+    assert_eq!(report.warning_count(), 1);
+    let retained = NativeSessionKey::new(RuntimeKind::ClaudeCode, "retained-main")
+        .expect("retained native ID should be valid");
+    assert_session_state(
+        &store,
+        SessionIdentity::Main(MainSessionId::from(SessionId::from_native(&retained))),
+        DetailedState::Starting,
+    )
+    .await;
+}
+
+fn write_live_claude_session(
+    registry: &Path,
+    session_id: &str,
+    title: &str,
+    status: &str,
+    process: &watchdog_domain::ProcessIdentity,
+) {
+    fs::write(
+        registry.join(format!("{}.json", process.pid().value())),
+        serde_json::to_vec(&json!({
+            "pid": process.pid().value(),
+            "sessionId": session_id,
+            "cwd": "/host/repositories/repo",
+            "kind": "interactive",
+            "name": title,
+            "procStart": process.start_time_ticks().to_string(),
+            "status": status,
+            "updatedAt": current_time_ms(),
+            "version": watchdog_claude::TESTED_CLAUDE_VERSION,
+        }))
+        .expect("registry JSON should serialize"),
+    )
+    .expect("registry record should be written");
 }
 
 async fn assert_patch_and_minor_compatibility_policy(
