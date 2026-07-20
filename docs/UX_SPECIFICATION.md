@@ -90,9 +90,12 @@ Zero-count groups are omitted. A child problem does not replace the main session
 | Finished | `✓` | Green/muted terminal treatment | 3 |
 | Unknown | `?` | Hatched/neutral warning treatment | 3 |
 
-`UPGRADE` is a separate actionable badge. Its accessible text names both the
-detected runtime version and the version tested by Watchdog when native evidence
-provides the former. It does not silently change the normalized state.
+`UPGRADE` is a separate actionable badge shown only when parsed detected and
+tested SemVer versions differ in major or minor. Patch, prerelease, and build
+metadata drift on the same major/minor line does not add it. Its accessible text
+names both versions. Missing or unparseable version evidence may degrade adapter
+health but does not prove a per-session mismatch. The badge does not silently
+change the normalized state.
 
 After a server restart, retained main sessions remain out of the default active
 view until current native evidence reconciles them. They remain available in the
@@ -218,6 +221,7 @@ Prepare release
 ```
 
 - The accessible badge description states which watchdog adapter needs an update.
+- Patch-only SemVer drift never displays this badge.
 - Best-effort state continues to render.
 - MCP includes the full warning field so the parent can tell the operator what failed.
 - A broad configured worktree allowlist does not by itself produce a degraded

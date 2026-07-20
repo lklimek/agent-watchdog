@@ -1007,14 +1007,25 @@ impl ClaudeDiscovery {
             .detected_version
             .clone()
             .or_else(|| self.detect_transcript_version(root, candidate));
-        let warning = detected_version.as_deref().map_or_else(
-            || error.compatibility_warning(),
-            |version| error.compatibility_warning_for_version(version),
-        );
-        let event_key = detected_version.as_deref().map_or_else(
-            || "bootstrap".to_owned(),
-            |version| format!("detected-version-v2:{version}"),
-        );
+        let Some(detected_version) = detected_version else {
+            if warning_needs_version {
+                let _ = self
+                    .emit_claude_compatibility_resolution(candidate, "version-unavailable")
+                    .await;
+            }
+            return;
+        };
+        if !minor_version_mismatch(&detected_version, watchdog_claude::TESTED_CLAUDE_VERSION) {
+            let _ = self
+                .emit_claude_compatibility_resolution(
+                    candidate,
+                    &format!("compatible-version:{detected_version}"),
+                )
+                .await;
+            return;
+        }
+        let warning = error.compatibility_warning_for_version(&detected_version);
+        let event_key = format!("detected-version-v2:{detected_version}");
         let _ = self
             .emit_claude_compatibility_warning(candidate, &event_key, warning)
             .await;
@@ -1424,10 +1435,21 @@ impl ClaudeDiscovery {
         let signal = match watchdog_claude::parse_transcript_record(record) {
             Ok(signal) => signal,
             Err(error) => {
-                let warning = watchdog_claude::parse_transcript_version(record).map_or_else(
-                    || error.compatibility_warning(),
-                    |version| error.compatibility_warning_for_version(version.as_str()),
-                );
+                let Some(version) = watchdog_claude::parse_transcript_version(record) else {
+                    return Ok((None, true));
+                };
+                if !minor_version_mismatch(version.as_str(), watchdog_claude::TESTED_CLAUDE_VERSION)
+                {
+                    return Ok((
+                        self.emit_claude_compatibility_resolution(
+                            candidate,
+                            &format!("compatible-version:{}", version.as_str()),
+                        )
+                        .await,
+                        true,
+                    ));
+                }
+                let warning = error.compatibility_warning_for_version(version.as_str());
                 return Ok((
                     self.emit_claude_compatibility_warning(candidate, event_key, warning)
                         .await,
@@ -1522,6 +1544,33 @@ impl ClaudeDiscovery {
         {
             return None;
         }
+        self.emit_claude_compatibility_payload(
+            candidate,
+            event_key,
+            ObservationPayload::Compatibility(warning),
+        )
+        .await
+    }
+
+    async fn emit_claude_compatibility_resolution(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        event_key: &str,
+    ) -> Option<ObservationId> {
+        self.emit_claude_compatibility_payload(
+            candidate,
+            event_key,
+            ObservationPayload::CompatibilityResolved,
+        )
+        .await
+    }
+
+    async fn emit_claude_compatibility_payload(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        event_key: &str,
+        payload: ObservationPayload,
+    ) -> Option<ObservationId> {
         let observation_id = ObservationId::from_native(
             RuntimeKind::ClaudeCode,
             "transcript-compatibility",
@@ -1533,7 +1582,7 @@ impl ClaudeDiscovery {
             candidate.subject.clone(),
             self.clock.now(),
             claude_transcript_source("transcript:compatibility").ok()?,
-            ObservationPayload::Compatibility(warning),
+            payload,
         )
         .ok()?;
         self.api
@@ -2801,6 +2850,15 @@ impl CodexDiscovery {
             }
             Err(error) => {
                 report.warn();
+                if !minor_version_mismatch(adapter_version, watchdog_codex::TESTED_CODEX_VERSION) {
+                    return Ok(self
+                        .emit_codex_compatibility_resolution(
+                            target.subject,
+                            adapter_version,
+                            event_key,
+                        )
+                        .await);
+                }
                 Ok(self
                     .emit_codex_compatibility_warning(
                         target.subject,
@@ -2844,6 +2902,37 @@ impl CodexDiscovery {
         event_key: &str,
         warning: watchdog_domain::CompatibilityWarning,
     ) -> Option<ObservationId> {
+        self.emit_codex_compatibility_payload(
+            subject,
+            adapter_version,
+            event_key,
+            ObservationPayload::Compatibility(warning),
+        )
+        .await
+    }
+
+    async fn emit_codex_compatibility_resolution(
+        &self,
+        subject: &NativeSessionKey,
+        adapter_version: &str,
+        event_key: &str,
+    ) -> Option<ObservationId> {
+        self.emit_codex_compatibility_payload(
+            subject,
+            adapter_version,
+            event_key,
+            ObservationPayload::CompatibilityResolved,
+        )
+        .await
+    }
+
+    async fn emit_codex_compatibility_payload(
+        &self,
+        subject: &NativeSessionKey,
+        adapter_version: &str,
+        event_key: &str,
+        payload: ObservationPayload,
+    ) -> Option<ObservationId> {
         let source = ObservationSource::new(
             AdapterIdentity::new(RuntimeKind::CodexCli, adapter_version).ok()?,
             "rollout:compatibility",
@@ -2859,7 +2948,7 @@ impl CodexDiscovery {
             subject.clone(),
             self.clock.now(),
             source,
-            ObservationPayload::Compatibility(warning),
+            payload,
         )
         .ok()?;
         self.api
@@ -3193,6 +3282,30 @@ fn codex_rollout_observation_for_kind(
     .map_err(|_| ())
 }
 
+fn minor_version_mismatch(detected: &str, tested: &str) -> bool {
+    match (
+        semver_compatibility_line(detected),
+        semver_compatibility_line(tested),
+    ) {
+        (Some(detected), Some(tested)) => detected != tested,
+        _ => false,
+    }
+}
+
+fn semver_compatibility_line(version: &str) -> Option<(u64, u64)> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let version = version.split_once('+').map_or(version, |(core, _)| core);
+    let version = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor))
+}
+
 fn recent_capability_file(
     root: &CapabilityRoot,
     relative: &Path,
@@ -3410,7 +3523,10 @@ mod tests {
 
     use watchdog_domain::{NativeSessionKey, RuntimeKind, SessionId};
 
-    use super::{CodexCorrelationLogCache, DiscoveryAliasRegistry, WorktreePathMapping};
+    use super::{
+        CodexCorrelationLogCache, DiscoveryAliasRegistry, WorktreePathMapping,
+        minor_version_mismatch,
+    };
 
     fn session(runtime: RuntimeKind, native_id: &str) -> SessionId {
         SessionId::from_native(
@@ -3444,6 +3560,16 @@ mod tests {
 
         aliases.bind(wrapper.clone(), first);
         assert_eq!(aliases.resolve(&wrapper), None);
+    }
+
+    #[test]
+    fn upgrade_badge_requires_a_major_or_minor_semver_mismatch() {
+        assert!(!minor_version_mismatch("2.1.212", "2.1.214"));
+        assert!(!minor_version_mismatch("v2.1.0-beta.1", "2.1.214"));
+        assert!(!minor_version_mismatch("2.1.214+build.7", "2.1.214"));
+        assert!(minor_version_mismatch("2.2.0", "2.1.214"));
+        assert!(minor_version_mismatch("3.1.0", "2.1.214"));
+        assert!(!minor_version_mismatch("unknown", "2.1.214"));
     }
 
     #[test]

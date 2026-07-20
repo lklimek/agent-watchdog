@@ -72,7 +72,7 @@ not accepted deferrals.
 | FR-MCP-004 | T-DATA-003, T-MCP-005 | Transactional parent inbox and durable cursor across reconnect/restart | Automated |
 | FR-MCP-005 | T-MCP-006 | Durable `AgentEventView` includes the explicit bounded FR-STA-007 diagnostic bundle without transcript retrieval | Automated |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |
-| FR-MCP-007 | T-MCP-008 | Actionable `UPGRADE` compatibility warning in snapshots, MCP, API, and UI | Automated |
+| FR-MCP-007 | T-MCP-008 | Major/minor-gated actionable `UPGRADE` warning in snapshots, MCP, API, and UI | Automated |
 
 ## UI, notifications, and API
 
@@ -122,7 +122,7 @@ not accepted deferrals.
 | Requirement | Acceptance tests | Implementation and test evidence | Status |
 |---|---|---|---|
 | FR-COMP-001 | T-COMP-001 | Version-guarded adapters and documented observed versions | Automated; owner-authorized live probe passed best-effort discovery, formal isolated matrix pending |
-| FR-COMP-002 | T-COMP-002, T-EVD-005, T-KILL-012, T-OPS-004 | Version-explicit per-session `UPGRADE`, best-effort state, termination suspension | Automated |
+| FR-COMP-002 | T-COMP-002, T-EVD-005, T-KILL-012, T-OPS-004 | Major/minor-gated, version-explicit per-session `UPGRADE`, best-effort state, termination suspension | Automated |
 | FR-COMP-003 | T-COMP-004 | Synthetic adapters exist; Claudius transfer pitfalls audited; owner-authorized corrective live probe recorded separately from the formal matrix | **Corrective live evidence passed; formal isolated live QA pending** |
 | FR-COMP-004 | T-COMP-005 | Reducer/correlation/timer/safety slices have synthetic typed-event TDD evidence and final diff self-review | Complete |
 | FR-COMP-005 | T-COMP-006 | Per-commit formatter, targeted tests, strict Clippy, audit/deny, Compose/image/browser release evidence | Final Linux engineering gates passed |

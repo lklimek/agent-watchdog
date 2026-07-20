@@ -202,25 +202,16 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
         Some("Claude transcript activity")
     );
 
-    transcript
-        .write_all(b"{\"type\":\"future-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"version\":\"2.1.212\"}\n")
-        .expect("future schema record should append");
-    clock.advance(DurationMs::new(1_000));
-    let drifted = reconcile_claude_fixture(
+    assert_patch_and_minor_compatibility_policy(
+        &mut transcript,
+        &clock,
         &discovery,
         &projects_root,
-        &runtime_mapping,
-        &worktree_mapping,
+        (&runtime_mapping, &worktree_mapping),
+        &store,
+        children[0].session,
     )
     .await;
-    assert_eq!(drifted.warning_count(), 1);
-    let drifted_snapshot = load_snapshot(&store, children[0].session).await;
-    let warning = drifted_snapshot
-        .reducer_snapshot()
-        .expect("reducer snapshot should exist")
-        .compatibility_warning()
-        .expect("schema drift should be actionable");
-    assert_upgrade_versions(warning, "Claude Code 2.1.212", "Claude Code 2.1.214");
 
     assert_versionless_drift_preserves_detected_warning(
         &mut transcript,
@@ -232,6 +223,47 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
         children[0].session,
     )
     .await;
+}
+
+async fn assert_patch_and_minor_compatibility_policy(
+    transcript: &mut fs::File,
+    clock: &FakeClock,
+    discovery: &ClaudeDiscovery,
+    projects_root: &Path,
+    mappings: (&WorktreePathMapping, &WorktreePathMapping),
+    store: &WatchdogStore,
+    session: SessionIdentity,
+) {
+    transcript
+        .write_all(b"{\"type\":\"future-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"version\":\"2.1.212\"}\n")
+        .expect("future schema record should append");
+    clock.advance(DurationMs::new(1_000));
+    let drifted = reconcile_claude_fixture(discovery, projects_root, mappings.0, mappings.1).await;
+    assert_eq!(drifted.warning_count(), 1);
+    let drifted_snapshot = load_snapshot(store, session).await;
+    assert!(
+        drifted_snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .compatibility_warning()
+            .is_none(),
+        "patch-only drift must not add an UPGRADE badge"
+    );
+
+    transcript
+        .write_all(b"{\"type\":\"future-minor-record\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"version\":\"2.2.0\"}\n")
+        .expect("minor schema record should append");
+    clock.advance(DurationMs::new(1_000));
+    let minor_drift =
+        reconcile_claude_fixture(discovery, projects_root, mappings.0, mappings.1).await;
+    assert_eq!(minor_drift.warning_count(), 1);
+    let minor_snapshot = load_snapshot(store, session).await;
+    let warning = minor_snapshot
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist")
+        .compatibility_warning()
+        .expect("schema drift should be actionable");
+    assert_upgrade_versions(warning, "Claude Code 2.2.0", "Claude Code 2.1.214");
 }
 
 async fn assert_claude_child_metadata(store: &WatchdogStore, session: SessionIdentity) {
@@ -272,7 +304,7 @@ async fn assert_versionless_drift_preserves_detected_warning(
         .expect("reducer snapshot should exist")
         .compatibility_warning()
         .expect("schema drift should remain actionable");
-    assert_upgrade_versions(warning, "Claude Code 2.1.212", "Claude Code 2.1.214");
+    assert_upgrade_versions(warning, "Claude Code 2.2.0", "Claude Code 2.1.214");
 }
 
 fn assert_upgrade_versions(
