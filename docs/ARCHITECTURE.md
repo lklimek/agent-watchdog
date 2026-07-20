@@ -250,12 +250,16 @@ adapters can emit the same observations without filesystem semantics.
 Evidence precedence:
 
 1. official lifecycle hooks when configured;
-2. exact team/member/task configuration and session IDs;
-3. session/subagent transcripts read incrementally;
-4. process ancestry and worktree evidence;
-5. timestamp heuristics.
+2. PID/start-verified live-session registry entries;
+3. exact team/member/task configuration and session IDs;
+4. session/subagent transcripts read incrementally;
+5. process ancestry and worktree evidence;
+6. timestamp heuristics.
 
-Automatic discovery watches the mounted Claude projects, teams, and tasks.
+Automatic discovery watches the mounted Claude projects, teams, tasks, and
+process-scoped live-session registry. Registry files are direct
+`sessions/<pid>.json` entries parsed under the same bounded capability rules as
+other internal runtime state.
 Optional official lifecycle hooks post to the exact `/hooks/claude` endpoint
 through the trusted-source Traefik route and application Bearer authentication.
 Hooks are enrichment, not a monitoring prerequisite. Team files are read-only
@@ -290,6 +294,22 @@ native `version`; it never scans the whole transcript or repeats the read after 
 successful or failed lookup during the server process.
 Once a version-specific warning is present, later versionless incompatible
 records cannot replace it with a less informative warning.
+
+Before transcript and cross-runtime correlation, Claude reconciliation reads a
+complete live-registry snapshot. Each entry must be an interactive main with a
+bounded session ID, cwd, title, status, version, PID, and kernel start ticks. The
+PID filename and record must agree, and a fresh `/proc` read must confirm the
+PID/start identity before the registry can clear the restart gate or add process
+evidence. Executable evidence uses `/proc/<pid>/exe` when container policy allows
+it and falls back to the bounded kernel `comm` name; PID plus kernel start ticks
+remain the reuse-resistant identity. A complete parseable scan makes retained
+Claude mains absent from the registry terminal, preventing old transcripts from
+remaining stalled top-level cards. Any scan uncertainty, malformed record,
+process-identity mismatch, or schema drift disables absence inference for that
+pass and degrades health. The algorithm never deduplicates by cwd: two verified
+live entries in one directory remain two mains. Running this step before Codex
+correlation removes dead parent candidates, allowing an explicitly
+Claude-originated Codex thread to select the one live parent.
 Team configs modified within the same 24-hour bootstrap window are reconciled
 before project transcripts; older retained configs do not create sessions in a
 fresh store. Every non-lead member is retained with its native active flag. An

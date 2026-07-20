@@ -10,7 +10,8 @@ use thiserror::Error;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, CompatibilityWarning, DetailedState, DomainInputError,
     EvidenceTrust, NativeSessionKey, ObservationEnvelope, ObservationError, ObservationId,
-    ObservationPayload, ObservationSource, RuntimeKind, SessionKind, TimePoint, WarningKind,
+    ObservationPayload, ObservationSource, ProcessId, RuntimeKind, SessionKind, TimePoint,
+    WarningKind,
 };
 
 /// Largest accepted official hook payload.
@@ -483,6 +484,120 @@ pub fn parse_transcript_record(input: &[u8]) -> Result<ClaudeTranscriptSignal, C
     })
 }
 
+/// Exact live Claude CLI session metadata from the process-scoped registry.
+#[derive(Clone, Debug)]
+pub struct ClaudeLiveSession {
+    subject: NativeSessionKey,
+    pid: ProcessId,
+    process_start_ticks: u64,
+    cwd: PathBuf,
+    title: Option<BoundedText<256>>,
+    version: BoundedText<128>,
+    state: DetailedState,
+    updated_at_ms: i64,
+}
+
+impl ClaudeLiveSession {
+    /// Native Claude conversation identity.
+    #[must_use]
+    pub const fn subject(&self) -> &NativeSessionKey {
+        &self.subject
+    }
+
+    /// Process ID claimed by the registry and requiring fresh procfs verification.
+    #[must_use]
+    pub const fn pid(&self) -> ProcessId {
+        self.pid
+    }
+
+    /// Kernel process start ticks claimed by the registry.
+    #[must_use]
+    pub const fn process_start_ticks(&self) -> u64 {
+        self.process_start_ticks
+    }
+
+    /// Untrusted startup directory requiring capability validation.
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        self.cwd.as_path()
+    }
+
+    /// Native human-readable session name when present.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Detected Claude Code version.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        self.version.as_str()
+    }
+
+    /// Normalized live session state.
+    #[must_use]
+    pub const fn state(&self) -> DetailedState {
+        self.state
+    }
+
+    /// Native registry revision time used only for idempotency.
+    #[must_use]
+    pub const fn updated_at_ms(&self) -> i64 {
+        self.updated_at_ms
+    }
+}
+
+/// Parse one bounded live-session registry record without trusting its PID.
+///
+/// # Errors
+///
+/// Returns [`ClaudeParseError`] for oversized, partial, non-interactive, or
+/// unsupported records. Callers must freshly verify PID/start ticks in procfs.
+pub fn parse_live_session_record(input: &[u8]) -> Result<ClaudeLiveSession, ClaudeParseError> {
+    if input.len() > MAX_HOOK_BYTES {
+        return Err(ClaudeParseError::InputTooLarge {
+            actual_bytes: input.len(),
+            max_bytes: MAX_HOOK_BYTES,
+        });
+    }
+    let raw: RawLiveSession =
+        serde_json::from_slice(input).map_err(|_| ClaudeParseError::Malformed)?;
+    if required(raw.kind.as_deref(), "kind")? != "interactive" {
+        return Err(ClaudeParseError::UnsupportedRecord);
+    }
+    let state = match required(raw.status.as_deref(), "status")? {
+        "busy" => DetailedState::Running,
+        "idle" => DetailedState::WaitingForUser,
+        _ => return Err(ClaudeParseError::UnsupportedState),
+    };
+    let pid = ProcessId::new(raw.pid.ok_or(ClaudeParseError::MissingField("pid"))?)
+        .map_err(|_| ClaudeParseError::InvalidProcessIdentity)?;
+    let process_start_ticks = required(raw.proc_start.as_deref(), "procStart")?
+        .parse()
+        .map_err(|_| ClaudeParseError::InvalidProcessIdentity)?;
+    let updated_at_ms = raw
+        .updated_at
+        .filter(|value| *value >= 0)
+        .ok_or(ClaudeParseError::MissingField("updatedAt"))?;
+    Ok(ClaudeLiveSession {
+        subject: native_key(required(raw.session_id.as_deref(), "sessionId")?)?,
+        pid,
+        process_start_ticks,
+        cwd: PathBuf::from(required(raw.cwd.as_deref(), "cwd")?),
+        title: raw
+            .name
+            .filter(|value| !value.is_empty())
+            .map(|value| BoundedText::new("name", value))
+            .transpose()?,
+        version: BoundedText::new(
+            "claude_version",
+            required(raw.version.as_deref(), "version")?,
+        )?,
+        state,
+        updated_at_ms,
+    })
+}
+
 /// Bounded metadata stored beside a Claude subagent transcript.
 #[derive(Clone, Debug)]
 pub struct ClaudeSubagentMetadata {
@@ -612,6 +727,9 @@ pub enum ClaudeParseError {
     /// Native task status cannot be normalized safely.
     #[error("Claude task state is unsupported")]
     UnsupportedState,
+    /// Registry PID or kernel start identity is invalid.
+    #[error("Claude live-session process identity is invalid")]
+    InvalidProcessIdentity,
     /// Team member count exceeded the bounded scan contract.
     #[error("Claude team exceeds the member limit")]
     TooManyMembers {
@@ -709,6 +827,22 @@ struct RawTranscript {
     git_branch: Option<String>,
     #[serde(rename = "agentSetting", alias = "agent_setting")]
     agent_setting: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawLiveSession {
+    pid: Option<u32>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    cwd: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "procStart")]
+    proc_start: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "updatedAt")]
+    updated_at: Option<i64>,
     version: Option<String>,
 }
 

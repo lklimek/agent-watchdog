@@ -4,16 +4,20 @@ allowed_worktree_roots = ["/monitored/worktrees", "/monitored/agent-worktrees"]
 native_worktree_roots = ["/home/example/git", "/data/git-worktrees"]
 # Runtime-native roots correspond positionally to their narrow read-only mounts.
 # They are needed because state databases retain host paths that do not exist in
-# the container. Edit these examples to match the bind-mount sources.
+# the container. The Claude sessions root is the process-scoped live registry;
+# keep it after projects, teams, and tasks. Edit these examples to match the
+# bind-mount sources.
 native_claude_roots = [
   "/home/example/.claude/projects",
   "/home/example/.claude/teams",
   "/home/example/.claude/tasks",
+  "/home/example/.claude/sessions",
 ]
 claude_roots = [
   "/monitored/claude/projects",
   "/monitored/claude/teams",
   "/monitored/claude/tasks",
+  "/monitored/claude/sessions",
 ]
 native_codex_roots = [
   "/home/example/.codex",

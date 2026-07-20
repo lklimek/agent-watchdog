@@ -6,6 +6,7 @@ COPY . .
 RUN mkdir -p \
     /rootfs/etc/agent-watchdog \
     /rootfs/monitored/claude/projects \
+    /rootfs/monitored/claude/sessions \
     /rootfs/monitored/claude/teams \
     /rootfs/monitored/claude/tasks \
     /rootfs/monitored/codex/state \

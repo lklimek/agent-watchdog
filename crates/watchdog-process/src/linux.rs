@@ -22,6 +22,7 @@ const PROC_ROOT: &str = "/proc";
 const MAX_STAT_BYTES: u64 = 64 * 1024;
 const MAX_IO_BYTES: u64 = 64 * 1024;
 const MAX_COMMAND_BYTES: u64 = 16 * 1024;
+const MAX_COMM_BYTES: u64 = 512;
 
 /// Linux procfs sampler with a hard process-enumeration budget.
 #[derive(Clone, Copy, Debug)]
@@ -404,11 +405,16 @@ fn read_stat(pid: ProcessId) -> Result<ProcStat, ProcessReadError> {
 }
 
 fn read_executable(pid: ProcessId) -> Result<BoundedText<512>, ProcessReadError> {
-    let executable =
-        fs::read_link(path(pid, "exe")).map_err(|source| ProcessReadError::Read { pid, source })?;
-    let executable = executable
-        .to_str()
-        .ok_or(ProcessReadError::NonUtf8Executable { pid })?;
+    let executable = if let Ok(executable) = fs::read_link(path(pid, "exe")) {
+        executable
+            .to_str()
+            .ok_or(ProcessReadError::NonUtf8Executable { pid })?
+            .to_owned()
+    } else {
+        let comm = read_bounded(path(pid, "comm"), MAX_COMM_BYTES)
+            .map_err(|source| ProcessReadError::Read { pid, source })?;
+        format!("comm:{}", comm.trim_end())
+    };
     BoundedText::new("process_executable", executable)
         .map_err(|source| ProcessReadError::ExecutableBound { pid, source })
 }

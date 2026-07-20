@@ -32,6 +32,7 @@ not accepted deferrals.
 | FR-DIS-015 | T-DIS-018 | Shared Claude/Companion wrapper alias registry | Automated and live-verified |
 | FR-DIS-016 | T-DIS-019 | Recent terminal Companion bootstrap with tracked-job exception | Automated and fresh-volume verified |
 | FR-DIS-017 | T-DIS-021 | Shared-team-parent transcript alias without false main promotion | Automated and live-derived regression |
+| FR-DIS-018 | T-DIS-022 | PID/start-verified Claude live-registry reconciliation and absence handling | Automated and live-verified |
 | FR-EVD-001 | T-EVD-001 | Linux `WatchService`, targeted invalidation, server watcher supervisor | Automated |
 | FR-EVD-002 | T-EVD-001 | Durable incremental cursor and complete-record reader; huge sparse-file test | Automated |
 | FR-EVD-003 | T-EVD-003, T-EVD-004 | File identity/truncation reconciliation, watcher uncertainty, generation-guarded health | Automated |

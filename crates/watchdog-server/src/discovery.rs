@@ -32,6 +32,7 @@ const MAX_CLAUDE_TRANSCRIPT_BATCHES: usize = 4;
 const MAX_CLAUDE_TRANSCRIPT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CLAUDE_TRANSCRIPT_RECORDS: usize = 128;
 const MAX_CLAUDE_ALIAS_CACHE: usize = 2_048;
+const MAX_CLAUDE_SESSIONS: u32 = 1_000;
 const CODEX_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_CODEX_THREADS: u32 = 1_000;
 const CODEX_ROLLOUT_PARSER_VERSION: u32 = 1;
@@ -575,6 +576,9 @@ impl ClaudeDiscovery {
             }
             scans.push((root, scan));
         }
+        let live_registry_present = self
+            .reconcile_live_registries(&scans, worktree_mappings, &mut report, &mut mains)
+            .await;
         let mut aliases = ClaudeTeamTranscriptAliases::default();
         let mut teams = Vec::new();
         for (root, scan) in &scans {
@@ -638,7 +642,298 @@ impl ClaudeDiscovery {
                 .await;
             }
         }
+        self.complete_absent_live_mains_if_complete(live_registry_present, &mut report)
+            .await;
         report
+    }
+
+    async fn complete_absent_live_mains_if_complete(
+        &self,
+        present: Option<BTreeSet<SessionId>>,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        if let Some(present) = present
+            && self
+                .complete_absent_live_mains(&present, report)
+                .await
+                .is_err()
+        {
+            report.warn();
+        }
+    }
+
+    async fn reconcile_live_registries(
+        &self,
+        scans: &[(CapabilityRoot, watchdog_runtime::ScanResult)],
+        worktree_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+        mains: &mut BTreeSet<SessionId>,
+    ) -> Option<BTreeSet<SessionId>> {
+        let mut present = BTreeSet::new();
+        let mut found = false;
+        let mut complete = true;
+        for (root, scan) in scans {
+            if !is_claude_live_registry_root(root) {
+                continue;
+            }
+            found = true;
+            if scan.uncertainty().is_some()
+                || self
+                    .reconcile_live_registry(
+                        root,
+                        scan,
+                        worktree_mappings,
+                        report,
+                        mains,
+                        &mut present,
+                    )
+                    .await
+                    .is_err()
+            {
+                complete = false;
+            }
+        }
+        (found && complete).then_some(present)
+    }
+
+    async fn reconcile_live_registry(
+        &self,
+        root: &CapabilityRoot,
+        scan: &watchdog_runtime::ScanResult,
+        worktree_mappings: &[WorktreePathMapping],
+        report: &mut RuntimeDiscoveryReport,
+        mains: &mut BTreeSet<SessionId>,
+        present: &mut BTreeSet<SessionId>,
+    ) -> Result<(), ()> {
+        for file in scan.files() {
+            if file.parent() != Some(root.path())
+                || file.extension().and_then(std::ffi::OsStr::to_str) != Some("json")
+            {
+                continue;
+            }
+            let Some(stem) = file.file_stem().and_then(std::ffi::OsStr::to_str) else {
+                report.warn();
+                return Err(());
+            };
+            let Ok(filename_pid) = stem.parse::<u32>() else {
+                report.warn();
+                return Err(());
+            };
+            let Ok(relative) = file.strip_prefix(root.path()) else {
+                report.warn();
+                return Err(());
+            };
+            let Ok(Some(bytes)) =
+                read_bounded_file(root, relative, watchdog_claude::MAX_HOOK_BYTES)
+            else {
+                report.warn();
+                return Err(());
+            };
+            let Ok(live) = watchdog_claude::parse_live_session_record(&bytes) else {
+                report.warn();
+                return Err(());
+            };
+            let session_id = SessionId::from_native(live.subject());
+            present.insert(session_id);
+            if live.pid().value() != filename_pid {
+                report.warn();
+                return Err(());
+            }
+            let Ok(sampler) = watchdog_process::LinuxProcessSampler::new(1) else {
+                report.warn();
+                return Err(());
+            };
+            let Ok(process) = sampler.read_identity(live.pid()).inspect_err(|error| {
+                tracing::warn!(
+                    event = "claude.live_process_verification_failed",
+                    pid = live.pid().value(),
+                    error = %error,
+                    "Claude live-session PID could not be freshly verified"
+                );
+            }) else {
+                report.warn();
+                return Err(());
+            };
+            if process.start_time_ticks() != live.process_start_ticks() {
+                report.warn();
+                return Err(());
+            }
+            let startup_directory =
+                validated_directory(Some(live.cwd()), worktree_mappings, report);
+            let view = self
+                .api
+                .discover_session(DiscoveredSession {
+                    runtime: RuntimeKind::ClaudeCode,
+                    native_id: live.subject().native_id().to_owned(),
+                    kind: SessionKind::Main,
+                    parent: None,
+                    event_key: format!(
+                        "claude-live:{}:{}",
+                        live.pid().value(),
+                        live.process_start_ticks()
+                    ),
+                    adapter_version: live.version().to_owned(),
+                    evidence_source: "claude:live-session-registry".to_owned(),
+                    title: live.title().map(ToOwned::to_owned),
+                    startup_directory,
+                })
+                .await
+                .map_err(|error| {
+                    log_reconcile_failure(RuntimeKind::ClaudeCode, "main", &error);
+                })?;
+            self.ingest_live_session_evidence(&live, &process).await?;
+            self.api
+                .mark_native_reconciled(
+                    view.session.session_id(),
+                    live.version(),
+                    "claude:live-session-registry:present",
+                )
+                .await
+                .map_err(|_| ())?;
+            if mains.insert(session_id) {
+                report.main_sessions = report.main_sessions.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    async fn ingest_live_session_evidence(
+        &self,
+        live: &watchdog_claude::ClaudeLiveSession,
+        process: &watchdog_domain::ProcessIdentity,
+    ) -> Result<(), ()> {
+        let source = || {
+            ObservationSource::new(
+                AdapterIdentity::new(RuntimeKind::ClaudeCode, live.version()).map_err(|_| ())?,
+                "live-session-registry",
+                EvidenceTrust::Authoritative,
+                None,
+            )
+            .map_err(|_| ())
+        };
+        let compatibility =
+            if minor_version_mismatch(live.version(), watchdog_claude::TESTED_CLAUDE_VERSION) {
+                ObservationPayload::Compatibility(
+                    watchdog_claude::ClaudeParseError::UnsupportedRecord
+                        .compatibility_warning_for_version(live.version()),
+                )
+            } else {
+                ObservationPayload::CompatibilityResolved
+            };
+        for (suffix, payload) in [
+            (
+                format!(
+                    "{}:process:{}",
+                    live.subject().native_id(),
+                    live.process_start_ticks()
+                ),
+                ObservationPayload::ProcessIdentity(process.clone()),
+            ),
+            (
+                format!(
+                    "{}:state:{}:{}:{}",
+                    live.subject().native_id(),
+                    live.process_start_ticks(),
+                    live.updated_at_ms(),
+                    state_key(live.state())
+                ),
+                ObservationPayload::NativeState(live.state()),
+            ),
+            (
+                format!(
+                    "{}:compatibility:{}:{}",
+                    live.subject().native_id(),
+                    live.version(),
+                    watchdog_claude::TESTED_CLAUDE_VERSION
+                ),
+                compatibility,
+            ),
+        ] {
+            let observation = ObservationEnvelope::new(
+                ObservationId::from_native(RuntimeKind::ClaudeCode, "live-session", suffix)
+                    .map_err(|_| ())?,
+                live.subject().clone(),
+                self.clock.now(),
+                source()?,
+                payload,
+            )
+            .map_err(|_| ())?;
+            self.api
+                .ingest_native_observation(observation)
+                .await
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    async fn complete_absent_live_mains(
+        &self,
+        present: &BTreeSet<SessionId>,
+        report: &mut RuntimeDiscoveryReport,
+    ) -> Result<(), ()> {
+        let sessions = self
+            .store
+            .sessions_by_kind(SessionKind::Main, MAX_CLAUDE_SESSIONS)
+            .await
+            .map_err(|_| ())?;
+        for session in sessions {
+            if session.native.runtime() != RuntimeKind::ClaudeCode
+                || present.contains(&session.session.session_id())
+            {
+                continue;
+            }
+            let Some(snapshot) = self.store.snapshot(session.session).await.map_err(|_| ())? else {
+                report.warn();
+                continue;
+            };
+            if matches!(
+                snapshot.state(),
+                DetailedState::Completed
+                    | DetailedState::Failed
+                    | DetailedState::Cancelled
+                    | DetailedState::Disappeared
+            ) {
+                continue;
+            }
+            let process_key = snapshot.reducer_snapshot().and_then(|reducer| {
+                reducer.process_identity().map(|process| {
+                    format!("{}:{}", process.pid().value(), process.start_time_ticks())
+                })
+            });
+            let event_key = process_key.unwrap_or_else(|| "legacy-absence".to_owned());
+            let observation = ObservationEnvelope::new(
+                ObservationId::from_native(
+                    RuntimeKind::ClaudeCode,
+                    "live-session-absent",
+                    format!("{}:{event_key}", session.native.native_id()),
+                )
+                .map_err(|_| ())?,
+                session.native,
+                self.clock.now(),
+                ObservationSource::new(
+                    AdapterIdentity::new(
+                        RuntimeKind::ClaudeCode,
+                        watchdog_claude::TESTED_CLAUDE_VERSION,
+                    )
+                    .map_err(|_| ())?,
+                    "live-session-registry:absent",
+                    EvidenceTrust::Authoritative,
+                    None,
+                )
+                .map_err(|_| ())?,
+                ObservationPayload::NativeState(DetailedState::Completed),
+            )
+            .map_err(|_| ())?;
+            if self
+                .api
+                .ingest_native_observation(observation)
+                .await
+                .is_err()
+            {
+                report.warn();
+            }
+        }
+        Ok(())
     }
 
     async fn reconcile_team(
@@ -1677,6 +1972,10 @@ fn claude_task_candidate(root: &CapabilityRoot, file: &Path) -> Option<(PathBuf,
     }
     let team_name = components[0].to_owned();
     Some((relative, team_name))
+}
+
+fn is_claude_live_registry_root(root: &CapabilityRoot) -> bool {
+    root.path().file_name().and_then(std::ffi::OsStr::to_str) == Some("sessions")
 }
 
 fn task_modified_ns(root: &CapabilityRoot, relative: &Path) -> Option<u128> {
