@@ -88,6 +88,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ${WATCHDOG_AGENT_WORKTREE_ROOT_PATH:?Set WATCHDOG_AGENT_WORKTREE_ROOT_PATH}
+        target: /monitored/agent-worktrees
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "/usr/local/bin/agent-watchdog", "healthcheck"]
       interval: 15s

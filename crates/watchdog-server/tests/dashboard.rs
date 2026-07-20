@@ -22,7 +22,8 @@ use watchdog_server::{
     DashboardService, DashboardSort, dashboard_router,
 };
 use watchdog_store::{
-    ApplyObservation, OutboxDestination, SessionMetadataRecord, SnapshotUpdate, WatchdogStore,
+    AdapterHealthRecord, AdapterHealthStatus, ApplyObservation, OutboxDestination,
+    SessionMetadataRecord, SnapshotUpdate, WatchdogStore,
 };
 use watchdog_testkit::FakeClock;
 
@@ -347,6 +348,53 @@ async fn dashboard_authentication_escaping_headers_and_read_only_routes_fail_clo
         .await
         .expect("router should respond");
     assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn page_warnings_name_each_degraded_runtime() {
+    let fixture = DashboardFixture::new().await;
+    for runtime in [RuntimeKind::ClaudeCode, RuntimeKind::CodexCli] {
+        fixture
+            .store
+            .save_adapter_health(&AdapterHealthRecord {
+                adapter: AdapterIdentity::new(runtime, "test").expect("adapter should be valid"),
+                status: AdapterHealthStatus::Degraded,
+                last_success: None,
+                last_error: Some(WallTimeMs::new(10_000)),
+                affected_scope: None,
+                message: Some(
+                    watchdog_domain::BoundedText::new(
+                        "message",
+                        "Some runtime records could not be reconciled safely",
+                    )
+                    .expect("message should be valid"),
+                ),
+            })
+            .await
+            .expect("health should persist");
+    }
+    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
+    let response = fixture
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/ui")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("body should be bounded")
+            .to_vec(),
+    )
+    .expect("dashboard should be UTF-8");
+
+    assert!(body.contains("Claude Code — <strong>DEGRADED</strong>"));
+    assert!(body.contains("Codex CLI — <strong>DEGRADED</strong>"));
 }
 
 #[tokio::test]

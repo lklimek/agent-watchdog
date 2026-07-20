@@ -37,8 +37,8 @@ pub use dashboard::{
 };
 pub use discovery::{
     ClaudeDiscovery, ClaudeDiscoveryReport, CodexDiscovery, CodexDiscoveryReport,
-    CompanionDiscovery, CompanionDiscoveryReport, PathMappingError, RuntimeDiscoveryReport,
-    WorktreePathMapping,
+    CompanionDiscovery, CompanionDiscoveryReport, DiscoveryAliasRegistry, PathMappingError,
+    RuntimeDiscoveryReport, WorktreePathMapping,
 };
 pub use filesystem_activity::{
     FilesystemActivityError, FilesystemActivityReconciler, FilesystemActivityReport,

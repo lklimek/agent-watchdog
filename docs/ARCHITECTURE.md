@@ -281,12 +281,20 @@ append batches. Existing message/tool bodies are neither replayed nor retained.
 Known metadata-only records advance the cursor without inventing activity;
 unknown complete records add an actionable `UPGRADE` warning to the affected
 session. Optional subagent sidecars contribute only their bounded `agentType`.
-Team configs are reconciled before project transcripts. A root-level teammate
-transcript is rebound to the one active team member whose native `agentType` and
-cwd both match, preventing its independent transcript UUID from creating a
-duplicate main-session card. Ambiguous matches remain independent rather than
-guessing. Positive bindings are cached under the same 2,048-entry bound; after
-a restart, an unresolved teammate cursor performs one bounded prefix recheck.
+Team configs modified within the same 24-hour bootstrap window are reconciled
+before project transcripts; older retained configs do not create sessions in a
+fresh store. Every non-lead member is retained with its native active flag. An
+inactive member produces a completed state unless a task or hook supplies a more
+specific terminal outcome.
+
+A root-level teammate transcript is rebound to the one active team member whose
+native `agentType` and cwd both match, preventing its independent transcript UUID
+from creating a duplicate main-session card. A main transcript may likewise be
+rebound to a configured team lead when exactly one recent lead has the same
+capability-validated cwd. This lead rule is deliberately one-to-one and logs its
+heuristic basis and confidence. Ambiguous matches remain independent rather than
+guessing. Positive bindings are cached under the same 2,048-entry bound; after a
+restart, an unresolved transcript cursor performs one bounded prefix recheck.
 
 Task snapshots are joined through the team config's exact native name and a
 unique active member owner. Unassigned tasks remain neutral. For each member,
@@ -304,6 +312,23 @@ Evidence precedence:
 3. incremental rollout JSONL records;
 4. process ancestry and worktree evidence;
 5. timestamp heuristics.
+
+Rollout `event_msg` records are decoded one level further for the supported
+`task_started` and `task_complete` lifecycle markers. Those records produce typed
+running/completed state; other supported rollout records remain content-free
+progress observations. On first sight only, discovery also inspects at most the
+last 1 MiB/128 complete records for the newest supported lifecycle marker before
+placing the durable cursor at EOF. This recovers a completion written before
+Watchdog started without replaying a huge transcript; later scans read only
+appended complete records.
+
+Current rollout metadata also retains the bounded `originator`. When it says
+Claude launched the thread, discovery may attach the Codex thread beneath a
+Claude main only when one nonterminal candidate matches by validated startup
+directory, or by canonical repository across a configured Git worktree. This is
+a heuristic relation with an explicit evidence basis and confidence in logs;
+missing or multiple candidates leave the Codex thread independent. Cwd without
+the explicit Claude origin never establishes this cross-runtime relation.
 
 Internal SQLite/JSONL schemas are guarded by runtime version and field-level
 parsing. The adapter opens native SQLite read-only and tolerates absent WAL/SHM;
@@ -346,6 +371,18 @@ uses it only to reconcile summary/detail consistency. It never grants automatic
 filesystem ownership or persists it as the child's startup directory. An exact
 child worktree must come from a native runtime source that identifies it or from
 the child's explicit MCP session/watch-path registration.
+
+Claude reconciliation runs first and publishes a bounded in-process alias from a
+wrapper transcript session to its canonical team member. Companion parent lookup
+reuses that alias, so the job joins the existing Claude root rather than creating
+a wrapper main card. The alias registry is repopulated from bounded transcript
+metadata after every restart; conflicts become ambiguous and are never selected.
+
+Fresh-store Companion bootstrap retains every active record, but admits a
+terminal record only when its per-job detail file was modified within 24 hours.
+Once a job is tracked, a later summary-only terminal transition remains valid so
+native detail pruning cannot strand it as running. This filters accumulated
+terminal history without deleting native files or Watchdog's retained database.
 
 For `jobs/<safe-job-id>.log`, Watchdog persists only device, inode, and byte
 offset. The first sighting starts at EOF; a later increase on the same file

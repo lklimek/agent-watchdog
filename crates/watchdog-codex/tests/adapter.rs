@@ -177,6 +177,67 @@ fn rollout_activity_uses_file_subject_and_does_not_retain_message_body() {
 }
 
 #[test]
+fn rollout_event_messages_preserve_supported_task_lifecycle() {
+    let parser = CodexRolloutParser::new("0.144.6").expect("version should be valid");
+    let subject =
+        NativeSessionKey::new(RuntimeKind::CodexCli, "claude-child").expect("valid subject");
+
+    for (event_type, expected) in [
+        ("task_started", DetailedState::Running),
+        ("task_complete", DetailedState::Completed),
+    ] {
+        let record = serde_json::json!({
+            "timestamp": "2026-07-20T07:44:35Z",
+            "type": "event_msg",
+            "payload": {
+                "type": event_type,
+                "last_agent_message": "SECRET_TRANSCRIPT_BODY"
+            }
+        });
+        let bytes = serde_json::to_vec(&record).expect("fixture should serialize");
+        let evidence = parser
+            .parse_record(&bytes, Some(&subject), event_type, now())
+            .expect("supported lifecycle event should parse");
+
+        assert!(matches!(
+            evidence.observation().payload(),
+            ObservationPayload::NativeState(state) if *state == expected
+        ));
+        assert!(!format!("{evidence:?}").contains("SECRET_TRANSCRIPT_BODY"));
+    }
+}
+
+#[test]
+fn rollout_metadata_retains_bounded_launch_origin_and_repository() {
+    let parser = CodexRolloutParser::new("0.144.6").expect("version should be valid");
+    let evidence = parser
+        .parse_record(
+            br#"{
+                "type":"session_meta",
+                "payload":{
+                    "id":"claude-launched-thread",
+                    "cwd":"/work/child",
+                    "originator":"Claude Code",
+                    "source":"vscode",
+                    "git":{"repository_url":"https://github.com/example/project.git"},
+                    "base_instructions":"SECRET_INSTRUCTIONS"
+                }
+            }"#,
+            None,
+            "rollout-origin",
+            now(),
+        )
+        .expect("current rollout metadata should parse");
+
+    assert_eq!(evidence.originator(), Some("Claude Code"));
+    assert_eq!(
+        evidence.repository_url(),
+        Some("https://github.com/example/project.git")
+    );
+    assert!(!format!("{evidence:?}").contains("SECRET_INSTRUCTIONS"));
+}
+
+#[test]
 fn rollout_activity_without_file_identity_fails_closed() {
     let parser = CodexRolloutParser::new("0.144.5").expect("version should be valid");
     let error = parser

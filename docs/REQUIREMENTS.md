@@ -124,6 +124,13 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-DIS-007 | Configured root prefixes and paths discovered from active sessions are both watched. Agents may register additional allowlisted paths through MCP. | A registered path outside the configured prefix is rejected; an in-prefix path becomes observable. |
 | FR-DIS-008 | V1 provides standard Claude/Codex/Companion Docker path templates plus TOML overrides and additional allowlisted mappings. | The supported Docker install resolves every standard or additional host path to a concrete read-only bind; operators may add matched native/mounted roots without rebuilding. |
 | FR-DIS-009 | Sessions with different startup directories or Git worktrees must remain distinct even when they share a repository. | Two concurrent worktrees appear as separate main sessions and cannot refresh each other’s agent-specific clocks. |
+| FR-DIS-010 | Runtime lifecycle records with a supported semantic state must be reduced as typed state, not generic activity. | Codex `task_started` becomes running and `task_complete` becomes completed; unknown supported activity remains progress. |
+| FR-DIS-011 | A recent Claude transcript may represent a retained team lead whose configured `leadSessionId` differs after a runtime reset. | A unique recent team-lead cwd match aliases the transcript to that lead; an ambiguous match remains separate and emits diagnostic evidence instead of guessing. |
+| FR-DIS-012 | Native team members retained as inactive must not remain indefinitely active or stalled. | An inactive member is retained as a child with a terminal completed state unless a more specific native task/hook terminal state is available. |
+| FR-DIS-013 | A Codex rollout explicitly launched by Claude should be monitored as a child of the one unambiguous active Claude orchestration, including across Git worktrees. | Explicit Claude origin plus one unique same-directory or same-repository Claude main creates a logged heuristic child relation; ambiguity leaves the Codex session unassigned. |
+| FR-DIS-014 | Historical runtime configuration files must not bootstrap dead sessions into a fresh database. | Team configs outside the 24-hour bootstrap window are ignored; retained database history is still removed only by the documented manual wipe. |
+| FR-DIS-015 | A Companion wrapper `sessionId` that resolves through a uniquely aliased Claude transcript must reuse the canonical Claude tree. | Companion jobs launched by an aliased `codex:codex-rescue` member add children under the team lead and do not create a wrapper main card. |
+| FR-DIS-016 | Retained terminal Companion history must not bootstrap old wrapper sessions. | A new terminal job is admitted only from a recent detail file; a previously tracked job may still receive a summary-only terminal update. Active records remain visible regardless of age. |
 
 ### 8.2 Evidence collection and performance
 
@@ -139,6 +146,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-EVD-008 | Runtime readers must avoid unbounded file reads, directory enumeration, and hot-loop logging. | Configured limits produce a degraded warning and targeted reconciliation rather than resource exhaustion. |
 | FR-EVD-009 | Filesystem/process evidence and native APIs are independent sources. | A disagreement becomes `unknown`; neither source silently overrides the other. |
 | FR-EVD-010 | Process sampling must compare cumulative CPU counters with the prior snapshot for the correlated process tree. On Linux, this includes each process's user, system, waited-for-children user, and waited-for-children system counters, plus currently correlated descendants. | Growth in any trustworthy counter records activity; growth across all four per-process counter classes is strong corroboration. Unchanged counters remain neutral evidence and do not alone prove a stall. |
+| FR-EVD-011 | Page-level degradation warnings identify the affected runtime in human-readable form. | Two degraded adapters render distinguishable runtime-labelled messages while preserving `/health` as the detailed source. |
 
 ### 8.3 Progress, delegation, and stall detection
 

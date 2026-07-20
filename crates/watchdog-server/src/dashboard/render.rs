@@ -35,6 +35,9 @@ pub(super) fn dashboard(snapshot: &DashboardSnapshot) -> Markup {
                     aside class="page-warnings" aria-label="Monitoring warnings" {
                         @for warning in &snapshot.warnings {
                             p {
+                                @if let Some(runtime) = warning.runtime {
+                                    (runtime_label(runtime)) " — "
+                                }
                                 strong { (warning.badge) }
                                 " " (warning.message)
                             }
@@ -75,6 +78,15 @@ pub(super) fn dashboard(snapshot: &DashboardSnapshot) -> Markup {
                 }
             }
         }
+    }
+}
+
+const fn runtime_label(runtime: watchdog_domain::RuntimeKind) -> &'static str {
+    match runtime {
+        watchdog_domain::RuntimeKind::ClaudeCode => "Claude Code",
+        watchdog_domain::RuntimeKind::CodexCli => "Codex CLI",
+        watchdog_domain::RuntimeKind::CodexCompanion => "Codex Companion",
+        watchdog_domain::RuntimeKind::OpenCode => "OpenCode",
     }
 }
 

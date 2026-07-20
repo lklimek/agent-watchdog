@@ -16,6 +16,16 @@ documents remain the source of truth.
   registration.
 - Multiple jobs reported by different wrapper sessions must remain distinct;
   do not collapse them behind a single coordinator-session identifier.
+- Claude Code team-lead IDs, transcript IDs after `/clear`, wrapper teammate
+  IDs, Companion job IDs, and Codex thread IDs are different identity layers.
+  Correlate them through exact references or one unique bounded heuristic; a
+  shared repository alone is insufficient when multiple mains match.
+- Native runtime files are retained history, not an active-session registry.
+  Fresh-store bootstrap applies recency to terminal/configuration artifacts,
+  preserves genuinely active records, and performs a bounded lifecycle tail
+  read before placing an incremental cursor at EOF. Tail recovery accepts only
+  newline-delimited complete records; syntactically valid trailing JSON without
+  its record boundary remains a partial write.
 
 ## Prefer privacy-preserving activity signals
 
@@ -28,6 +38,10 @@ documents remain the source of truth.
 - Main sessions are never automatic termination targets. Safety decisions need
   fresh process identity and watcher-health evidence, not merely an elapsed
   timer.
+- Reconciliation diagnostics are state changes, not heartbeat logs. A bounded
+  per-session cache emits a correlation selection or ambiguity only when first
+  observed or changed, keeping persistent uncertainty visible without flooding
+  structured logs.
 
 ## Compatibility claims need the right environment
 
