@@ -453,6 +453,28 @@ impl AgentApi {
         Ok(())
     }
 
+    /// Clear the restart gate after an adapter has re-observed a current native
+    /// session without claiming that the observation itself is progress.
+    pub(crate) async fn mark_native_reconciled(
+        &self,
+        session_id: SessionId,
+        adapter_version: &str,
+        evidence_source: &str,
+    ) -> Result<(), AgentApiError> {
+        let record = self
+            .inner
+            .store
+            .session_by_id(session_id)
+            .await?
+            .ok_or(AgentApiError::SessionNotFound)?;
+        let now = self.inner.clock.now();
+        let observation =
+            reconciliation_observation(&record, now, adapter_version, evidence_source)?;
+        let lane = self.lane(&record, now).await?;
+        lane.lock().await.apply_reconciled(observation).await?;
+        Ok(())
+    }
+
     /// Evaluate suspect, stall, and reminder timers for every retained session.
     ///
     /// No-op evaluations are kept entirely in memory and do not grow the
@@ -1429,6 +1451,32 @@ fn scheduler_observation(
             AdapterIdentity::new(record.native.runtime(), "agent-watchdog-scheduler-v1")?,
             "scheduler:tick",
             EvidenceTrust::Authoritative,
+            None,
+        )?,
+        ObservationPayload::SchedulerTick,
+    )?)
+}
+
+fn reconciliation_observation(
+    record: &StoredSessionRecord,
+    now: TimePoint,
+    adapter_version: &str,
+    evidence_source: &str,
+) -> Result<ObservationEnvelope, AgentApiError> {
+    let event_key = format!(
+        "{}:{}:{}",
+        record.session.session_id(),
+        now.wall_time().value(),
+        now.monotonic_ms()
+    );
+    Ok(ObservationEnvelope::new(
+        ObservationId::from_native(record.native.runtime(), "native-reconciled", event_key)?,
+        record.native.clone(),
+        now,
+        ObservationSource::new(
+            AdapterIdentity::new(record.native.runtime(), adapter_version)?,
+            evidence_source,
+            EvidenceTrust::Corroborating,
             None,
         )?,
         ObservationPayload::SchedulerTick,

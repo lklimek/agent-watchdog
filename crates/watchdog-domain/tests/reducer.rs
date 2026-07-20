@@ -505,3 +505,53 @@ fn causally_independent_compatibility_and_progress_inputs_converge() {
             .contains(&DomainEventKind::CompatibilityChanged)
     );
 }
+
+#[test]
+fn compatibility_only_evidence_does_not_clear_restart_reconciliation() {
+    let restarted = reduce(
+        initial(),
+        ReducerInput::Restarted(time(1)),
+        ReducerPolicy::default(),
+    );
+    let warned = reduce(
+        restarted.into_snapshot(),
+        ReducerInput::Observation(observation(
+            1,
+            time(2),
+            ObservationPayload::Compatibility(
+                watchdog_domain::CompatibilityWarning::new(
+                    watchdog_domain::WarningKind::Upgrade,
+                    "detected runtime drift",
+                )
+                .expect("warning should be valid"),
+            ),
+        )),
+        ReducerPolicy::default(),
+    );
+
+    assert!(warned.snapshot().reconciliation_required());
+    assert_eq!(
+        warned
+            .snapshot()
+            .compatibility_warning()
+            .expect("warning should be retained")
+            .badge(),
+        "UPGRADE"
+    );
+}
+
+#[test]
+fn scheduler_ticks_do_not_clear_restart_reconciliation() {
+    let restarted = reduce(
+        initial(),
+        ReducerInput::Restarted(time(1)),
+        ReducerPolicy::default(),
+    );
+    let ticked = reduce(
+        restarted.into_snapshot(),
+        ReducerInput::Observation(observation(1, time(2), ObservationPayload::SchedulerTick)),
+        ReducerPolicy::default(),
+    );
+
+    assert!(ticked.snapshot().reconciliation_required());
+}

@@ -100,6 +100,9 @@ fn schema_drift_and_oversize_become_upgrade_errors() {
         .expect_err("unknown method should not invent state");
     assert!(matches!(drift, CodexParseError::UnsupportedEvent));
     assert_eq!(drift.compatibility_warning().badge(), "UPGRADE");
+    let warning = drift.compatibility_warning_for_version("0.150.0");
+    assert!(warning.message().contains("detected Codex CLI 0.150.0"));
+    assert!(warning.message().contains("tested with Codex CLI 0.144.5"));
     assert!(!drift.to_string().contains("future/event"));
 
     let oversized = vec![b'x'; MAX_APP_SERVER_BYTES + 1];

@@ -18,8 +18,8 @@ use watchdog_domain::{
     TimePoint, WallTimeMs,
 };
 use watchdog_server::{
-    BasicAuthenticator, DashboardOutboxDispatcher, DashboardQuery, DashboardScope,
-    DashboardService, DashboardSort, dashboard_router,
+    AgentApi, BasicAuthenticator, DashboardOutboxDispatcher, DashboardQuery, DashboardScope,
+    DashboardService, DashboardSort, DiscoveredSession, dashboard_router,
 };
 use watchdog_store::{
     AdapterHealthRecord, AdapterHealthStatus, ApplyObservation, OutboxDestination,
@@ -214,6 +214,51 @@ impl DashboardFixture {
             BasicAuthenticator::new("watchdog", "secret").expect("auth should be valid"),
         )
     }
+}
+
+#[tokio::test]
+async fn active_projection_excludes_unreconciled_retained_mains() {
+    let fixture = DashboardFixture::new().await;
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(60_000),
+        60_000,
+    )));
+    let api = AgentApi::new(fixture.store.clone(), clock)
+        .await
+        .expect("API should initialize");
+    api.discover_session(DiscoveredSession {
+        runtime: RuntimeKind::ClaudeCode,
+        native_id: "retained-main".to_owned(),
+        kind: SessionKind::Main,
+        parent: None,
+        event_key: "retained-main:discover".to_owned(),
+        adapter_version: "test".to_owned(),
+        evidence_source: "dashboard-test".to_owned(),
+        title: Some("Retained main".to_owned()),
+        startup_directory: Some("/retained/main".to_owned()),
+    })
+    .await
+    .expect("main should be discovered");
+    api.mark_restarted()
+        .await
+        .expect("restart boundary should persist");
+
+    let active = fixture
+        .service
+        .snapshot(DashboardQuery::default())
+        .await
+        .expect("active snapshot should render");
+    assert!(active.sessions.is_empty());
+
+    let history = fixture
+        .service
+        .snapshot(DashboardQuery {
+            scope: DashboardScope::All,
+            sort: DashboardSort::Attention,
+        })
+        .await
+        .expect("history snapshot should render");
+    assert_eq!(history.sessions.len(), 1);
 }
 
 #[tokio::test]

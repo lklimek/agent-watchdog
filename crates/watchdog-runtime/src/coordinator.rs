@@ -175,12 +175,33 @@ impl SessionCoordinator {
         self.apply_input(observation, input).await
     }
 
+    /// Persist confirmation that the owning adapter re-observed this session
+    /// after a restart, without inventing activity or a native state change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError`] for non-tick payloads or persistence failure.
+    pub async fn apply_reconciled(
+        &mut self,
+        observation: ObservationEnvelope,
+    ) -> Result<ApplyResult, CoordinatorError> {
+        if !matches!(
+            observation.payload(),
+            watchdog_domain::ObservationPayload::SchedulerTick
+        ) {
+            return Err(CoordinatorError::InvalidInput);
+        }
+        let input = ReducerInput::Reconciled(observation.observed_at());
+        self.apply_input(observation, input).await
+    }
+
     async fn apply_input(
         &mut self,
         observation: ObservationEnvelope,
         input: ReducerInput,
     ) -> Result<ApplyResult, CoordinatorError> {
-        let transient_noop_allowed = matches!(input, ReducerInput::Tick(_));
+        let transient_noop_allowed =
+            matches!(input, ReducerInput::Tick(_) | ReducerInput::Reconciled(_));
         let output = reduce(self.snapshot.clone(), input, self.policy);
         if transient_noop_allowed
             && output.snapshot() == &self.snapshot

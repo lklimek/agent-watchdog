@@ -281,6 +281,12 @@ append batches. Existing message/tool bodies are neither replayed nor retained.
 Known metadata-only records advance the cursor without inventing activity;
 unknown complete records add an actionable `UPGRADE` warning to the affected
 session. Optional subagent sidecars contribute only their bounded `agentType`.
+For a retained generic warning created by an older Watchdog build, discovery may
+perform one cached bounded-prefix read of that exact transcript to recover its
+native `version`; it never scans the whole transcript or repeats the read after a
+successful or failed lookup during the server process.
+Once a version-specific warning is present, later versionless incompatible
+records cannot replace it with a less informative warning.
 Team configs modified within the same 24-hour bootstrap window are reconciled
 before project transcripts; older retained configs do not create sessions in a
 fresh store. Every non-lead member is retained with its native active flag. An
@@ -293,8 +299,13 @@ from creating a duplicate main-session card. A main transcript may likewise be
 rebound to a configured team lead when exactly one recent lead has the same
 capability-validated cwd. This lead rule is deliberately one-to-one and logs its
 heuristic basis and confidence. Ambiguous matches remain independent rather than
-guessing. Positive bindings are cached under the same 2,048-entry bound; after a
-restart, an unresolved transcript cursor performs one bounded prefix recheck.
+guessing. When several matching teammates share one unambiguous team lead, the
+wrapper transcript aliases only to that common root: member identity remains
+ambiguous, but no false main is created. Positive bindings are cached under the
+same 2,048-entry bound. After a restart, an unresolved transcript cursor—or a
+retained transcript identity that still requires reconciliation—performs one
+bounded prefix recheck so it can rebind to a newly rediscovered canonical team
+root without re-reading the transcript.
 
 Task snapshots are joined through the team config's exact native name and a
 unique active member owner. Unassigned tasks remain neutral. For each member,
@@ -652,7 +663,9 @@ Persisted monotonic values are never compared across server processes. Before
 startup reconciliation, the server durably marks every retained session as
 restart-required, clears its process-local monotonic observation cursor, and
 emits the reconciliation-required event. Fresh trusted native evidence clears
-that gate; deadlines and termination remain conservative until then.
+that gate; deadlines and termination remain conservative until then. The active
+dashboard omits retained mains whose gate remains set. Re-observing a current
+Claude team config clears the gate without advancing activity or native state.
 
 ## 14. MCP surface
 

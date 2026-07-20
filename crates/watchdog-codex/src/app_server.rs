@@ -380,13 +380,34 @@ impl CodexParseError {
     /// Actionable warning for affected sessions and adapter health.
     #[must_use]
     pub fn compatibility_warning(&self) -> CompatibilityWarning {
-        CompatibilityWarning::new(
-            WarningKind::Upgrade,
-            format!(
-                "Update Agent Watchdog's Codex adapter; tested with Codex CLI {}",
-                crate::TESTED_CODEX_VERSION
-            ),
-        )
-        .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))
+        Self::compatibility_warning_message(None)
+    }
+
+    /// Actionable warning including the detected Codex CLI version.
+    #[must_use]
+    pub fn compatibility_warning_for_version(
+        &self,
+        detected_version: &str,
+    ) -> CompatibilityWarning {
+        Self::compatibility_warning_message(Some(detected_version))
+    }
+
+    fn compatibility_warning_message(detected_version: Option<&str>) -> CompatibilityWarning {
+        let message = detected_version.map_or_else(
+            || {
+                format!(
+                    "Update Agent Watchdog's Codex adapter; tested with Codex CLI {}",
+                    crate::TESTED_CODEX_VERSION
+                )
+            },
+            |detected_version| {
+                format!(
+                    "Update Agent Watchdog's Codex adapter; detected Codex CLI {detected_version}, tested with Codex CLI {}",
+                    crate::TESTED_CODEX_VERSION
+                )
+            },
+        );
+        CompatibilityWarning::new(WarningKind::Upgrade, message)
+            .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))
     }
 }

@@ -131,6 +131,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-DIS-014 | Historical runtime configuration files must not bootstrap dead sessions into a fresh database. | Team configs outside the 24-hour bootstrap window are ignored; retained database history is still removed only by the documented manual wipe. |
 | FR-DIS-015 | A Companion wrapper `sessionId` that resolves through a uniquely aliased Claude transcript must reuse the canonical Claude tree. | Companion jobs launched by an aliased `codex:codex-rescue` member add children under the team lead and do not create a wrapper main card. |
 | FR-DIS-016 | Retained terminal Companion history must not bootstrap old wrapper sessions. | A new terminal job is admitted only from a recent detail file; a previously tracked job may still receive a summary-only terminal update. Active records remain visible regardless of age. |
+| FR-DIS-017 | A root-level Claude transcript matching multiple teammates under one unambiguous team lead must not become a separate main session. | The transcript aliases to the shared team root for hierarchy/activity purposes; candidates spanning multiple roots remain ambiguous. |
 
 ### 8.2 Evidence collection and performance
 
@@ -207,7 +208,7 @@ The v1 MCP tool set is:
 
 | ID | Requirement | Acceptance criteria |
 |---|---|---|
-| FR-UI-001 | The default dashboard shows active main sessions only. | Children are summarized as counts by status and do not create top-level cards. |
+| FR-UI-001 | The default dashboard shows active, post-restart-reconciled main sessions only. | Retained roots lacking current native reconciliation stay in the all-session history; children are summarized as counts by status and do not create top-level cards. |
 | FR-UI-002 | Waiting-for-user and stalled main sessions sort first, idle sessions next, then all others. | The default ordering is deterministic within each group. |
 | FR-UI-003 | The operator may switch sorting to startup-directory alphabetical order. | Changing sort order does not change filters or session state. |
 | FR-UI-004 | Each card shows session title, startup directory, branch or linked GitHub PR, last activity, main state, and child counts by status. | Missing GitHub connectivity leaves an unlinked branch instead of failing the card. |
@@ -266,7 +267,7 @@ The v1 MCP tool set is:
 | ID | Requirement | Acceptance criteria |
 |---|---|---|
 | FR-COMP-001 | V1 targets the latest Claude Code, Codex CLI, and Codex Companion releases at implementation time. | The tested version matrix is documented. |
-| FR-COMP-002 | Other versions run optimistically. Unexpected format/API changes keep best-effort monitoring active and add `UPGRADE`. | Only the affected adapter/sessions degrade; the server and other adapters continue. |
+| FR-COMP-002 | Other versions run optimistically. Unexpected format/API changes keep best-effort monitoring active and add `UPGRADE`. | Only the affected adapter/sessions degrade; when native evidence supplies a version, the warning names both the detected and tested versions. |
 | FR-COMP-003 | Runtime compatibility is verified with manually or explicitly enabled live-runtime smoke tests. | Live tests spawn/observe/finish supported child types without touching real user data. |
 | FR-COMP-004 | Pure normalization, timer, correlation, and safety logic follows TDD with synthetic typed events. | Tests are written from the test specification and fail before their implementation. |
 | FR-COMP-005 | Formatter, targeted tests, Clippy with warnings denied, and relevant security checks run before each implementation commit. | Handoff reports commands that ran and anything that could not run. |

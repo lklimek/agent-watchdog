@@ -284,22 +284,29 @@ struct ClaudeTeamTranscriptAlias {
     parent: Option<NativeSessionKey>,
     agent_type: Option<String>,
     cwd: PathBuf,
+    basis: ClaudeAliasBasis,
+}
+
+#[derive(Clone, Copy)]
+enum ClaudeAliasBasis {
+    TeamMember,
+    TeamLead,
+    SharedTeamParent,
 }
 
 impl ClaudeTeamTranscriptAlias {
     const fn basis(&self) -> &'static str {
-        if self.parent.is_some() {
-            "team_member_agent_type_and_cwd"
-        } else {
-            "unique_team_lead_cwd"
+        match self.basis {
+            ClaudeAliasBasis::TeamMember => "team_member_agent_type_and_cwd",
+            ClaudeAliasBasis::TeamLead => "unique_team_lead_cwd",
+            ClaudeAliasBasis::SharedTeamParent => "shared_team_parent",
         }
     }
 
     const fn confidence(&self) -> &'static str {
-        if self.parent.is_some() {
-            "high"
-        } else {
-            "medium"
+        match self.basis {
+            ClaudeAliasBasis::TeamMember => "high",
+            ClaudeAliasBasis::TeamLead | ClaudeAliasBasis::SharedTeamParent => "medium",
         }
     }
 }
@@ -315,6 +322,7 @@ impl ClaudeTeamTranscriptAliases {
                 parent: None,
                 agent_type: None,
                 cwd: cwd.to_path_buf(),
+                basis: ClaudeAliasBasis::TeamLead,
             });
         }
         self.0.extend(team.members().iter().filter_map(|member| {
@@ -323,19 +331,38 @@ impl ClaudeTeamTranscriptAliases {
                 parent: Some(team.lead().clone()),
                 agent_type: Some(member.agent_type()?.to_owned()),
                 cwd: member.cwd()?.to_path_buf(),
+                basis: ClaudeAliasBasis::TeamMember,
             })
         }));
     }
 
-    fn resolve(&self, bootstrap: &ClaudeTranscriptBootstrap) -> Option<&ClaudeTeamTranscriptAlias> {
+    fn resolve(&self, bootstrap: &ClaudeTranscriptBootstrap) -> Option<ClaudeTeamTranscriptAlias> {
         let cwd = bootstrap.cwd.as_deref()?;
         if let Some(title) = bootstrap.title.as_deref() {
-            let mut member_candidates = self
+            let member_candidates = self
                 .0
                 .iter()
-                .filter(|alias| alias.agent_type.as_deref() == Some(title) && alias.cwd == cwd);
-            if let Some(matched) = member_candidates.next() {
-                return member_candidates.next().is_none().then_some(matched);
+                .filter(|alias| alias.agent_type.as_deref() == Some(title) && alias.cwd == cwd)
+                .collect::<Vec<_>>();
+            if let [matched] = member_candidates.as_slice() {
+                return Some((*matched).clone());
+            }
+            if let Some(shared_parent) = member_candidates
+                .first()
+                .and_then(|candidate| candidate.parent.as_ref())
+                .filter(|parent| {
+                    member_candidates
+                        .iter()
+                        .all(|candidate| candidate.parent.as_ref() == Some(*parent))
+                })
+            {
+                return Some(ClaudeTeamTranscriptAlias {
+                    subject: shared_parent.clone(),
+                    parent: None,
+                    agent_type: Some(title.to_owned()),
+                    cwd: cwd.to_path_buf(),
+                    basis: ClaudeAliasBasis::SharedTeamParent,
+                });
             }
         }
         let mut lead_candidates = self
@@ -343,7 +370,7 @@ impl ClaudeTeamTranscriptAliases {
             .iter()
             .filter(|alias| alias.parent.is_none() && alias.cwd == cwd);
         let matched = lead_candidates.next()?;
-        lead_candidates.next().is_none().then_some(matched)
+        lead_candidates.next().is_none().then(|| matched.clone())
     }
 }
 
@@ -445,6 +472,7 @@ struct ClaudeTranscriptBootstrap {
     cwd: Option<PathBuf>,
     branch: Option<String>,
     title: Option<String>,
+    detected_version: Option<String>,
     drifted: bool,
 }
 
@@ -477,6 +505,7 @@ pub struct ClaudeDiscovery {
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
     alias_cache: Arc<Mutex<HashMap<String, ClaudeTeamTranscriptAlias>>>,
+    version_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
     native_aliases: DiscoveryAliasRegistry,
 }
 
@@ -508,6 +537,7 @@ impl ClaudeDiscovery {
             store,
             clock,
             alias_cache: Arc::new(Mutex::new(HashMap::new())),
+            version_cache: Arc::new(Mutex::new(HashMap::new())),
             native_aliases,
         }
     }
@@ -640,6 +670,18 @@ impl ClaudeDiscovery {
             report.warn();
             return;
         }
+        if self
+            .api
+            .mark_native_reconciled(
+                main_id,
+                watchdog_claude::TESTED_CLAUDE_VERSION,
+                "claude:team-config:present",
+            )
+            .await
+            .is_err()
+        {
+            report.warn();
+        }
         if mains.insert(main_id) {
             report.main_sessions = report.main_sessions.saturating_add(1);
         }
@@ -664,6 +706,18 @@ impl ClaudeDiscovery {
                 log_reconcile_failure(RuntimeKind::ClaudeCode, "child", &error);
                 report.warn();
             } else {
+                if self
+                    .api
+                    .mark_native_reconciled(
+                        child_id,
+                        watchdog_claude::TESTED_CLAUDE_VERSION,
+                        "claude:team-config:present",
+                    )
+                    .await
+                    .is_err()
+                {
+                    report.warn();
+                }
                 if !member.is_active()
                     && self
                         .ingest_inactive_team_member(member, child_id)
@@ -903,6 +957,8 @@ impl ClaudeDiscovery {
             report.warn();
             return;
         };
+        self.enrich_claude_warning(root, &candidate, view.session, &bootstrap, report)
+            .await;
         if self
             .api
             .enrich_repository_metadata(
@@ -917,16 +973,6 @@ impl ClaudeDiscovery {
         {
             report.warn();
         }
-        if bootstrap.drifted {
-            report.warn();
-            let _ = self
-                .emit_claude_compatibility_warning(
-                    &candidate,
-                    "bootstrap",
-                    watchdog_claude::ClaudeParseError::UnsupportedRecord.compatibility_warning(),
-                )
-                .await;
-        }
         self.reconcile_transcript_cursor(root, &candidate, report)
             .await;
         match candidate.kind {
@@ -940,6 +986,40 @@ impl ClaudeDiscovery {
         }
     }
 
+    async fn enrich_claude_warning(
+        &self,
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+        session: SessionIdentity,
+        bootstrap: &ClaudeTranscriptBootstrap,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        let warning_needs_version = self
+            .warning_needs_detected_version(session)
+            .await
+            .unwrap_or(false);
+        if !bootstrap.drifted && !warning_needs_version {
+            return;
+        }
+        report.warn();
+        let error = watchdog_claude::ClaudeParseError::UnsupportedRecord;
+        let detected_version = bootstrap
+            .detected_version
+            .clone()
+            .or_else(|| self.detect_transcript_version(root, candidate));
+        let warning = detected_version.as_deref().map_or_else(
+            || error.compatibility_warning(),
+            |version| error.compatibility_warning_for_version(version),
+        );
+        let event_key = detected_version.as_deref().map_or_else(
+            || "bootstrap".to_owned(),
+            |version| format!("detected-version-v2:{version}"),
+        );
+        let _ = self
+            .emit_claude_compatibility_warning(candidate, &event_key, warning)
+            .await;
+    }
+
     async fn prepare_transcript_candidate(
         &self,
         root: &CapabilityRoot,
@@ -947,23 +1027,38 @@ impl ClaudeDiscovery {
         aliases: &ClaudeTeamTranscriptAliases,
     ) -> Result<(ClaudeTranscriptCandidate, ClaudeTranscriptBootstrap), ()> {
         let cached_alias = self.cached_alias(&candidate.path_key);
-        let cursor = self.store.file_cursor(&candidate.path_key).await;
-        let path_session_exists = self
+        let cursor = self
+            .store
+            .file_cursor(&candidate.path_key)
+            .await
+            .map_err(|_| ())?;
+        let path_session = self
             .store
             .session_by_id(SessionId::from_native(&candidate.transcript_session))
-            .await;
-        let bootstrap = match (cursor, path_session_exists) {
-            (Ok(None), Ok(_)) => Self::bootstrap_transcript(root, &candidate),
-            (Ok(Some(_)), Ok(path_session))
-                if candidate.kind == SessionKind::Main
-                    && cached_alias.is_none()
-                    && path_session.is_none()
-                    && !aliases.0.is_empty() =>
-            {
-                Self::bootstrap_transcript(root, &candidate)
-            }
-            (Ok(Some(_)), Ok(_)) => ClaudeTranscriptBootstrap::default(),
-            (Err(_), _) | (_, Err(_)) => return Err(()),
+            .await
+            .map_err(|_| ())?;
+        let path_session_requires_reconciliation = if let Some(record) = path_session.as_ref() {
+            self.store
+                .snapshot(record.session)
+                .await
+                .map_err(|_| ())?
+                .and_then(|snapshot| {
+                    snapshot
+                        .reducer_snapshot()
+                        .map(watchdog_domain::SessionSnapshot::reconciliation_required)
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        let alias_recheck = candidate.kind == SessionKind::Main
+            && cached_alias.is_none()
+            && path_session_requires_reconciliation
+            && !aliases.0.is_empty();
+        let bootstrap = if cursor.is_none() || alias_recheck {
+            Self::bootstrap_transcript(root, &candidate)
+        } else {
+            ClaudeTranscriptBootstrap::default()
         };
         if candidate.kind == SessionKind::Main {
             if let Some(alias) = cached_alias {
@@ -980,12 +1075,12 @@ impl ClaudeDiscovery {
                     confidence = alias.confidence(),
                     "Selected unique Claude transcript correlation"
                 );
-                candidate.bind_team_alias(alias);
+                candidate.bind_team_alias(&alias);
                 self.native_aliases.bind(
                     candidate.transcript_session.clone(),
                     SessionId::from_native(&candidate.subject),
                 );
-                self.cache_alias(&candidate.path_key, alias.clone());
+                self.cache_alias(&candidate.path_key, alias);
             }
         }
         Ok((candidate, bootstrap))
@@ -1055,6 +1150,75 @@ impl ClaudeDiscovery {
         cache.insert(path_key.as_str().to_owned(), alias);
     }
 
+    async fn warning_needs_detected_version(&self, session: SessionIdentity) -> Result<bool, ()> {
+        let snapshot = self
+            .store
+            .snapshot(session)
+            .await
+            .map_err(|_| ())?
+            .ok_or(())?;
+        Ok(snapshot
+            .reducer_snapshot()
+            .and_then(watchdog_domain::SessionSnapshot::compatibility_warning)
+            .is_some_and(|warning| !warning.message().contains("detected Claude Code ")))
+    }
+
+    fn detect_transcript_version(
+        &self,
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+    ) -> Option<String> {
+        let key = candidate.path_key.as_str();
+        if let Some(cached) = self
+            .version_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+        {
+            return cached;
+        }
+        let detected = Self::scan_transcript_version(root, candidate);
+        let mut cache = self
+            .version_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_CLAUDE_ALIAS_CACHE && !cache.contains_key(key) {
+            cache.clear();
+        }
+        cache.insert(key.to_owned(), detected.clone());
+        detected
+    }
+
+    fn scan_transcript_version(
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+    ) -> Option<String> {
+        let reader = claude_transcript_reader();
+        let mut cursor = reader
+            .cursor_at_start(root, &candidate.relative, CLAUDE_TRANSCRIPT_PARSER_VERSION)
+            .ok()?;
+        for _ in 0..MAX_CLAUDE_BOOTSTRAP_BATCHES {
+            let ReadOutcome::Records(batch) =
+                reader.read(root, &candidate.relative, &cursor).ok()?
+            else {
+                return None;
+            };
+            if let Some(version) = batch
+                .records()
+                .iter()
+                .find_map(|record| watchdog_claude::parse_transcript_version(record))
+            {
+                return Some(version.as_str().to_owned());
+            }
+            cursor = batch.cursor().clone();
+            if !batch.continuation_required() {
+                return None;
+            }
+        }
+        None
+    }
+
     fn transcript_is_recent(
         &self,
         root: &CapabilityRoot,
@@ -1107,6 +1271,9 @@ impl ClaudeDiscovery {
                 break;
             };
             for record in batch.records() {
+                if let Some(version) = watchdog_claude::parse_transcript_version(record) {
+                    bootstrap.detected_version = Some(version.as_str().to_owned());
+                }
                 match watchdog_claude::parse_transcript_record(record) {
                     Ok(signal) => bootstrap.merge(candidate, &signal),
                     Err(_) => bootstrap.drifted = true,
@@ -1257,13 +1424,13 @@ impl ClaudeDiscovery {
         let signal = match watchdog_claude::parse_transcript_record(record) {
             Ok(signal) => signal,
             Err(error) => {
+                let warning = watchdog_claude::parse_transcript_version(record).map_or_else(
+                    || error.compatibility_warning(),
+                    |version| error.compatibility_warning_for_version(version.as_str()),
+                );
                 return Ok((
-                    self.emit_claude_compatibility_warning(
-                        candidate,
-                        event_key,
-                        error.compatibility_warning(),
-                    )
-                    .await,
+                    self.emit_claude_compatibility_warning(candidate, event_key, warning)
+                        .await,
                     true,
                 ));
             }
@@ -1348,6 +1515,13 @@ impl ClaudeDiscovery {
         event_key: &str,
         warning: watchdog_domain::CompatibilityWarning,
     ) -> Option<ObservationId> {
+        if !warning.message().contains("detected Claude Code ")
+            && self
+                .warning_has_detected_claude_version(&candidate.subject)
+                .await
+        {
+            return None;
+        }
         let observation_id = ObservationId::from_native(
             RuntimeKind::ClaudeCode,
             "transcript-compatibility",
@@ -1367,6 +1541,25 @@ impl ClaudeDiscovery {
             .await
             .ok()
             .map(|_| observation_id)
+    }
+
+    async fn warning_has_detected_claude_version(&self, subject: &NativeSessionKey) -> bool {
+        let session_id = SessionId::from_native(subject);
+        let Ok(Some(record)) = self.store.session_by_id(session_id).await else {
+            return false;
+        };
+        self.store
+            .snapshot(record.session)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|snapshot| {
+                snapshot
+                    .reducer_snapshot()
+                    .and_then(watchdog_domain::SessionSnapshot::compatibility_warning)
+                    .map(|warning| warning.message().contains("detected Claude Code "))
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -2319,6 +2512,12 @@ impl CodexDiscovery {
             let Some(snapshot) = self.store.snapshot(main.session).await.map_err(|_| ())? else {
                 continue;
             };
+            if snapshot
+                .reducer_snapshot()
+                .is_some_and(watchdog_domain::SessionSnapshot::reconciliation_required)
+            {
+                continue;
+            }
             if matches!(
                 snapshot.state(),
                 DetailedState::Completed
@@ -2593,7 +2792,7 @@ impl CodexDiscovery {
                         subject,
                         adapter_version,
                         event_key,
-                        error.compatibility_warning(),
+                        error.compatibility_warning_for_version(adapter_version),
                     )
                     .await)
             }
