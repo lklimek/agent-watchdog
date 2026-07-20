@@ -191,7 +191,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-MCP-005 | Parent disconnects before a child event and reconnects with cursor. | Undelivered event is returned. | FR-MCP-004 |
 | T-MCP-006 | Alert event is read by parent. | PID identity, CPU deltas, timestamps, conflicts, correlation, operation, and suggestions exist. | FR-MCP-005 |
 | T-MCP-007 | Push is unsupported or fails. | Durable inbox remains correct. | FR-MCP-006 |
-| T-MCP-008 | Adapter version drifts. | Tool response includes actionable `UPGRADE` warning. | FR-MCP-007 |
+| T-MCP-008 | Adapter detected version first differs only in patch, then differs in minor or major. | Patch-only drift has no `UPGRADE`; a major/minor mismatch includes an actionable warning in the tool response. | FR-MCP-007 |
 | T-HTTP-001 | Missing/wrong/oversized Basic credential requests UI/API. | Browser challenge/failure contains no session metadata. | FR-UI-008, FR-SEC-001 |
 | T-HTTP-002 | API attempts a state mutation. | No route exists or method is rejected. | FR-API-001 |
 | T-HTTP-003 | Native title contains HTML/script. | Rendered page escapes it; CSP blocks execution. | FR-SEC-003 |
@@ -241,7 +241,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-SEC-001 | Paths contain `..`, symlink escape, race replacement, or non-UTF-8 components. | Capability-root access prevents escape; errors remain bounded. | FR-SEC-002 |
 | T-SEC-002 | Transcript/MCP strings contain markup, shell syntax, control chars, or huge fields. | Input is bounded/escaped and never executed. | FR-SEC-003 |
 | T-COMP-001 | Supported runtime emits recognized current schema. | Adapter healthy with documented tested version. | FR-COMP-001 |
-| T-COMP-002 | One required native field changes/removes, followed by versionless incompatible evidence. | Affected sessions get `UPGRADE` with detected and tested versions when available; later versionless evidence never downgrades that detail, while best effort and other adapters continue. | FR-COMP-002 |
+| T-COMP-002 | A required native field changes/removes under patch-only, major/minor-mismatched, and versionless evidence. | Patch-only and versionless evidence do not add `UPGRADE`; a confirmed major/minor mismatch adds it with detected and tested versions, and later versionless evidence never downgrades that detail. Best effort and other adapters continue. | FR-COMP-002 |
 | T-COMP-003 | Build workspace on macOS target in CI where available. | It compiles with unsupported process/watchdog operation clearly gated. | Product summary |
 | T-COMP-004 | Run the explicitly enabled isolated live-runtime matrix. | Current supported child types are observed without reading real user data. | FR-COMP-003 |
 | T-COMP-005 | Review implementation PR evidence for pure logic. | Each reducer/timer/correlation/safety change shows a failing synthetic typed-event test before implementation. | FR-COMP-004 |

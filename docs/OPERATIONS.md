@@ -87,9 +87,10 @@ metadata record needed to establish identity and hierarchy, places a durable
 cursor at EOF, and then parses only bounded, complete records appended
 afterward. This avoids loading retained transcripts. Cursor replacement,
 truncation, oversized records, and schema drift never cause an implicit scan
-from byte zero. File discontinuities degrade adapter health, while incompatible
-records additionally place an actionable `UPGRADE` warning on the affected
-session.
+from byte zero. File discontinuities and incompatible records degrade adapter
+health. An incompatible record additionally places an actionable `UPGRADE`
+warning on the affected session only when detected and tested SemVer versions
+differ in major or minor; patch-only drift does not add the badge.
 
 The exact `state_5.sqlite` bind supplies bootstrap thread metadata but may lag
 rows that Codex has not checkpointed out of its WAL. Watchdog therefore does not
@@ -209,12 +210,14 @@ degrade only the affected adapter while the server stays ready. Critical store,
 reducer, process-sampler, or authorization failures make readiness fail and
 suspend destructive automation.
 
-An `UPGRADE` warning on a session means a runtime format or behavior is newer
-than the tested adapter. Monitoring continues on a best-effort basis, but
-destructive automation is suspended for affected sessions. Update Agent
-Watchdog and inspect detailed health before treating the warning as resolved.
-When the native record identifies its runtime version, the warning reports both
-that detected version and the Watchdog-tested version.
+An `UPGRADE` warning on a session means the detected runtime and tested adapter
+differ at the SemVer major/minor compatibility line. A patch-only difference,
+including prerelease or build metadata on the same line, does not add the badge.
+Monitoring continues on a best-effort basis, but destructive automation is
+suspended for badged sessions. Update Agent Watchdog and inspect detailed health
+before treating the warning as resolved. The warning reports both the detected
+version and the Watchdog-tested version. Missing or unparseable version evidence
+may degrade adapter health but does not prove a per-session mismatch.
 `termination_automation` degradation means the child-only reconciliation pass
 failed safely; no new signal stage is attempted until the worker and all safety
 components are healthy again.
@@ -263,8 +266,9 @@ docker compose ps
 
 Traefik is pinned by version and multi-platform digest. Do not replace the pin
 with `latest`. Agent Watchdog intentionally starts optimistically with runtime
-versions other than those tested; compatibility problems become `UPGRADE`
-warnings instead of silent startup refusal.
+versions other than those tested. Compatibility problems degrade health instead
+of causing silent startup refusal; per-session `UPGRADE` warnings require a
+confirmed detected/tested SemVer major/minor mismatch.
 
 On Linux, verified process trees are sampled immediately before each timer
 evaluation. The latest trustworthy CPU delta per session replaces the previous

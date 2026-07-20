@@ -278,9 +278,12 @@ The first encounter reads at most one bounded 2 MiB/128-record prefix for cwd,
 branch, and native agent metadata, then durably initializes the activity cursor
 at EOF. Later passes never repeat that bootstrap and read at most four bounded
 append batches. Existing message/tool bodies are neither replayed nor retained.
-Known metadata-only records advance the cursor without inventing activity;
-unknown complete records add an actionable `UPGRADE` warning to the affected
-session. Optional subagent sidecars contribute only their bounded `agentType`.
+Known metadata-only records advance the cursor without inventing activity.
+Unknown complete records degrade adapter health; they add an actionable
+`UPGRADE` warning to the affected session only when detected and tested SemVer
+versions differ at the major/minor compatibility line. Patch-only drift does
+not add the badge. Optional subagent sidecars contribute only their bounded
+`agentType`.
 For a retained generic warning created by an older Watchdog build, discovery may
 perform one cached bounded-prefix read of that exact transcript to recover its
 native `version`; it never scans the whole transcript or repeats the read after a
@@ -344,8 +347,10 @@ the explicit Claude origin never establishes this cross-runtime relation.
 
 Internal SQLite/JSONL schemas are guarded by runtime version and field-level
 parsing. The adapter opens native SQLite read-only and tolerates absent WAL/SHM;
-failure falls back to JSONL/process evidence and adds `UPGRADE` when the format is
-unrecognized. It never migrates, locks for writing, or repairs Codex state.
+failure falls back to JSONL/process evidence and degrades adapter health. An
+affected session receives `UPGRADE` only for a confirmed detected/tested SemVer
+major/minor mismatch, not patch-only drift. The adapter never migrates, locks
+for writing, or repairs Codex state.
 
 Optional official lifecycle hooks post to `/hooks/codex` through the
 trusted-source Traefik route and application Bearer authentication. The endpoint
@@ -618,8 +623,10 @@ complete-record offset. First discovery starts at EOF; each pass is capped by
 bytes, record size, record count, and batch count. Partial trailing records are
 re-read from the last complete boundary after restart, while replacement or
 truncation moves to a newly established EOF boundary and degrades adapter health.
-Incompatible complete records advance the cursor, degrade adapter health, and
-place an `UPGRADE` warning on the exactly associated session.
+Incompatible complete records advance the cursor and degrade adapter health.
+They place an `UPGRADE` warning on the exactly associated session only when
+detected and tested SemVer versions differ in major or minor; a patch-only
+difference is compatible for badge purposes.
 Only typed lifecycle/activity evidence is retained; transcript bodies are not.
 
 “Standard location” in the supported Docker deployment means a tracked
@@ -804,8 +811,11 @@ error, version, and affected scope. Overall readiness is degraded—not failed�
 one runtime adapter breaks while others can monitor safely.
 
 Unknown native fields are ignored. Missing required fields, schema failures, or
-unsupported runtime behavior produce an `UPGRADE` warning on affected sessions
-and suspend destructive automation for them. Best-effort evidence continues.
+unsupported runtime behavior degrade the affected adapter while best-effort
+evidence continues. They produce an `UPGRADE` warning and suspend destructive
+automation for an affected session only when detected and tested SemVer versions
+differ in major or minor. Patch-only drift does not add the badge; unavailable or
+unparseable versions do not prove a mismatch.
 
 The process sampler, database, reducer, and authorization layer are critical.
 Failure in any one makes readiness fail and all termination automation stop.

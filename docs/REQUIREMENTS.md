@@ -65,7 +65,7 @@ A project maintainer adds runtime adapters, validates the latest runtime release
 - **Worktree**: a Git working tree associated with a main session or child.
 - **Observation**: a runtime API event, MCP report, filesystem event, process fact, or parsed native record.
 - **Trusted state**: the most recent state for which all required authoritative sources agree.
-- **Degraded session**: a session monitored on a best-effort basis after runtime compatibility drift. It carries an `UPGRADE` badge and warning message.
+- **Degraded session**: a session monitored on a best-effort basis after runtime compatibility drift. It carries an `UPGRADE` badge and warning message only when the detected runtime and tested adapter differ at the SemVer major/minor compatibility line; patch-only drift does not add the badge.
 - **Unknown session**: a session whose material sources conflict. Destructive automation is suspended until the conflict clears.
 
 ## 7. Status model
@@ -187,7 +187,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 | FR-MCP-004 | Every meaningful child event is available to the parent through a durable inbox. | Disconnecting and reconnecting does not lose undelivered events. |
 | FR-MCP-005 | Parent-facing alerts include PID and detailed diagnostic evidence. | The event includes the fields in FR-STA-007 without requiring transcript retrieval. |
 | FR-MCP-006 | Best-effort push is a nice-to-have when a runtime/client supports safe delivery. | Failure or lack of push support never replaces or blocks durable inbox delivery. |
-| FR-MCP-007 | Runtime compatibility drift appears as an `UPGRADE` warning field with an actionable message. | The agent can tell the user which watchdog/runtime compatibility needs attention. |
+| FR-MCP-007 | Confirmed runtime compatibility-line drift appears as an `UPGRADE` warning field with an actionable message. | The agent can tell the user which watchdog/runtime compatibility needs attention; a patch-only SemVer difference does not add the warning. |
 
 The v1 MCP tool set is:
 
@@ -267,7 +267,7 @@ The v1 MCP tool set is:
 | ID | Requirement | Acceptance criteria |
 |---|---|---|
 | FR-COMP-001 | V1 targets the latest Claude Code, Codex CLI, and Codex Companion releases at implementation time. | The tested version matrix is documented. |
-| FR-COMP-002 | Other versions run optimistically. Unexpected format/API changes keep best-effort monitoring active and add `UPGRADE`. | Only the affected adapter/sessions degrade; when native evidence supplies a version, the warning names both the detected and tested versions. |
+| FR-COMP-002 | Other versions run optimistically. Unexpected format/API changes keep best-effort monitoring active. A per-session `UPGRADE` badge is added only when parsed detected and tested SemVer versions differ in major or minor; patch, prerelease, or build-metadata differences on the same major/minor line do not add it. | Only the affected adapter/sessions degrade; a badge names both detected and tested versions. Missing or unparseable version evidence cannot by itself add the badge. |
 | FR-COMP-003 | Runtime compatibility is verified with manually or explicitly enabled live-runtime smoke tests. | Live tests spawn/observe/finish supported child types without touching real user data. |
 | FR-COMP-004 | Pure normalization, timer, correlation, and safety logic follows TDD with synthetic typed events. | Tests are written from the test specification and fail before their implementation. |
 | FR-COMP-005 | Formatter, targeted tests, Clippy with warnings denied, and relevant security checks run before each implementation commit. | Handoff reports commands that ran and anything that could not run. |
@@ -357,7 +357,7 @@ appears to conflict.
 | Waiting user | Never stalled or auto-killed; promoted in UI/human notifications. |
 | Termination | Children only after one continuous hour stalled and every safety gate; warn parent, allow 10-minute grace, graceful cancel → `SIGTERM` → `SIGKILL`. `SIGKILL` defaults on with TOML opt-out. Main sessions are impossible targets. |
 | Human events | Main waiting-for-user, stalled, and completed through web/browser, Home Assistant webhook, and generic webhook. Webhooks get one attempt and no retry. |
-| Compatibility | Test latest versions at implementation time. Other versions run optimistically; unexpected formats add actionable `UPGRADE`, continue best effort, and suspend affected destructive automation. |
+| Compatibility | Test latest versions at implementation time. Other versions run optimistically and continue best effort. Unexpected formats may degrade adapter health; an actionable per-session `UPGRADE` is reserved for a confirmed detected/tested SemVer major/minor mismatch and suspends affected destructive automation. Patch-only drift does not add the badge. |
 | Persistence | SQLite WAL; retain Watchdog history until manual wipe; no automatic pruning, backup, or export requirement. Never alter native runtime state. |
 | Configuration | Secrets/essentials in environment; roots, exclusions, thresholds, and policy in mounted TOML. Atomic TOML reload; environment changes require restart. |
 | Observability | `tracing` operational logs and detailed health only; no Prometheus in v1. Correlation confidence/evidence is logged, not shown in the default UI. |
