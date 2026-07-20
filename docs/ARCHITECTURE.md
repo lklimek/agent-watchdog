@@ -700,6 +700,7 @@ Routes are split by exposure and authentication:
 ```text
 GET  /health/live             minimal unauthenticated container liveness
 GET  /health                  authenticated detailed component health
+GET  /                        Basic Auth, fixed temporary redirect to /ui
 GET  /ui                      Basic Auth dashboard
 GET  /api/v1/sessions         Basic Auth read-only JSON snapshot
 GET  /api/v1/events           Basic Auth SSE

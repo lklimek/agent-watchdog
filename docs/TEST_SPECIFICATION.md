@@ -194,6 +194,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-HTTP-003 | Native title contains HTML/script. | Rendered page escapes it; CSP blocks execution. | FR-SEC-003 |
 | T-HTTP-004 | SSE client lags broadcast capacity. | It receives `resync_required`, reconnects, and converges. | FR-UI-007 |
 | T-HTTP-005 | Runtime warning and state coexist. | JSON distinguishes state from warning badge. | FR-API-003 |
+| T-HTTP-006 | Client requests the HTTP root with and without valid Basic Auth. | Unauthenticated access is challenged; authenticated access receives a fixed temporary redirect to `/ui`. | FR-UI-010 |
 
 ### 5.8 Dashboard and accessibility
 
