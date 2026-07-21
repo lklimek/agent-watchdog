@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Isolated Linux procfs and pidfd integration tests.
+#![cfg(target_os = "linux")]
 
 use std::{
     process::{Child, Command, Stdio},
