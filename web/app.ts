@@ -99,17 +99,20 @@ function scheduleReconnect(): void {
 /** Apply the current local scope and sort without polling or mutating server state. */
 function render(): void {
   if (latest === null) return;
+  const generatedAtMs = latest.generated_at_ms;
   const scope = selectedScope();
   const sort = selectedSort();
   const cards = latest.sessions.filter((card) => scope === "all" || card.in_active_scope);
   cards.sort((left, right) => compareCards(left, right, sort));
-  sessionList.replaceChildren(...(cards.length > 0 ? cards.map(createCard) : [createEmpty(scope)]));
+  sessionList.replaceChildren(...(cards.length > 0
+    ? cards.map((card) => createCard(card, generatedAtMs))
+    : [createEmpty(scope)]));
   sessionList.dataset.revision = String(latest.revision);
   summary.textContent = `${cards.length} ${scope === "active" ? "active" : "retained"} ${cards.length === 1 ? "session" : "sessions"}`;
 }
 
 /** Build one semantic, non-interactive main-session card using text nodes only. */
-function createCard(card: Card): HTMLElement {
+function createCard(card: Card, generatedAtMs: number): HTMLElement {
   const article = document.createElement("article");
   article.className = `session-card state-${card.compact_state}`;
   article.dataset.sessionId = card.session_id;
@@ -126,7 +129,7 @@ function createCard(card: Card): HTMLElement {
     badge.setAttribute("aria-label", card.warning.message);
     stateLabel.append(badge);
   }
-  stateRow.append(stateLabel, element("p", "age", `Last activity ${relativeAge(card.last_activity_ms)}`));
+  stateRow.append(stateLabel, element("p", "age", `Last activity ${relativeAge(generatedAtMs, card.last_activity_ms)}`));
 
   const title = document.createElement("h3");
   title.textContent = card.title;
@@ -334,8 +337,8 @@ function statePresentation(state: DetailedState): readonly [string, string] {
   return presentations[state];
 }
 
-function relativeAge(thenMs: number): string {
-  const seconds = Math.max(0, Math.floor((Date.now() - thenMs) / 1_000));
+function relativeAge(generatedAtMs: number, thenMs: number): string {
+  const seconds = Math.max(0, Math.floor((generatedAtMs - thenMs) / 1_000));
   if (seconds < 5) return "now";
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ago`;

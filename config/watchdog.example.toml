@@ -48,5 +48,5 @@ companion = true
 enabled = true
 
 [termination]
-automation_enabled = true
+automation_enabled = false
 sigkill_enabled = true

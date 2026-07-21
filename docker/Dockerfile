@@ -12,6 +12,7 @@ RUN mkdir -p \
     /rootfs/monitored/codex/state \
     /rootfs/monitored/codex/sessions \
     /rootfs/monitored/companion \
+    /rootfs/monitored/agent-worktrees \
     /rootfs/monitored/worktrees \
     /rootfs/usr/local/bin \
     /rootfs/usr/share/licenses/agent-watchdog \

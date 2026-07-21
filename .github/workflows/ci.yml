@@ -23,8 +23,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Validate Compose configuration
+        run: docker compose --env-file .env.example config --quiet
+
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test workspace
         run: cargo test --workspace --all-targets
@@ -33,7 +36,7 @@ jobs:
         run: cargo test --workspace --doc
 
       - name: Lint Phase 0 probes
-        run: cargo clippy --manifest-path tools/spikes/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path tools/spikes/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Test Phase 0 probes
         run: cargo test --manifest-path tools/spikes/Cargo.toml --all-targets

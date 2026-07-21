@@ -709,6 +709,9 @@ pub enum StoreError {
     /// One watch-path event key was reused for materially different content.
     #[error("Watch-path event identity was reused with different content")]
     WatchPathIdentityConflict,
+    /// One session attempted to register the same native path under a new event key.
+    #[error("Watch path is already registered for this session")]
+    WatchPathAlreadyRegistered,
     /// Cross-record identities do not describe one session tree.
     #[error("Observation, snapshot, and event identities do not agree")]
     IdentityMismatch,

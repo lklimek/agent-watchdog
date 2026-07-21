@@ -108,7 +108,9 @@ impl WatchPathRegistry {
                 return if existing.event_key() == event_key {
                     Ok(existing.clone())
                 } else {
-                    Err(WatchPathError::Store(StoreError::WatchPathIdentityConflict))
+                    Err(WatchPathError::Store(
+                        StoreError::WatchPathAlreadyRegistered,
+                    ))
                 };
             }
             if records.len() >= MAX_REGISTERED_WATCH_PATHS as usize {
@@ -344,6 +346,7 @@ mod tests {
             .expect("duplicate should be idempotent"),
             accepted
         );
+        assert_duplicate_path_rejected(&api, &transport, child.session.session_id()).await;
         for rejected in [
             "/host/repositories/../outside",
             "/host/outside",
@@ -512,6 +515,25 @@ mod tests {
             title: None,
             startup_directory: startup_directory.map(ToOwned::to_owned),
         }
+    }
+
+    async fn assert_duplicate_path_rejected(
+        api: &AgentApi,
+        transport: &TransportKey,
+        session_id: SessionId,
+    ) {
+        assert!(matches!(
+            api.register_watch_path(
+                transport,
+                session_id,
+                "watch-inside-new-key",
+                "/host/repositories/inside",
+            )
+            .await,
+            Err(crate::AgentApiError::Store(
+                StoreError::WatchPathAlreadyRegistered
+            ))
+        ));
     }
 
     struct WatchPathFixture {
