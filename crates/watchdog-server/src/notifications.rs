@@ -394,10 +394,6 @@ fn issue(kind: &DomainEventKind) -> &'static str {
             stage: TerminationStage::WarningGrace,
             ..
         } => "Sub-agent termination warning",
-        DomainEventKind::TerminationChanged {
-            stage: TerminationStage::Aborted,
-            ..
-        } => "Sub-agent termination aborted",
         _ => "Session status changed",
     }
 }

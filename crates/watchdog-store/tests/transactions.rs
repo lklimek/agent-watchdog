@@ -399,7 +399,7 @@ async fn initialization_enables_required_sqlite_pragmas_and_schema() {
     assert_eq!(health.journal_mode, "wal");
     assert!(health.foreign_keys);
     assert!(health.schema_version >= 1);
-    assert_eq!(health.application_table_count, 14);
+    assert_eq!(health.application_table_count, 16);
 }
 
 #[tokio::test]

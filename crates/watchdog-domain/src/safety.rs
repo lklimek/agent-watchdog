@@ -72,6 +72,8 @@ pub enum TerminationActionOutcome {
     SafetyAborted,
     /// Global automation configuration stopped escalation.
     AutomationDisabled,
+    /// SIGKILL policy stopped escalation after a verified SIGTERM.
+    SigkillDisabled,
 }
 
 impl TerminationStage {

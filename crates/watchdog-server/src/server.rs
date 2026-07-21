@@ -198,8 +198,8 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     let health = HealthService::new(Arc::clone(&clock) as Arc<_>);
 
     let api = initialize_agent_api(&store, &clock, &current).await?;
-    api.configure_watch_paths(watch_paths.clone());
     record_initial_health(&health, &current);
+    configure_agent_api(&api, &health, &watch_paths);
 
     #[cfg(target_os = "linux")]
     let linux_monitors = initialize_linux_monitors(&api, &store, &clock, &health, &current)?;
@@ -296,10 +296,20 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
     result
 }
 
+fn configure_agent_api(api: &AgentApi, health: &HealthService, watch_paths: &WatchPathRegistry) {
+    api.configure_health(health.clone());
+    api.configure_watch_paths(watch_paths.clone());
+}
+
 fn record_initial_health(health: &HealthService, config: &RuntimeConfig) {
     health.record(ComponentId::Store, ComponentStatus::Healthy, None);
     health.record(ComponentId::Authorization, ComponentStatus::Healthy, None);
     health.record(ComponentId::Reducer, ComponentStatus::Healthy, None);
+    health.record(
+        ComponentId::ObservationQueue,
+        ComponentStatus::Healthy,
+        None,
+    );
     record_adapter_health(health, config);
 }
 
@@ -462,6 +472,7 @@ fn initialize_linux_monitors(
         store.clone(),
         Arc::clone(clock) as Arc<_>,
         health.clone(),
+        config.companion_roots().to_vec(),
         termination_config,
         config.deadline_policy().terminate_after_stalled(),
     )
@@ -505,6 +516,7 @@ fn spawn_termination_worker(
             monitor.update_policy(
                 termination_config,
                 current.deadline_policy().terminate_after_stalled(),
+                current.companion_roots(),
             );
             if let Ok(report) = monitor.reconcile().await {
                 health.record(

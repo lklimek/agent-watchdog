@@ -18,6 +18,8 @@ pub enum ObservationPayload {
     Progress(BoundedText<2_048>),
     /// Parent-requested expected check-in change.
     Deadline(DeadlineCommand),
+    /// Intentional agent wait that atomically pauses progress and termination timers.
+    IntentionalWait,
     /// Runtime compatibility degradation.
     Compatibility(CompatibilityWarning),
     /// Fresh adapter validation cleared its compatibility warning.

@@ -32,6 +32,44 @@ fn activity_coalesces_but_terminal_admission_is_preserved() {
 }
 
 #[test]
+fn activity_coalescing_returns_the_displaced_item() {
+    let mut queue = SessionQueue::new(1).expect("queue capacity should be valid");
+    assert_eq!(
+        queue
+            .try_push_replacing(ObservationClass::Activity, "activity-1")
+            .expect("first activity should fit"),
+        None
+    );
+    assert_eq!(
+        queue
+            .try_push_replacing(ObservationClass::Activity, "activity-2")
+            .expect("new activity should coalesce"),
+        Some("activity-1")
+    );
+    assert_eq!(queue.pop(), Some("activity-2"));
+}
+
+#[test]
+fn activity_coalescing_never_overtakes_durable_evidence() {
+    let mut queue = SessionQueue::new(2).expect("queue capacity should be valid");
+    queue
+        .try_push(ObservationClass::Activity, "activity-1")
+        .expect("first activity should fit");
+    queue
+        .try_push(ObservationClass::Durable, "waiting-user")
+        .expect("durable evidence should fit");
+    assert_eq!(
+        queue
+            .try_push_replacing(ObservationClass::Activity, "activity-2")
+            .expect("new activity should coalesce"),
+        Some("activity-1")
+    );
+
+    assert_eq!(queue.pop(), Some("waiting-user"));
+    assert_eq!(queue.pop(), Some("activity-2"));
+}
+
+#[test]
 fn full_durable_queue_backpressures_without_losing_the_item() {
     let mut queue = SessionQueue::new(1).expect("queue capacity should be valid");
     queue

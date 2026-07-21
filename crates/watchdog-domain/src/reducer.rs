@@ -366,6 +366,9 @@ fn apply_observation(
             apply_deadline(snapshot, *command, observation.observed_at());
             events.push(DomainEventKind::DeadlineChanged);
         }
+        ObservationPayload::IntentionalWait => {
+            apply_intentional_wait(snapshot, observation.observed_at(), events);
+        }
         ObservationPayload::Compatibility(warning) => {
             if snapshot.compatibility_warning.as_ref() != Some(warning) {
                 snapshot.compatibility_warning = Some(warning.clone());
@@ -460,6 +463,19 @@ fn apply_deadline(snapshot: &mut SessionSnapshot, command: DeadlineCommand, now:
         DeadlineCommand::Resume => resume_clock(snapshot, now),
         DeadlineCommand::Clear => snapshot.explicit_deadline = None,
     }
+}
+
+fn apply_intentional_wait(
+    snapshot: &mut SessionSnapshot,
+    now: TimePoint,
+    events: &mut Vec<DomainEventKind>,
+) {
+    transition(snapshot, DetailedState::WaitingForAgent, now, events);
+    snapshot.last_activity = now;
+    snapshot.paused_elapsed_ms = 0;
+    snapshot.suspect_emitted = false;
+    snapshot.pause_started_monotonic_ms = Some(now.monotonic_ms());
+    events.push(DomainEventKind::DeadlineChanged);
 }
 
 fn pause_clock(snapshot: &mut SessionSnapshot, now: TimePoint) {

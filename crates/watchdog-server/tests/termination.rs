@@ -10,12 +10,12 @@ use std::{
 };
 
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, ChildSessionId, DeadlineCommand, DurationMs, EventId,
-    EvidenceTrust, MainSessionId, NativeSessionKey, ObservationEnvelope, ObservationId,
-    ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, ReducerInput, ReducerPolicy,
-    RuntimeKind, SessionIdentity, SessionSnapshot, TerminationActionOutcome, TerminationBlocker,
-    TerminationCandidate, TerminationComponent, TerminationFacts, TerminationHealth,
-    TerminationStage, TimePoint, WallTimeMs, reduce,
+    AdapterIdentity, BoundedText, ChildSessionId, DeadlineCommand, DomainEvent, DomainEventKind,
+    DurationMs, EventId, EvidenceTrust, MainSessionId, NativeSessionKey, ObservationEnvelope,
+    ObservationId, ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, ReducerInput,
+    ReducerPolicy, RuntimeKind, SessionIdentity, SessionSnapshot, TerminationActionOutcome,
+    TerminationBlocker, TerminationCandidate, TerminationComponent, TerminationFacts,
+    TerminationHealth, TerminationStage, TimePoint, WallTimeMs, reduce,
 };
 use watchdog_process::{ProcessControl, ProcessControlError, ProcessSignal, VerifiedProcessHandle};
 use watchdog_runtime::EventSequence;
@@ -24,7 +24,7 @@ use watchdog_server::{
     TerminationConfig, TerminationContext, TerminationEngine, TerminationStatus, TransportKey,
     VerifiedChild,
 };
-use watchdog_store::WatchdogStore;
+use watchdog_store::{OutboxDestination, TerminationAdvance, WatchdogStore};
 use watchdog_testkit::FakeClock;
 
 const MINUTE: u64 = 60_000;
@@ -250,6 +250,7 @@ fn context<'a>(
         },
         native_id: "child-1",
         child_exited: false,
+        process_identity_changed: false,
     }
 }
 
@@ -350,6 +351,39 @@ async fn warning_graceful_term_and_kill_are_durable_and_sequenced() {
 }
 
 #[tokio::test]
+async fn changed_native_cancellation_identity_aborts_before_any_signal() {
+    let fixture = fixture(
+        TerminationConfig::default(),
+        Err(GracefulCancelError::EvidenceChanged),
+    )
+    .await;
+    fixture
+        .engine
+        .reconcile(context(&fixture, &fixture.snapshot, time(75)))
+        .await
+        .expect("warning should persist");
+    assert_eq!(
+        fixture
+            .engine
+            .reconcile(context(&fixture, &fixture.snapshot, time(85)))
+            .await
+            .expect("changed native identity should reconcile safely"),
+        TerminationStatus::Aborted
+    );
+    assert!(fixture.process_control.signals().is_empty());
+    assert_eq!(
+        fixture
+            .store
+            .termination_saga(fixture.child)
+            .await
+            .expect("saga should load")
+            .expect("saga should exist")
+            .stage,
+        TerminationStage::Aborted
+    );
+}
+
+#[tokio::test]
 async fn parent_extension_aborts_grace_and_old_deadline_cannot_resume_it() {
     let fixture = fixture(
         TerminationConfig::default(),
@@ -388,6 +422,27 @@ async fn parent_extension_aborts_grace_and_old_deadline_cannot_resume_it() {
     );
     assert!(fixture.process_control.signals().is_empty());
     assert_eq!(fixture.graceful.call_count(), 0);
+    for destination in [
+        OutboxDestination::Browser,
+        OutboxDestination::HomeAssistant,
+        OutboxDestination::Webhook,
+    ] {
+        let pending = fixture
+            .store
+            .pending_outbox_for(destination, 10)
+            .await
+            .expect("human outbox should load");
+        assert_eq!(pending.len(), 1, "only the warning should notify humans");
+        let warning: watchdog_domain::DomainEvent =
+            serde_json::from_slice(pending[0].payload()).expect("warning payload should decode");
+        assert!(matches!(
+            warning.kind(),
+            watchdog_domain::DomainEventKind::TerminationChanged {
+                stage: TerminationStage::WarningGrace,
+                ..
+            }
+        ));
+    }
 }
 
 #[tokio::test]
@@ -469,7 +524,7 @@ async fn pid_reuse_between_graceful_and_signal_aborts_without_touching_replaceme
 }
 
 #[tokio::test]
-async fn sigkill_opt_out_stops_after_verified_sigterm() {
+async fn sigkill_opt_out_can_resume_after_policy_is_reenabled() {
     let config = TerminationConfig::new(
         true,
         false,
@@ -496,10 +551,129 @@ async fn sigkill_opt_out_stops_after_verified_sigterm() {
         .expect("saga should load")
         .expect("saga should exist");
     assert_eq!(saga.stage, TerminationStage::Sigterm);
-    assert_eq!(saga.next_action_at, None);
+    assert!(saga.next_action_at.is_some());
     assert_eq!(
         saga.last_outcome,
-        Some(TerminationActionOutcome::AutomationDisabled)
+        Some(TerminationActionOutcome::SigkillDisabled)
+    );
+
+    let revision = saga.revision;
+    fixture
+        .engine
+        .reconcile(context(&fixture, &fixture.snapshot, time(115)))
+        .await
+        .expect("disabled SIGKILL should remain stable");
+    assert_eq!(
+        fixture
+            .store
+            .termination_saga(fixture.child)
+            .await
+            .expect("saga should load")
+            .expect("saga should exist")
+            .revision,
+        revision,
+        "disabled reconciliation must not emit repeated audit events"
+    );
+
+    let enabled = TerminationEngine::new(
+        fixture.store.clone(),
+        Arc::new(
+            EventSequence::from_store(&fixture.store)
+                .await
+                .expect("event sequence should resume"),
+        ),
+        fixture.process_control.clone(),
+        fixture.graceful.clone(),
+        TerminationConfig::default(),
+    );
+    assert_eq!(
+        enabled
+            .reconcile(context(&fixture, &fixture.snapshot, time(115)))
+            .await
+            .expect("re-enabled SIGKILL should resume the saga"),
+        TerminationStatus::Advanced
+    );
+    assert_eq!(
+        fixture.process_control.signals(),
+        vec![ProcessSignal::Terminate, ProcessSignal::Kill]
+    );
+}
+
+#[tokio::test]
+async fn legacy_sigkill_opt_out_without_a_deadline_resumes_after_upgrade() {
+    let disabled = TerminationConfig::new(
+        true,
+        false,
+        DurationMs::new(10 * MINUTE),
+        DurationMs::new(10 * MINUTE),
+    )
+    .expect("config should be valid");
+    let fixture = fixture(disabled, Ok(GracefulCancelSupport::Unsupported)).await;
+    for minute in [75, 85, 95, 105] {
+        fixture
+            .engine
+            .reconcile(context(&fixture, &fixture.snapshot, time(minute)))
+            .await
+            .expect("disabled saga should reconcile");
+    }
+    let mut legacy = fixture
+        .store
+        .termination_saga(fixture.child)
+        .await
+        .expect("saga should load")
+        .expect("saga should exist");
+    legacy.revision += 1;
+    legacy.next_action_at = None;
+    legacy.last_outcome = Some(TerminationActionOutcome::AutomationDisabled);
+    let event_id = EventId::new(
+        fixture
+            .store
+            .latest_event_id()
+            .await
+            .expect("event sequence should load")
+            .value()
+            + 1,
+    );
+    fixture
+        .store
+        .apply_termination_advance(&TerminationAdvance::new(
+            legacy,
+            DomainEvent::new(
+                event_id,
+                fixture.root,
+                SessionIdentity::Child(fixture.child),
+                time(105).wall_time(),
+                DomainEventKind::TerminationChanged {
+                    stage: TerminationStage::Sigterm,
+                    outcome: TerminationActionOutcome::AutomationDisabled,
+                },
+            ),
+            [],
+        ))
+        .await
+        .expect("legacy saga should persist");
+
+    let enabled = TerminationEngine::new(
+        fixture.store.clone(),
+        Arc::new(
+            EventSequence::from_store(&fixture.store)
+                .await
+                .expect("event sequence should resume"),
+        ),
+        fixture.process_control.clone(),
+        fixture.graceful.clone(),
+        TerminationConfig::default(),
+    );
+    assert_eq!(
+        enabled
+            .reconcile(context(&fixture, &fixture.snapshot, time(115)))
+            .await
+            .expect("legacy SIGKILL opt-out should resume"),
+        TerminationStatus::Advanced
+    );
+    assert_eq!(
+        fixture.process_control.signals(),
+        vec![ProcessSignal::Terminate, ProcessSignal::Kill]
     );
 }
 

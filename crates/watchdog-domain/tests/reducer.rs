@@ -191,6 +191,44 @@ fn pause_and_resume_do_not_leak_elapsed_time() {
 }
 
 #[test]
+fn intentional_wait_rebases_an_existing_user_wait_pause() {
+    let waiting_for_user = reduce(
+        initial(),
+        ReducerInput::Observation(observation(
+            1,
+            time(1),
+            ObservationPayload::NativeState(DetailedState::WaitingForUser),
+        )),
+        ReducerPolicy::default(),
+    );
+    let intentional_wait = reduce(
+        waiting_for_user.into_snapshot(),
+        ReducerInput::Observation(observation(
+            2,
+            time(100),
+            ObservationPayload::IntentionalWait,
+        )),
+        ReducerPolicy::default(),
+    );
+    let resumed = reduce(
+        intentional_wait.into_snapshot(),
+        ReducerInput::Observation(observation(
+            3,
+            time(101),
+            ObservationPayload::Deadline(DeadlineCommand::Resume),
+        )),
+        ReducerPolicy::default(),
+    );
+    let stalled = reduce(
+        resumed.into_snapshot(),
+        ReducerInput::Tick(time(116)),
+        ReducerPolicy::default(),
+    );
+
+    assert_eq!(stalled.snapshot().state(), DetailedState::Stalled);
+}
+
+#[test]
 fn native_progress_resets_stall_clock_without_mcp_heartbeat() {
     let near_stall = reduce(
         initial(),

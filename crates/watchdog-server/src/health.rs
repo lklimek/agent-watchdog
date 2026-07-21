@@ -13,8 +13,10 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
-use watchdog_domain::{BoundedText, Clock};
-use watchdog_runtime::{ComponentId, ComponentStatus};
+use watchdog_domain::{BoundedText, Clock, RuntimeKind, SessionIdentity};
+use watchdog_runtime::{
+    ComponentHealth, ComponentId, ComponentStatus, HealthRegistry, HealthScope,
+};
 
 use crate::BasicAuthenticator;
 
@@ -64,16 +66,21 @@ pub struct HealthSnapshot {
 
 #[derive(Clone, Debug)]
 struct HealthEntry {
-    status: ComponentStatus,
     updated_at_ms: i64,
     message: Option<BoundedText<MAX_HEALTH_MESSAGE_BYTES>>,
+}
+
+#[derive(Debug, Default)]
+struct HealthState {
+    registry: HealthRegistry,
+    global_components: BTreeMap<ComponentId, HealthEntry>,
 }
 
 /// Shared bounded health registry for HTTP reporting and task supervision.
 #[derive(Clone)]
 pub struct HealthService {
     clock: Arc<dyn Clock>,
-    components: Arc<RwLock<BTreeMap<ComponentId, HealthEntry>>>,
+    state: Arc<RwLock<HealthState>>,
     configuration_warning: Arc<RwLock<Option<BoundedText<MAX_HEALTH_MESSAGE_BYTES>>>>,
 }
 
@@ -81,7 +88,10 @@ impl std::fmt::Debug for HealthService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HealthService")
-            .field("component_count", &self.read_components().len())
+            .field(
+                "component_count",
+                &self.read_state().global_components.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -92,13 +102,24 @@ impl HealthService {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
-            components: Arc::new(RwLock::new(BTreeMap::new())),
+            state: Arc::new(RwLock::new(HealthState::default())),
             configuration_warning: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Replace one component's global report.
     pub fn record(&self, component: ComponentId, status: ComponentStatus, message: Option<&str>) {
+        self.record_scoped(component, status, HealthScope::Global, message);
+    }
+
+    /// Replace one component report for a global, runtime, or session scope.
+    pub fn record_scoped(
+        &self,
+        component: ComponentId,
+        status: ComponentStatus,
+        scope: HealthScope,
+        message: Option<&str>,
+    ) {
         let message = message.and_then(|message| {
             BoundedText::new("health_message", message)
                 .ok()
@@ -110,22 +131,39 @@ impl HealthService {
                     .ok()
                 })
         });
-        self.write_components().insert(
-            component,
-            HealthEntry {
-                status,
-                updated_at_ms: self.clock.now().wall_time().value(),
-                message,
-            },
-        );
+        let mut state = self.write_state();
+        state
+            .registry
+            .record(ComponentHealth::new(component, status, scope));
+        if scope == HealthScope::Global {
+            state.global_components.insert(
+                component,
+                HealthEntry {
+                    updated_at_ms: self.clock.now().wall_time().value(),
+                    message,
+                },
+            );
+        }
     }
 
     /// Read the latest global component status for safety-gate evaluation.
     #[must_use]
     pub fn component_status(&self, component: ComponentId) -> Option<ComponentStatus> {
-        self.read_components()
-            .get(&component)
-            .map(|entry| entry.status)
+        self.read_state()
+            .registry
+            .status(component, HealthScope::Global)
+    }
+
+    /// Whether all required scoped health reports permit destructive automation.
+    #[must_use]
+    pub fn destructive_automation_allowed(
+        &self,
+        runtime: RuntimeKind,
+        session: SessionIdentity,
+    ) -> bool {
+        self.read_state()
+            .registry
+            .destructive_automation_allowed(runtime, session)
     }
 
     /// Replace or clear the last rejected configuration reload warning.
@@ -146,12 +184,18 @@ impl HealthService {
     /// Build a deterministic detailed health snapshot.
     #[must_use]
     pub fn snapshot(&self) -> HealthSnapshot {
-        let components = self
-            .read_components()
+        let state = self.read_state();
+        let components = state
+            .global_components
             .iter()
             .map(|(component, entry)| HealthComponentView {
                 component: component_name(*component),
-                status: level(entry.status),
+                status: level(
+                    state
+                        .registry
+                        .status(*component, HealthScope::Global)
+                        .unwrap_or(ComponentStatus::Failed),
+                ),
                 critical: critical(*component),
                 updated_at_ms: entry.updated_at_ms,
                 message: entry
@@ -164,9 +208,7 @@ impl HealthService {
             .read_configuration_warning()
             .as_ref()
             .map(|warning| warning.as_str().to_owned());
-        let ready = components
-            .iter()
-            .all(|component| !(component.critical && component.status == HealthLevel::Failed));
+        let ready = state.registry.is_ready();
         let status = if !ready {
             HealthLevel::Failed
         } else if configuration_warning.is_some()
@@ -186,14 +228,14 @@ impl HealthService {
         }
     }
 
-    fn read_components(&self) -> RwLockReadGuard<'_, BTreeMap<ComponentId, HealthEntry>> {
-        self.components
+    fn read_state(&self) -> RwLockReadGuard<'_, HealthState> {
+        self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn write_components(&self) -> RwLockWriteGuard<'_, BTreeMap<ComponentId, HealthEntry>> {
-        self.components
+    fn write_state(&self) -> RwLockWriteGuard<'_, HealthState> {
+        self.state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
