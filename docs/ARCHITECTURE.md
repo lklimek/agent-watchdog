@@ -223,7 +223,10 @@ Backpressure policy is evidence-aware:
 - watcher overflow marks the affected root uncertain and schedules bounded
   reconciliation;
 - queue saturation degrades health and suspends destructive automation for the
-  affected sessions.
+  affected sessions. Every rejected observation identity is retained durably
+  until that exact identity is replayed, while the in-memory admission queue
+  remains bounded; an older database overflow marker remains fail-closed until
+  the documented Watchdog-data wipe.
 
 ## 7. Runtime adapter contract
 
@@ -725,8 +728,10 @@ Proposed tools:
 | `list_events` | Durable inbox cursor/long-poll style retrieval. |
 | `get_watchdog_health` | Read relevant adapter and compatibility warnings. |
 
-All mutating tools are idempotent through a caller event key. Responses include
-server time, snapshot revision, normalized state, warning field, and evidence
+All mutating tools are idempotent through a caller event key. State-bearing,
+health, and watch-path responses expose server time. Session views also include
+snapshot revision, normalized state, warnings, and evidence provenance; health
+and watch-path responses carry their domain-specific diagnostics or registration
 provenance. Tool text is bounded and treated as untrusted.
 
 MCP resource subscription or server notification may hint that events are
@@ -969,6 +974,10 @@ structure.
   processes, so v1 keeps its parser adapter-ready without making app-server a
   hidden discovery dependency. Official lifecycle hooks are optional exact
   enrichment; filesystem, process, and rollout evidence remain automatic.
+- Codex Companion state exposes thread/turn identifiers but no authenticated,
+  capability-scoped cancellation transport. V1 therefore reports native
+  graceful cancellation as unsupported and proceeds to freshly verified
+  `SIGTERM`; it never trusts an ad hoc broker endpoint from runtime state.
 - Codex Companion 1.0.6 was inspected at
   `/home/ubuntu/.claude/plugins/cache/openai-codex/codex/1.0.6/`. Its v1 store
   used per-workspace state, `jobs/<id>.json`, logs, launcher PIDs, session IDs,

@@ -50,6 +50,9 @@ and configuration contrary to the concrete least-privilege inventory.
   optional user-level lifecycle hooks.
 - Keep app-server parsing available for a future explicitly shared transport;
   do not make it a hidden v1 dependency or expose an unauthenticated listener.
+- Treat Codex Companion graceful cancellation as unsupported until Companion
+  publishes an authenticated endpoint with verifiable job ownership. Thread
+  and turn IDs alone do not authorize sending `turn/interrupt` to a broker.
 - Treat the single-file SQLite source as bounded bootstrap metadata, not as the
   sole live discovery source. Automatic live discovery must independently scan
   capability-mounted rollout roots and use process evidence, so missing WAL rows

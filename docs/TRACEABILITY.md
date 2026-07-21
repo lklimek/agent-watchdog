@@ -19,8 +19,8 @@ not accepted deferrals.
 | FR-DIS-002 | T-DIS-001, T-DIS-011, T-DIS-012 | Runtime adapter crates; `server/tests/discovery.rs`; lifecycle-hook tests | Automated; isolated live matrix pending |
 | FR-DIS-003 | T-DIS-009 | Runtime-neutral domain identity, observation, capability, and state types; `domain/tests/model.rs` | Automated |
 | FR-DIS-004 | T-DIS-010 | Runtime-namespaced native IDs and role-preserving identities; `domain/tests/identity.rs` | Automated |
-| FR-DIS-005 | T-DIS-003, T-DIS-005 | Deterministic correlation priority and retained relation evidence; `domain/tests/correlation.rs` | Automated |
-| FR-DIS-006 | T-DIS-003, T-DIS-004, T-DIS-011, T-DIS-012 | Correlation engine plus exact native Claude/Codex/Companion hierarchy parsers | Automated |
+| FR-DIS-005 | T-DIS-003, T-DIS-005, T-DIS-023 | Deterministic correlation priority, retained relation evidence, and nested native-parent reuse | Automated |
+| FR-DIS-006 | T-DIS-003, T-DIS-004, T-DIS-011, T-DIS-012, T-DIS-023 | Correlation engine plus exact native Claude/Codex/Companion hierarchy parsers | Automated |
 | FR-DIS-007 | T-DIS-006, T-DIS-007 | Durable scoped `register_watch_path`, capability projection, prioritized watcher rebuild, and exact child ownership | Automated |
 | FR-DIS-008 | T-DIS-008 | Tracked standard path templates, explicit Compose binds, and tested coexistence of standard/additional native-to-mounted TOML mappings | Automated |
 | FR-DIS-009 | T-DIS-002 | Startup-directory/worktree metadata, root-scoped stores, dashboard cards, and ambiguity-safe worktree activity | Automated |
@@ -59,18 +59,18 @@ not accepted deferrals.
 | FR-STA-006 | T-STA-007 | Authoritative failure and verified process disappearance reduce immediately | Automated |
 | FR-STA-007 | T-STA-008 | Process sampling precedes timer evaluation; `AgentDiagnosticView` includes PID, latest CPU delta/provenance, trusted times, operation, conflicts, correlation, and suggested checks | Automated |
 | FR-STA-008 | T-STA-009 | Monotonic five-minute reminder reducer/outbox behavior | Automated |
-| FR-STA-009 | T-DIS-005, T-STA-010, T-STA-014 | Stable observation IDs, transactional store, durable event cursor, restart boundary | Automated |
+| FR-STA-009 | T-DIS-005, T-STA-010, T-STA-014, T-STA-017 | Source-sensitive stable observation IDs, transactional store, durable event cursor, restart boundary | Automated |
 | FR-KILL-001 | T-KILL-001 | `ChildSessionId`-only safety/termination entry points and main rejection tests | Automated |
-| FR-KILL-002 | T-KILL-002, T-KILL-003, T-KILL-012, T-STA-003, T-STA-013 | Typed safety gates, fresh-health/reconciliation checks, one-hour policy | Automated |
+| FR-KILL-002 | T-KILL-002, T-KILL-003, T-KILL-012, T-STA-003, T-STA-013, T-OPS-010 | Typed safety gates, recoverable queue pressure, fresh-health/reconciliation checks, one-hour policy | Automated |
 | FR-KILL-003 | T-KILL-003–005 | Durable warning/grace stages and cancellation on extension/progress | Automated |
-| FR-KILL-004 | T-KILL-006–008 | Durable graceful→TERM→KILL saga; graceful capability is optional | Automated |
+| FR-KILL-004 | T-KILL-006–008, T-KILL-015 | Durable graceful→TERM→KILL saga; unsupported Companion transport falls through to freshly verified TERM | Automated |
 | FR-KILL-005 | T-CPU-007, T-KILL-007, T-KILL-010, T-KILL-011, T-OPS-002 | Fresh PID/start-time/executable checks and pidfd helper integration | Automated |
 | FR-KILL-006 | T-KILL-008, T-KILL-009 | Default-enabled configurable KILL stage and opt-out test | Automated |
 | FR-KILL-007 | T-KILL-013 | Adapter boundary is read-only; cancellation interface and OS signals are the only mutation capabilities | Automated contract and final security inspection passed |
 | FR-MCP-001 | T-MCP-001 | Bearer middleware before rmcp parsing/allocation; auth and transport tests | Automated |
 | FR-MCP-002 | T-MCP-002, T-MCP-003 | One immutable main-tree scope per transport and cross-tree rejection | Automated |
 | FR-MCP-003 | T-MCP-004 | Twelve bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated |
-| FR-MCP-004 | T-DATA-003, T-MCP-005 | Transactional parent inbox and durable cursor across reconnect/restart | Automated |
+| FR-MCP-004 | T-DATA-003, T-MCP-005, T-MCP-009 | Transactional parent inbox with separate delivered/acknowledged ceilings across roots and restart | Automated |
 | FR-MCP-005 | T-MCP-006 | Durable `AgentEventView` includes the explicit bounded FR-STA-007 diagnostic bundle without transcript retrieval | Automated |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |
 | FR-MCP-007 | T-MCP-008 | Major/minor-gated actionable `UPGRADE` warning in snapshots, MCP, API, and UI | Automated |
@@ -109,13 +109,13 @@ not accepted deferrals.
 | FR-CFG-002 | T-CFG-001, T-CFG-002 | Atomic SIGHUP reload and last-valid snapshot/error retention | Automated |
 | FR-OPS-001 | T-OPS-001–003 | Hardened multi-stage image, Traefik-only Compose, non-root/read-only context | Automated contract and live Compose evidence |
 | FR-OPS-002 | T-OPS-001 | Exact read-only mounts, host PID namespace, no Docker socket/home/root mount | Automated contract |
-| FR-OPS-003 | T-OPS-008 | 50-main/500-session production-service load and restart test | Explicit load target passed |
+| FR-OPS-003 | T-OPS-008, T-OPS-010 | 50-main/500-session load plus bounded in-memory admission and exact durable rejection recovery | Explicit load target passed |
 | FR-OPS-004 | T-EVD-006 | Event-driven workers, bounded queues/scans/records, degradation health; isolated 500-session container gate | Automated; ten-minute CPU averaged 0.000% at Docker precision and burst p99 was 65.732 ms |
 | FR-OPS-005 | T-OPS-004, T-OPS-005 | Component health registry, isolated adapter degradation, critical readiness failure | Automated |
-| FR-OPS-006 | T-CPU-010, T-OPS-006 | Structured `tracing`, stable event codes, redacted Debug/error tests, bounded change-only correlation log cache | Automated and live reconciliation noise-checked |
+| FR-OPS-006 | T-CPU-010, T-OPS-006, T-OPS-009 | Structured stage-aware `tracing`, stable event codes, redacted diagnostics, and bounded change-only correlation log cache | Automated and live reconciliation noise-checked |
 | FR-OPS-007 | T-OPS-007 | Health/log interface only; no metrics route or exporter | Automated route/Compose inspection |
 | FR-SEC-001 | T-CFG-004, T-CPU-010, T-HTTP-001, T-MCP-001 | Constant-time bounded credentials, secret wrappers, redacted errors/debug | Automated |
-| FR-SEC-002 | T-DIS-007, T-SEC-001 | Linux capability roots, canonical mappings, openat2/no-symlink tests, and rejected MCP traversal/out-of-prefix/symlink registrations | Automated |
+| FR-SEC-002 | T-DIS-007, T-KILL-015, T-SEC-001 | Linux capability roots, canonical mappings, rejected path escapes, and no unauthenticated Companion cancellation transport | Automated |
 | FR-SEC-003 | T-HTTP-003, T-SEC-002 | Bounded typed parsers, no shell construction from native content, Maud escaping/CSP | Automated |
 
 ## Compatibility and engineering process

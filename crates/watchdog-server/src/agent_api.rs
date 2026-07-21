@@ -26,7 +26,6 @@ use watchdog_store::{
 pub(crate) const MAX_TREE_SESSIONS: u32 = 1_000;
 const MAX_EVENTS: u32 = 500;
 const OBSERVATION_QUEUE_CAPACITY: usize = 64;
-const MAX_REJECTED_OBSERVATIONS: usize = 64;
 // Retain a small recent sample without inflating every event response.
 const DIAGNOSTIC_ACTIVITY_SAMPLES: u32 = 8;
 
@@ -244,9 +243,20 @@ pub struct SessionTreeView {
     pub relations: Vec<RelationRecord>,
 }
 
+/// Server-timestamped result of registering one capability-validated path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RegisteredWatchPathView {
+    /// Server wall time used for response correlation.
+    pub server_time: WallTimeMs,
+    /// Durable registration, including ownership and caller provenance.
+    pub registration: watchdog_store::RegisteredWatchPathRecord,
+}
+
 /// Agent-facing health needed to diagnose monitoring coverage.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentHealthView {
+    /// Server wall time used for client-relative display and correlation.
+    pub server_time: WallTimeMs,
     /// Whether the database uses WAL journaling.
     pub store_wal: bool,
     /// Whether foreign-key enforcement is active.
@@ -287,8 +297,6 @@ struct ScopeRegistry {
 struct SessionAdmission<T> {
     queue: SessionQueue<T>,
     draining: bool,
-    rejected_observations: BTreeSet<ObservationId>,
-    rejected_overflow: bool,
 }
 
 impl<T> SessionAdmission<T> {
@@ -297,8 +305,6 @@ impl<T> SessionAdmission<T> {
             queue: SessionQueue::new(capacity)
                 .unwrap_or_else(|_| unreachable!("observation queue capacity is positive")),
             draining: false,
-            rejected_observations: BTreeSet::new(),
-            rejected_overflow: false,
         }
     }
 
@@ -315,22 +321,8 @@ impl<T> SessionAdmission<T> {
         self.queue.is_degraded()
     }
 
-    fn record_rejected(&mut self, observation_id: ObservationId) {
-        if self.rejected_observations.len() == MAX_REJECTED_OBSERVATIONS
-            && !self.rejected_observations.contains(&observation_id)
-        {
-            self.rejected_overflow = true;
-            return;
-        }
-        self.rejected_observations.insert(observation_id);
-    }
-
-    fn reconcile_rejected(&mut self, observation_id: ObservationId) -> bool {
-        self.rejected_observations.remove(&observation_id);
-        if self.rejected_overflow
-            || !self.rejected_observations.is_empty()
-            || !self.queue.is_degraded()
-        {
+    fn reconcile_rejected(&mut self, durable_uncertainty_remaining: bool) -> bool {
+        if durable_uncertainty_remaining || !self.queue.is_degraded() {
             return false;
         }
         self.queue.mark_reconciled();
@@ -405,6 +397,18 @@ impl std::fmt::Debug for AgentApi {
 impl AgentApi {
     pub(crate) fn event_sequence(&self) -> Arc<EventSequence> {
         Arc::clone(&self.inner.event_sequence)
+    }
+
+    pub(crate) async fn discovered_session_identity(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionIdentity>, AgentApiError> {
+        Ok(self
+            .inner
+            .store
+            .session_by_id(session_id)
+            .await?
+            .map(|record| record.session))
     }
 
     /// Construct the agent API and resume durable event allocation.
@@ -512,7 +516,7 @@ impl AgentApi {
         session_id: SessionId,
         event_key: &str,
         native_path: &str,
-    ) -> Result<watchdog_store::RegisteredWatchPathRecord, AgentApiError> {
+    ) -> Result<RegisteredWatchPathView, AgentApiError> {
         validate_event_key(event_key)?;
         let session = self.resolve_scoped(transport, session_id).await?;
         let registry = self
@@ -522,7 +526,7 @@ impl AgentApi {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(AgentApiError::WatchPathUnavailable)?;
-        registry
+        let registration = registry
             .register(session.session, session.root, event_key, native_path)
             .await
             .map_err(|error| match error {
@@ -530,7 +534,11 @@ impl AgentApi {
                 crate::watch_paths::WatchPathError::Capacity
                 | crate::watch_paths::WatchPathError::State => AgentApiError::WatchPathUnavailable,
                 crate::watch_paths::WatchPathError::Store(source) => AgentApiError::Store(source),
-            })
+            })?;
+        Ok(RegisteredWatchPathView {
+            server_time: self.inner.clock.now().wall_time(),
+            registration,
+        })
     }
 
     /// Persist a restart boundary for every retained session before native
@@ -1131,6 +1139,7 @@ impl AgentApi {
             }
         }
         Ok(AgentHealthView {
+            server_time: self.inner.clock.now().wall_time(),
             store_wal: store.journal_mode == "wal",
             store_foreign_keys: store.foreign_keys,
             schema_version: store.schema_version,
@@ -1140,8 +1149,9 @@ impl AgentApi {
 
     /// Read durable events after a caller-confirmed cursor.
     ///
-    /// Passing `after` also advances the stored acknowledgement monotonically;
-    /// the returned `next_cursor` is not stored until a later call confirms it.
+    /// Passing `after` advances the stored acknowledgement monotonically. A
+    /// successfully assembled page also stores `next_cursor` as the highest
+    /// cursor that this root may acknowledge on a later call.
     ///
     /// # Errors
     ///
@@ -1159,20 +1169,10 @@ impl AgentApi {
         let root = self.inner.scopes.root(transport)?;
         let durable = self.inner.store.inbox_offset(root).await?;
         let stored_cursor = durable.map_or(0, |offset| offset.last_event_id.value());
-        let latest_event_id = self.inner.store.latest_event_id().await?.value();
+        let delivered_cursor = durable.map_or(0, |offset| offset.last_delivered_event_id.value());
         let cursor = after.map_or(stored_cursor, |confirmed| {
-            confirmed.min(latest_event_id).max(stored_cursor)
+            confirmed.min(delivered_cursor).max(stored_cursor)
         });
-        if after.is_some() {
-            self.inner
-                .store
-                .save_inbox_offset(InboxOffsetRecord {
-                    parent: root,
-                    last_event_id: watchdog_domain::EventId::new(cursor),
-                    updated_at: self.inner.clock.now().wall_time(),
-                })
-                .await?;
-        }
         let domain_events = self
             .inner
             .store
@@ -1212,11 +1212,23 @@ impl AgentApi {
                 diagnostics,
             });
         }
-        Ok(EventPage {
+        let page = EventPage {
             after: cursor,
             next_cursor,
             events,
-        })
+        };
+        self.inner
+            .store
+            .save_inbox_offset(InboxOffsetRecord {
+                parent: root,
+                last_event_id: watchdog_domain::EventId::new(cursor),
+                last_delivered_event_id: watchdog_domain::EventId::new(
+                    delivered_cursor.max(next_cursor),
+                ),
+                updated_at: self.inner.clock.now().wall_time(),
+            })
+            .await?;
+        Ok(page)
     }
 
     async fn mutate_scoped(
@@ -1267,8 +1279,6 @@ impl AgentApi {
         let replaced = match admission.push(class, pending) {
             Ok(replaced) => replaced,
             Err(AdmissionError::Backpressure(pending)) => {
-                let observation_id = pending.observation.observation_id();
-                admission.record_rejected(observation_id);
                 self.persist_queue_rejection(record, &pending.observation)
                     .await?;
                 self.record_queue_health(
@@ -1279,8 +1289,6 @@ impl AgentApi {
                 return Err(AgentApiError::ObservationBackpressure);
             }
             Err(AdmissionError::ActivitySaturated(pending)) => {
-                let observation_id = pending.observation.observation_id();
-                admission.record_rejected(observation_id);
                 self.persist_queue_rejection(record, &pending.observation)
                     .await?;
                 self.record_queue_health(
@@ -1346,12 +1354,14 @@ impl AgentApi {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&lane.record.session);
+        let mut durable_uncertainty_remaining = uncertain;
         if uncertain {
             let remaining = self
                 .inner
                 .store
                 .clear_observation_queue_rejection(observation_id, lane.record.session)
                 .await?;
+            durable_uncertainty_remaining = remaining;
             if !remaining {
                 self.inner
                     .queue_uncertain
@@ -1366,7 +1376,7 @@ impl AgentApi {
             }
         }
         let mut admission = lane.admission.lock().await;
-        if !admission.reconcile_rejected(observation_id) {
+        if !admission.reconcile_rejected(durable_uncertainty_remaining) {
             return Ok(());
         }
         self.record_queue_health(
@@ -2143,15 +2153,8 @@ mod admission_tests {
     }
 
     async fn wait_for_queue_len(lane: &super::SessionLane, expected: usize) {
-        // Wall-clock deadline rather than a fixed yield-count: under a
-        // contended parallel test-suite run, `tokio::task::yield_now()`
-        // alone does not guarantee the background task(s) populating the
-        // queue actually get scheduled within a bounded number of yields
-        // (confirmed flaky: intermittent "queue did not reach expected
-        // length" panics under `cargo test --workspace`, always passing
-        // standalone / single-threaded). A short real sleep between checks
-        // gives the scheduler genuine wall-clock time to make progress
-        // instead of assuming cooperative yields are enough.
+        // Wall-clock polling lets contended background tasks make progress
+        // without assuming a fixed number of cooperative yields is sufficient.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let admission = lane.admission.lock().await;

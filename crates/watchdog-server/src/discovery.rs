@@ -1,8 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
+    borrow::Borrow,
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    hash::Hash,
     io::{Read as _, Seek as _, SeekFrom},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::UNIX_EPOCH,
 };
 
@@ -31,7 +33,9 @@ const MAX_CLAUDE_BOOTSTRAP_BATCHES: usize = 1;
 const MAX_CLAUDE_TRANSCRIPT_BATCHES: usize = 4;
 const MAX_CLAUDE_TRANSCRIPT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CLAUDE_TRANSCRIPT_RECORDS: usize = 128;
-const MAX_CLAUDE_ALIAS_CACHE: usize = 2_048;
+const MAX_DISCOVERY_ALIAS_CACHE: usize = 2_048;
+const MAX_CLAUDE_TRANSCRIPT_ALIAS_CACHE: usize = 2_048;
+const MAX_CLAUDE_TRANSCRIPT_VERSION_CACHE: usize = 2_048;
 const MAX_CLAUDE_SESSIONS: u32 = 1_000;
 const CODEX_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_CODEX_THREADS: u32 = 1_000;
@@ -42,6 +46,100 @@ const MAX_CODEX_ROLLOUT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CODEX_ROLLOUT_RECORDS: usize = 128;
 const MAX_CODEX_BOOTSTRAP_TAIL_BYTES: usize = 1_024 * 1_024;
 const MAX_CODEX_CORRELATION_LOG_CACHE: usize = 2_048;
+const MAX_DISCOVERY_WARNING_LOG_SITES: usize = 256;
+
+type DiscoveryWarningSite = (&'static str, u32, u32);
+static DISCOVERY_WARNING_LOG_SITES: OnceLock<Mutex<BoundedLru<DiscoveryWarningSite, ()>>> =
+    OnceLock::new();
+
+struct BoundedLru<K, V> {
+    entries: HashMap<K, V>,
+    recency: VecDeque<K>,
+    capacity: usize,
+}
+
+impl<K, V> BoundedLru<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get_cloned<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+        V: Clone,
+    {
+        let (owned, value) = self
+            .entries
+            .get_key_value(key)
+            .map(|(owned, value)| (owned.clone(), value.clone()))?;
+        touch_recency(&mut self.recency, owned);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> bool {
+        self.insert_evicting_where(key, value, |_| true)
+    }
+
+    fn insert_evicting_where(
+        &mut self,
+        key: K,
+        value: V,
+        mut may_evict: impl FnMut(&V) -> bool,
+    ) -> bool {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), value);
+            touch_recency(&mut self.recency, key);
+            return true;
+        }
+        if self.capacity == 0 {
+            return false;
+        }
+        if self.entries.len() >= self.capacity {
+            let Some(index) = self
+                .recency
+                .iter()
+                .position(|candidate| self.entries.get(candidate).is_some_and(&mut may_evict))
+            else {
+                return false;
+            };
+            let evicted = self
+                .recency
+                .remove(index)
+                .unwrap_or_else(|| unreachable!("eviction index came from the same queue"));
+            self.entries.remove(&evicted);
+        }
+        self.entries.insert(key.clone(), value);
+        touch_recency(&mut self.recency, key);
+        true
+    }
+}
+
+fn touch_recency<K: Eq>(recency: &mut VecDeque<K>, key: K) {
+    if let Some(index) = recency.iter().position(|candidate| *candidate == key) {
+        recency.remove(index);
+    }
+    recency.push_back(key);
+}
+
+fn discovery_warning_site_is_new(site: DiscoveryWarningSite) -> bool {
+    let mut sites = DISCOVERY_WARNING_LOG_SITES
+        .get_or_init(|| Mutex::new(BoundedLru::new(MAX_DISCOVERY_WARNING_LOG_SITES)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if sites.get_cloned(&site).is_some() {
+        return false;
+    }
+    sites.insert(site, ());
+    true
+}
 const COMPANION_LOG_CURSOR_VERSION: u32 = 1;
 const COMPANION_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_GIT_CONFIG_BYTES: usize = 64 * 1_024;
@@ -161,6 +259,18 @@ pub struct RuntimeDiscoveryReport {
     warning_count: u32,
 }
 
+#[derive(Debug, Error)]
+enum CodexBootstrapTailError {
+    #[error("Codex rollout bootstrap cursor could not be read")]
+    CursorRead(#[source] StoreError),
+    #[error("Codex rollout bootstrap tail could not be read")]
+    TailRead,
+    #[error("Codex rollout bootstrap observation could not be built")]
+    ObservationBuild,
+    #[error("Codex rollout bootstrap observation could not be ingested")]
+    ObservationIngest(#[source] crate::AgentApiError),
+}
+
 impl RuntimeDiscoveryReport {
     /// Unique main sessions successfully reconciled in this pass.
     #[must_use]
@@ -186,7 +296,18 @@ impl RuntimeDiscoveryReport {
         self.warning_count > 0
     }
 
+    #[track_caller]
     fn warn(&mut self) {
+        let caller = std::panic::Location::caller();
+        if discovery_warning_site_is_new((caller.file(), caller.line(), caller.column())) {
+            tracing::warn!(
+                event = "discovery.reconciliation_warning",
+                source_file = caller.file(),
+                source_line = caller.line(),
+                source_column = caller.column(),
+                "Runtime discovery evidence could not be reconciled"
+            );
+        }
         self.warning_count = self.warning_count.saturating_add(1);
     }
 }
@@ -199,7 +320,7 @@ struct MainParentDiscovery<'a> {
     evidence_source: &'a str,
 }
 
-async fn ensure_main_parent(
+async fn ensure_native_parent(
     api: &AgentApi,
     parent: &NativeSessionKey,
     discovery: MainParentDiscovery<'_>,
@@ -208,6 +329,12 @@ async fn ensure_main_parent(
 ) -> Result<SessionId, crate::AgentApiError> {
     let parent_id = SessionId::from_native(parent);
     if mains.contains(&parent_id) {
+        return Ok(parent_id);
+    }
+    if let Some(identity) = api.discovered_session_identity(parent_id).await? {
+        if matches!(identity, SessionIdentity::Main(_)) && mains.insert(parent_id) {
+            report.main_sessions = report.main_sessions.saturating_add(1);
+        }
         return Ok(parent_id);
     }
     api.discover_session(DiscoveredSession {
@@ -427,15 +554,13 @@ impl ClaudeTeamTranscriptAliases {
 /// reconciliation on every server start.
 #[derive(Clone)]
 pub struct DiscoveryAliasRegistry {
-    aliases: Arc<Mutex<HashMap<NativeSessionKey, Option<SessionId>>>>,
-    capacity: usize,
+    aliases: Arc<Mutex<BoundedLru<NativeSessionKey, Option<SessionId>>>>,
 }
 
 impl Default for DiscoveryAliasRegistry {
     fn default() -> Self {
         Self {
-            aliases: Arc::new(Mutex::new(HashMap::new())),
-            capacity: MAX_CLAUDE_ALIAS_CACHE,
+            aliases: Arc::new(Mutex::new(BoundedLru::new(MAX_DISCOVERY_ALIAS_CACHE))),
         }
     }
 }
@@ -444,8 +569,7 @@ impl DiscoveryAliasRegistry {
     #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            aliases: Arc::new(Mutex::new(HashMap::new())),
-            capacity,
+            aliases: Arc::new(Mutex::new(BoundedLru::new(capacity))),
         }
     }
 
@@ -454,23 +578,14 @@ impl DiscoveryAliasRegistry {
             .aliases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if aliases.len() >= self.capacity && !aliases.contains_key(&alias) {
-            let removable = aliases
-                .iter()
-                .find_map(|(key, canonical)| canonical.is_some().then(|| key.clone()));
-            let Some(removable) = removable else {
-                return;
-            };
-            aliases.remove(&removable);
-        }
-        match aliases.entry(alias) {
-            Entry::Vacant(entry) => {
-                entry.insert(Some(canonical));
+        match aliases.get_cloned(&alias) {
+            None => {
+                aliases.insert_evicting_where(alias, Some(canonical), Option::is_some);
             }
-            Entry::Occupied(mut entry) if entry.get() != &Some(canonical) => {
-                entry.insert(None);
+            Some(Some(existing)) if existing != canonical => {
+                aliases.insert(alias, None);
             }
-            Entry::Occupied(_) => {}
+            Some(Some(_) | None) => {}
         }
     }
 
@@ -478,8 +593,7 @@ impl DiscoveryAliasRegistry {
         self.aliases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(alias)
-            .copied()
+            .get_cloned(alias)
             .flatten()
     }
 }
@@ -576,8 +690,8 @@ pub struct ClaudeDiscovery {
     api: AgentApi,
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
-    alias_cache: Arc<Mutex<HashMap<String, ClaudeTeamTranscriptAlias>>>,
-    version_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
+    alias_cache: Arc<Mutex<BoundedLru<String, ClaudeTeamTranscriptAlias>>>,
+    version_cache: Arc<Mutex<BoundedLru<String, Option<String>>>>,
     native_aliases: DiscoveryAliasRegistry,
 }
 
@@ -608,8 +722,12 @@ impl ClaudeDiscovery {
             api,
             store,
             clock,
-            alias_cache: Arc::new(Mutex::new(HashMap::new())),
-            version_cache: Arc::new(Mutex::new(HashMap::new())),
+            alias_cache: Arc::new(Mutex::new(BoundedLru::new(
+                MAX_CLAUDE_TRANSCRIPT_ALIAS_CACHE,
+            ))),
+            version_cache: Arc::new(Mutex::new(BoundedLru::new(
+                MAX_CLAUDE_TRANSCRIPT_VERSION_CACHE,
+            ))),
             native_aliases,
         }
     }
@@ -1479,7 +1597,7 @@ impl ClaudeDiscovery {
         let Some(parent_native) = candidate.parent.as_ref() else {
             return Ok(None);
         };
-        ensure_main_parent(
+        ensure_native_parent(
             &self.api,
             parent_native,
             MainParentDiscovery {
@@ -1513,8 +1631,7 @@ impl ClaudeDiscovery {
         self.alias_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(path_key.as_str())
-            .cloned()
+            .get_cloned(path_key.as_str())
     }
 
     fn cache_alias(&self, path_key: &BoundedText<4_096>, alias: ClaudeTeamTranscriptAlias) {
@@ -1522,9 +1639,6 @@ impl ClaudeDiscovery {
             .alias_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= MAX_CLAUDE_ALIAS_CACHE && !cache.contains_key(path_key.as_str()) {
-            cache.clear();
-        }
         cache.insert(path_key.as_str().to_owned(), alias);
     }
 
@@ -1551,8 +1665,7 @@ impl ClaudeDiscovery {
             .version_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
-            .cloned()
+            .get_cloned(key)
         {
             return cached;
         }
@@ -1561,9 +1674,6 @@ impl ClaudeDiscovery {
             .version_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= MAX_CLAUDE_ALIAS_CACHE && !cache.contains_key(key) {
-            cache.clear();
-        }
         cache.insert(key.to_owned(), detected.clone());
         detected
     }
@@ -2275,7 +2385,7 @@ impl CompanionDiscovery {
         } else {
             let adapter_version =
                 format!("companion-{}", watchdog_companion::TESTED_COMPANION_VERSION);
-            if let Err(error) = ensure_main_parent(
+            if let Err(error) = ensure_native_parent(
                 &self.api,
                 parent,
                 MainParentDiscovery {
@@ -2320,7 +2430,7 @@ impl CompanionDiscovery {
             report.warn();
             return false;
         }
-        let event_key = companion_event_key(child_id, reconciled_job);
+        let event_key = companion_event_key(child_id, reconciled);
         let Ok(observation) = parser.observation(reconciled, &event_key, self.clock.now()) else {
             report.warn();
             return false;
@@ -2587,9 +2697,9 @@ impl ClaudeParentIndex {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CodexCorrelationLogCache {
-    outcomes: Arc<Mutex<HashMap<SessionId, CodexCorrelationLogOutcome>>>,
+    outcomes: Arc<Mutex<BoundedLru<SessionId, CodexCorrelationLogOutcome>>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2610,14 +2720,20 @@ impl CodexCorrelationLogCache {
             .outcomes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if outcomes.get(&subject) == Some(&outcome) {
+        let existing = outcomes.get_cloned(&subject);
+        if existing == Some(outcome) {
             return false;
-        }
-        if outcomes.len() >= MAX_CODEX_CORRELATION_LOG_CACHE && !outcomes.contains_key(&subject) {
-            outcomes.clear();
         }
         outcomes.insert(subject, outcome);
         true
+    }
+}
+
+impl Default for CodexCorrelationLogCache {
+    fn default() -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(BoundedLru::new(MAX_CODEX_CORRELATION_LOG_CACHE))),
+        }
     }
 }
 
@@ -2826,7 +2942,7 @@ impl CodexDiscovery {
         };
         let mut parent = match metadata.parent() {
             Some(parent) => {
-                let parent_id = match ensure_main_parent(
+                let parent_id = match ensure_native_parent(
                     &self.api,
                     parent,
                     MainParentDiscovery {
@@ -2886,11 +3002,16 @@ impl CodexDiscovery {
             report.warn();
         }
         record_rollout_session(kind, session_id, mains, children, report);
-        if self
+        if let Err(error) = self
             .reconcile_codex_bootstrap_tail(candidate, metadata.subject(), kind)
             .await
-            .is_err()
         {
+            tracing::warn!(
+                event = "discovery.codex_bootstrap_tail_failed",
+                session_kind = ?kind,
+                error = ?error,
+                "Codex rollout bootstrap evidence could not be reconciled"
+            );
             report.warn();
         }
         Some((metadata.subject().clone(), kind))
@@ -2901,27 +3022,29 @@ impl CodexDiscovery {
         candidate: &CodexRolloutCandidate,
         subject: &NativeSessionKey,
         kind: SessionKind,
-    ) -> Result<(), ()> {
+    ) -> Result<(), CodexBootstrapTailError> {
         if self
             .store
             .file_cursor(&candidate.path_key)
             .await
-            .map_err(|_| ())?
+            .map_err(CodexBootstrapTailError::CursorRead)?
             .is_some()
         {
             return Ok(());
         }
-        let Some(evidence) = parse_codex_rollout_tail(candidate, subject, self.clock.now())? else {
+        let Some(evidence) = parse_codex_rollout_tail(candidate, subject, self.clock.now())
+            .map_err(|()| CodexBootstrapTailError::TailRead)?
+        else {
             return Ok(());
         };
         self.api
-            .ingest_native_observation(codex_rollout_observation_for_kind(
-                evidence.observation(),
-                kind,
-            )?)
+            .ingest_native_observation(
+                codex_rollout_observation_for_kind(evidence.observation(), kind)
+                    .map_err(|()| CodexBootstrapTailError::ObservationBuild)?,
+            )
             .await
             .map(|_| ())
-            .map_err(|_| ())
+            .map_err(CodexBootstrapTailError::ObservationIngest)
     }
 
     async fn enrich_rollout_repository(
@@ -3440,7 +3563,7 @@ impl CodexDiscovery {
             report.warn();
             return;
         };
-        let parent_id = match ensure_main_parent(
+        let parent_id = match ensure_native_parent(
             &self.api,
             parent,
             MainParentDiscovery {
@@ -3835,12 +3958,36 @@ impl std::fmt::Debug for CodexDiscovery {
     }
 }
 
-fn companion_event_key(session: SessionId, job: &watchdog_companion::CompanionJob) -> String {
+fn companion_event_key(
+    session: SessionId,
+    reconciled: &watchdog_companion::ReconciledCompanionJob,
+) -> String {
+    let job = reconciled.job();
     format!(
-        "companion-state:{session}:{}:{}",
+        "companion-state:{session}:{}:{}:{}:{}",
         job.updated_at().unwrap_or("no-native-time"),
-        state_key(job.state())
+        state_key(job.state()),
+        companion_source_key(reconciled.source()),
+        companion_consistency_key(reconciled.consistency()),
     )
+}
+
+const fn companion_source_key(source: watchdog_companion::CompanionSource) -> &'static str {
+    match source {
+        watchdog_companion::CompanionSource::Summary => "summary",
+        watchdog_companion::CompanionSource::Detail => "detail",
+        watchdog_companion::CompanionSource::Both => "both",
+    }
+}
+
+const fn companion_consistency_key(
+    consistency: watchdog_companion::CompanionConsistency,
+) -> &'static str {
+    match consistency {
+        watchdog_companion::CompanionConsistency::SingleSource => "single",
+        watchdog_companion::CompanionConsistency::Consistent => "consistent",
+        watchdog_companion::CompanionConsistency::Conflicted => "conflicted",
+    }
 }
 
 const fn state_key(state: DetailedState) -> &'static str {
@@ -3947,7 +4094,7 @@ fn is_concrete_absolute(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink, path::Path, sync::Arc};
+    use std::{collections::BTreeSet, fs, os::unix::fs::symlink, path::Path, sync::Arc};
 
     use watchdog_domain::{
         CompatibilityWarning, NativeSessionKey, RuntimeKind, SessionId, SessionKind, TimePoint,
@@ -3957,8 +4104,10 @@ mod tests {
     use watchdog_testkit::FakeClock;
 
     use super::{
-        AgentApi, CODEX_VERSION_UNKNOWN, CodexCorrelationLogCache, CodexDiscovery,
-        DiscoveredSession, DiscoveryAliasRegistry, WorktreePathMapping, minor_version_mismatch,
+        AgentApi, BoundedLru, CODEX_VERSION_UNKNOWN, CodexBootstrapTailError,
+        CodexCorrelationLogCache, CodexDiscovery, DiscoveredSession, DiscoveryAliasRegistry,
+        MAX_CODEX_CORRELATION_LOG_CACHE, MainParentDiscovery, RuntimeDiscoveryReport,
+        WorktreePathMapping, companion_event_key, ensure_native_parent, minor_version_mismatch,
     };
 
     fn session(runtime: RuntimeKind, native_id: &str) -> SessionId {
@@ -3977,6 +4126,158 @@ mod tests {
         assert!(!cache.changed(subject, None, "claude_origin_without_unique_parent"));
         assert!(cache.changed(subject, Some(parent), "claude_origin_and_unique_cwd"));
         assert!(!cache.changed(subject, Some(parent), "claude_origin_and_unique_cwd"));
+    }
+
+    #[test]
+    fn codex_bootstrap_failures_keep_actionable_stage_context() {
+        assert_eq!(
+            CodexBootstrapTailError::TailRead.to_string(),
+            "Codex rollout bootstrap tail could not be read"
+        );
+        assert_eq!(
+            CodexBootstrapTailError::ObservationBuild.to_string(),
+            "Codex rollout bootstrap observation could not be built"
+        );
+    }
+
+    #[test]
+    fn codex_correlation_pressure_preserves_existing_suppression_state() {
+        let cache = CodexCorrelationLogCache::default();
+        let retained = session(RuntimeKind::CodexCli, "retained-codex-child");
+        assert!(cache.changed(retained, None, "no_unique_parent"));
+        for index in 1..MAX_CODEX_CORRELATION_LOG_CACHE {
+            assert!(cache.changed(
+                session(RuntimeKind::CodexCli, &format!("codex-child-{index}")),
+                None,
+                "no_unique_parent",
+            ));
+        }
+        assert!(!cache.changed(retained, None, "no_unique_parent"));
+        assert!(cache.changed(
+            session(RuntimeKind::CodexCli, "overflow-codex-child"),
+            None,
+            "no_unique_parent",
+        ));
+
+        assert!(
+            !cache.changed(retained, None, "no_unique_parent"),
+            "one new subject must not erase every prior one-shot outcome"
+        );
+    }
+
+    #[test]
+    fn bounded_cache_evicts_the_least_recently_used_entry() {
+        let mut cache = BoundedLru::new(2);
+        cache.insert("hot", 1);
+        cache.insert("cold", 2);
+        assert_eq!(cache.get_cloned(&"hot"), Some(1));
+
+        cache.insert("new", 3);
+
+        assert_eq!(cache.get_cloned(&"hot"), Some(1));
+        assert_eq!(cache.get_cloned(&"cold"), None);
+        assert_eq!(cache.get_cloned(&"new"), Some(3));
+    }
+
+    #[test]
+    fn repeated_discovery_warning_site_logs_once_per_process() {
+        let site = ("discovery-test.rs", u32::MAX, u32::MAX);
+        assert!(super::discovery_warning_site_is_new(site));
+        assert!(!super::discovery_warning_site_is_new(site));
+    }
+
+    #[tokio::test]
+    async fn native_parent_discovery_reuses_an_existing_child_role() {
+        let fixture = tempfile::tempdir().expect("fixture root should exist");
+        let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(
+            WallTimeMs::new(1_000),
+            1_000,
+        )));
+        let api = AgentApi::new(store, clock)
+            .await
+            .expect("API should initialize");
+        let root = api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: "nested-root".to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "nested-root".to_owned(),
+                adapter_version: "test".to_owned(),
+                evidence_source: "test:root".to_owned(),
+                title: None,
+                startup_directory: None,
+            })
+            .await
+            .expect("root should be discovered");
+        let parent_native =
+            NativeSessionKey::new(RuntimeKind::CodexCli, "nested-parent").expect("valid parent");
+        let parent = api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::CodexCli,
+                native_id: parent_native.native_id().to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(root.session.session_id()),
+                event_key: "nested-parent".to_owned(),
+                adapter_version: "test".to_owned(),
+                evidence_source: "test:parent".to_owned(),
+                title: None,
+                startup_directory: None,
+            })
+            .await
+            .expect("nested parent should be discovered");
+        let mut mains = BTreeSet::new();
+        let mut report = RuntimeDiscoveryReport::default();
+
+        let resolved = ensure_native_parent(
+            &api,
+            &parent_native,
+            MainParentDiscovery {
+                runtime: RuntimeKind::CodexCli,
+                event_key_prefix: "nested-parent-fallback",
+                adapter_version: "test",
+                evidence_source: "test:fallback",
+            },
+            &mut mains,
+            &mut report,
+        )
+        .await
+        .expect("an existing child may own native descendants");
+
+        assert_eq!(resolved, parent.session.session_id());
+        assert_eq!(report.main_sessions(), 0);
+    }
+
+    #[test]
+    fn companion_observation_identity_changes_when_evidence_source_changes() {
+        let parser = watchdog_companion::CompanionParser::new("1.0.6")
+            .expect("parser version should be supported");
+        let summary = parser
+            .parse_summary(
+                br#"{"version":1,"jobs":[{"id":"job","workspaceRoot":"/work","sessionId":"root","status":"running","phase":"running","pid":42,"updatedAt":"same"}]}"#,
+            )
+            .expect("summary should parse");
+        let detail = parser
+            .parse_detail(
+                br#"{"id":"job","workspaceRoot":"/work","sessionId":"root","status":"running","phase":"running","pid":42,"updatedAt":"same"}"#,
+            )
+            .expect("detail should parse");
+        let summary_only = parser
+            .reconcile(Some(&summary.jobs()[0]), None)
+            .expect("summary should reconcile");
+        let both = parser
+            .reconcile(Some(&summary.jobs()[0]), Some(&detail))
+            .expect("matching sources should reconcile");
+        let subject = SessionId::from_native(summary_only.subject());
+
+        assert_ne!(
+            companion_event_key(subject, &summary_only),
+            companion_event_key(subject, &both),
+            "idempotency identity must include the evidence source and consistency"
+        );
     }
 
     #[test]

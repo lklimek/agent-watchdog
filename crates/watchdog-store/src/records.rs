@@ -448,6 +448,8 @@ pub struct InboxOffsetRecord {
     pub parent: MainSessionId,
     /// Last event acknowledged by the parent.
     pub last_event_id: EventId,
+    /// Highest event returned to this parent and therefore safe to acknowledge.
+    pub last_delivered_event_id: EventId,
     /// Persistable acknowledgement time.
     pub updated_at: WallTimeMs,
 }

@@ -92,6 +92,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-DIS-020 | Watchdog first sees a main Codex rollout after its final `task_complete` was already written, or while that final JSON object lacks its newline boundary. | One bounded tail read recovers only a complete turn boundary as waiting for user before the durable EOF cursor is initialized; a partial final record is ignored and subsequent scans remain incremental. | FR-DIS-010, FR-EVD-002, FR-EVD-004, FR-EVD-008 |
 | T-DIS-021 | A root-level Claude transcript matches two same-type teammates with one common team lead. | The common lead remains the only main; ambiguous member identity does not create another card. | FR-DIS-005, FR-DIS-017 |
 | T-DIS-022 | A complete Claude live registry contains one PID/start-verified main while a retained transcript main with the same cwd is absent; repeat with two valid live entries sharing that cwd and with malformed registry coverage. | The absent retained main becomes completed, every valid live entry remains distinct and receives exact process/state metadata, and malformed/uncertain coverage retires nothing. | FR-DIS-018, FR-DIS-006, FR-UI-001 |
+| T-DIS-023 | A native Codex child is referenced as the parent of another native thread. | The existing child role and root are reused; discovery does not promote it to a conflicting main session. | FR-DIS-005, FR-DIS-006 |
 
 ### 5.2 Filesystem ingestion and native parsing
 
@@ -147,6 +148,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-STA-014 | A restarted process receives fresh evidence whose monotonic value is below the prior process's persisted value. | The durable restart boundary resets ordering; fresh evidence applies and clears reconciliation. | FR-DATA-001, FR-STA-009 |
 | T-STA-015 | A current Claude team config is re-observed after restart without new transcript activity. | The lead and listed members clear the restart gate without fabricating progress or changing native state. | FR-DIS-001, FR-DATA-001, FR-UI-001 |
 | T-STA-016 | Scheduler ticks and compatibility-only observations arrive for a retained session after restart. | Neither clears the restart gate; only fresh native/process reconciliation can return the session to the active projection. | FR-DATA-001, FR-UI-001 |
+| T-STA-017 | Companion summary-only evidence is followed by matching summary-plus-detail evidence with the same native timestamp and state. | The source/consistency change receives a distinct observation identity and reconciles without an idempotency conflict. | FR-STA-009 |
 
 ### 5.5 Termination safety
 
@@ -166,6 +168,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-KILL-012 | Adapter, queue, database, or process evidence is degraded. | All affected destructive automation is suspended. | FR-KILL-002, FR-COMP-002 |
 | T-KILL-013 | Cancellation completes. | Native runtime files are byte-for-byte unchanged by Watchdog. | FR-KILL-007 |
 | T-KILL-014 | Server restarts in every saga stage. | It resumes conservatively, reconciles, and never skips a gate. | FR-DATA-001 |
+| T-KILL-015 | Companion state contains thread/turn IDs but no authenticated capability-scoped transport. | Graceful cancellation is unsupported and escalation proceeds only through freshly verified OS signalling. | FR-KILL-004, FR-SEC-002 |
 
 ### 5.6 Persistence and configuration
 
@@ -193,6 +196,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-MCP-006 | Alert event is read by parent. | PID identity, CPU deltas, timestamps, conflicts, correlation, operation, and suggestions exist. | FR-MCP-005 |
 | T-MCP-007 | Push is unsupported or fails. | Durable inbox remains correct. | FR-MCP-006 |
 | T-MCP-008 | Adapter detected version first differs only in patch, then differs in minor or major. | Patch-only drift has no `UPGRADE`; a major/minor mismatch includes an actionable warning in the tool response. | FR-MCP-007 |
+| T-MCP-009 | Root A has an undelivered event while root B advances the global event sequence; root A then sends an oversized acknowledgement. | Root A clamps to its highest delivered event and still receives its undelivered event. | FR-MCP-004 |
 | T-HTTP-001 | Missing/wrong/oversized Basic credential requests UI/API. | Browser challenge/failure contains no session metadata. | FR-UI-008, FR-SEC-001 |
 | T-HTTP-002 | API attempts a state mutation. | No route exists or method is rejected. | FR-API-001 |
 | T-HTTP-003 | Native title contains HTML/script. | Rendered page escapes it; CSP blocks execution. | FR-SEC-003 |
@@ -239,6 +243,8 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-OPS-006 | Generate operational errors, transitions, and repeated identical correlation outcomes. | `tracing` output is structured, bounded, and secret/transcript free; an unchanged correlation outcome logs once and logs again only after it changes. | FR-OPS-006 |
 | T-OPS-007 | Query deployment for metrics endpoint/exporter. | None is required or exposed in v1. | FR-OPS-007 |
 | T-OPS-008 | Run the target synthetic population. | 50 mains/500 total agents converge with bounded resources and no transcript rescans. | FR-OPS-003 |
+| T-OPS-009 | More unique correlation outcomes than the diagnostic-cache capacity are observed. | Existing one-shot suppression state remains bounded and is not cleared wholesale. | FR-OPS-006 |
+| T-OPS-010 | One session rejects 65 distinct observations; the first 64 are retried, followed by the final identity. | The 65th unretried identity keeps the session fail-closed; uncertainty clears only after its exact retry. | FR-OPS-003, FR-KILL-002 |
 | T-SEC-001 | Paths contain `..`, symlink escape, race replacement, or non-UTF-8 components. | Capability-root access prevents escape; errors remain bounded. | FR-SEC-002 |
 | T-SEC-002 | Transcript/MCP strings contain markup, shell syntax, control chars, or huge fields. | Input is bounded/escaped and never executed. | FR-SEC-003 |
 | T-COMP-001 | Supported runtime emits recognized current schema. | Adapter healthy with documented tested version. | FR-COMP-001 |

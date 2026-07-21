@@ -483,7 +483,6 @@ fn initialize_linux_monitors(
         store.clone(),
         Arc::clone(clock) as Arc<_>,
         health.clone(),
-        config.companion_roots().to_vec(),
         termination_config,
         config.deadline_policy().terminate_after_stalled(),
     )
@@ -527,7 +526,6 @@ fn spawn_termination_worker(
             monitor.update_policy(
                 termination_config,
                 current.deadline_policy().terminate_after_stalled(),
-                current.companion_roots(),
             );
             if let Ok(report) = monitor.reconcile().await {
                 health.record(

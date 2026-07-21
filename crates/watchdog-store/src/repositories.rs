@@ -11,8 +11,6 @@ use crate::{
     bounded_json, sqlite_integer,
 };
 
-const MAX_PERSISTED_QUEUE_REJECTIONS_PER_SESSION: i64 = 64;
-
 impl WatchdogStore {
     /// Persist uncertainty for durable evidence rejected by bounded admission.
     ///
@@ -40,34 +38,16 @@ impl WatchdogStore {
         {
             return Err(StoreError::IdentityMismatch);
         }
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM observation_queue_rejections WHERE session_id = ?",
-        )
-        .bind(&session_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if existing_session.is_none() && count >= MAX_PERSISTED_QUEUE_REJECTIONS_PER_SESSION {
-            sqlx::query(
-                "INSERT INTO observation_queue_rejection_overflow \
-                 (session_id, rejected_at_ms) VALUES (?, ?) \
-                 ON CONFLICT(session_id) DO UPDATE SET rejected_at_ms = excluded.rejected_at_ms",
-            )
-            .bind(&session_id)
-            .bind(rejected_at.value())
-            .execute(&mut *transaction)
-            .await?;
-        } else {
-            sqlx::query(
-                "INSERT INTO observation_queue_rejections \
+        sqlx::query(
+            "INSERT INTO observation_queue_rejections \
              (observation_id, session_id, rejected_at_ms) VALUES (?, ?, ?) \
              ON CONFLICT(observation_id) DO UPDATE SET rejected_at_ms = excluded.rejected_at_ms",
-            )
-            .bind(observation_id)
-            .bind(&session_id)
-            .bind(rejected_at.value())
-            .execute(&mut *transaction)
-            .await?;
-        }
+        )
+        .bind(observation_id)
+        .bind(&session_id)
+        .bind(rejected_at.value())
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -817,14 +797,24 @@ impl WatchdogStore {
     /// Returns [`StoreError`] for integer overflow or persistence failure.
     pub async fn save_inbox_offset(&self, record: InboxOffsetRecord) -> Result<bool, StoreError> {
         let event_id = sqlite_integer("inbox event ID", record.last_event_id.value())?;
+        let delivered_event_id = sqlite_integer(
+            "inbox delivered event ID",
+            record.last_delivered_event_id.value(),
+        )?;
         let result = sqlx::query(
-            "INSERT INTO inbox_offsets (parent_session_id, last_event_id, updated_at_ms) \
-             VALUES (?, ?, ?) ON CONFLICT(parent_session_id) DO UPDATE SET \
-             last_event_id = excluded.last_event_id, updated_at_ms = excluded.updated_at_ms \
-             WHERE excluded.last_event_id > inbox_offsets.last_event_id",
+            "INSERT INTO inbox_offsets \
+             (parent_session_id, last_event_id, last_delivered_event_id, updated_at_ms) \
+             VALUES (?, ?, ?, ?) ON CONFLICT(parent_session_id) DO UPDATE SET \
+             last_event_id = MAX(inbox_offsets.last_event_id, excluded.last_event_id), \
+             last_delivered_event_id = MAX( \
+                 inbox_offsets.last_delivered_event_id, excluded.last_delivered_event_id \
+             ), updated_at_ms = excluded.updated_at_ms \
+             WHERE excluded.last_event_id > inbox_offsets.last_event_id \
+                OR excluded.last_delivered_event_id > inbox_offsets.last_delivered_event_id",
         )
         .bind(record.parent.session_id().to_string())
         .bind(event_id)
+        .bind(delivered_event_id)
         .bind(record.updated_at.value())
         .execute(&self.pool)
         .await?;
@@ -841,7 +831,8 @@ impl WatchdogStore {
         parent: watchdog_domain::MainSessionId,
     ) -> Result<Option<InboxOffsetRecord>, StoreError> {
         let Some(row) = sqlx::query(
-            "SELECT last_event_id, updated_at_ms FROM inbox_offsets WHERE parent_session_id = ?",
+            "SELECT last_event_id, last_delivered_event_id, updated_at_ms \
+             FROM inbox_offsets WHERE parent_session_id = ?",
         )
         .bind(parent.session_id().to_string())
         .fetch_optional(&self.pool)
@@ -855,6 +846,10 @@ impl WatchdogStore {
             last_event_id: EventId::new(
                 u64::try_from(raw_event_id)
                     .map_err(|_| StoreError::CorruptValue("negative inbox event ID"))?,
+            ),
+            last_delivered_event_id: EventId::new(
+                u64::try_from(row.try_get::<i64, _>("last_delivered_event_id")?)
+                    .map_err(|_| StoreError::CorruptValue("negative delivered event ID"))?,
             ),
             updated_at: watchdog_domain::WallTimeMs::new(row.try_get("updated_at_ms")?),
         }))
