@@ -500,10 +500,18 @@ async fn registered_watch_paths_are_durable_idempotent_and_event_keys_cannot_be_
         WallTimeMs::new(2_002),
     )
     .expect("duplicate path should be structurally valid");
+    let duplicate_path_error = store
+        .save_registered_watch_path(&duplicate_path)
+        .await
+        .expect_err("a duplicate session path should be rejected");
     assert!(matches!(
-        store.save_registered_watch_path(&duplicate_path).await,
-        Err(StoreError::WatchPathIdentityConflict)
+        duplicate_path_error,
+        StoreError::WatchPathAlreadyRegistered
     ));
+    assert_eq!(
+        duplicate_path_error.to_string(),
+        "Watch path is already registered for this session"
+    );
 
     drop(store);
     let reopened = WatchdogStore::open(database.path())

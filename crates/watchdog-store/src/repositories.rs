@@ -133,7 +133,7 @@ impl WatchdogStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] for a missing/mismatched session tree, a reused
-    /// event key with different content, or persistence failure.
+    /// event key or session path with different content, or persistence failure.
     pub async fn save_registered_watch_path(
         &self,
         record: &RegisteredWatchPathRecord,
@@ -167,6 +167,16 @@ impl WatchdogStore {
             }
             return Err(StoreError::WatchPathIdentityConflict);
         }
+        let existing_path: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM registered_watch_paths WHERE session_id = ? AND native_path = ?",
+        )
+        .bind(record.session().session_id().to_string())
+        .bind(record.native_path())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if existing_path.is_some() {
+            return Err(StoreError::WatchPathAlreadyRegistered);
+        }
         let result = sqlx::query(
             "INSERT OR IGNORE INTO registered_watch_paths \
              (event_key, session_id, root_session_id, native_path, registered_at_ms, record_json) \
@@ -181,7 +191,7 @@ impl WatchdogStore {
         .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(StoreError::WatchPathIdentityConflict);
+            return Err(StoreError::WatchPathAlreadyRegistered);
         }
         transaction.commit().await?;
         Ok(true)
