@@ -184,7 +184,7 @@ impl WatchdogMcpService {
     }
 
     #[tool(
-        description = "Register or enrich a session and bind a main session to this MCP transport"
+        description = "Register or enrich a session. Register kind=main first to bind this transport to one immutable session tree; kind=child requires an in-tree parent. Supported runtimes: claude_code, codex_cli, codex_companion"
     )]
     async fn register_session(
         &self,
@@ -192,8 +192,7 @@ impl WatchdogMcpService {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        let runtime = parse_runtime(&params.runtime)?;
-        let kind = parse_kind(&params.kind)?;
+        let kind = params.kind.into();
         let parent = params
             .parent_session_id
             .as_deref()
@@ -204,7 +203,7 @@ impl WatchdogMcpService {
                 .register_session(
                     &transport,
                     RegisterSession {
-                        runtime,
+                        runtime: params.runtime.into(),
                         native_id: params.native_id,
                         kind,
                         parent,
@@ -215,7 +214,9 @@ impl WatchdogMcpService {
         )
     }
 
-    #[tool(description = "Record an exact parent-child delegation and optional expected check-in")]
+    #[tool(
+        description = "Record an exact relation between two existing sessions in the bound tree and optionally set the child's expected check-in time"
+    )]
     async fn register_delegation(
         &self,
         Parameters(params): Parameters<RegisterDelegationParams>,
@@ -239,7 +240,7 @@ impl WatchdogMcpService {
     }
 
     #[tool(
-        description = "Register one additional allowlisted filesystem path for an in-scope session"
+        description = "Watch one existing directory beneath a configured worktree prefix for an in-tree session"
     )]
     async fn register_watch_path(
         &self,
@@ -259,7 +260,7 @@ impl WatchdogMcpService {
         )
     }
 
-    #[tool(description = "Report bounded event-driven progress for one in-scope session")]
+    #[tool(description = "Record bounded progress text for one session in the bound tree")]
     async fn report_progress(
         &self,
         Parameters(params): Parameters<ProgressParams>,
@@ -279,7 +280,9 @@ impl WatchdogMcpService {
         )
     }
 
-    #[tool(description = "Report waiting for an agent, tool, user, or intentional pause")]
+    #[tool(
+        description = "Mark an in-tree session as waiting for an agent, tool, user, or intentional pause; intentional pauses also pause timers"
+    )]
     async fn report_waiting(
         &self,
         Parameters(params): Parameters<WaitingParams>,
@@ -292,13 +295,13 @@ impl WatchdogMcpService {
                     &transport,
                     parse_session_id(&params.session_id)?,
                     &params.event_key,
-                    parse_waiting(&params.waiting_for)?,
+                    params.waiting_for.into(),
                 )
                 .await,
         )
     }
 
-    #[tool(description = "Report a successful, failed, or cancelled terminal outcome")]
+    #[tool(description = "Record a completed, failed, or cancelled terminal outcome")]
     async fn complete_session(
         &self,
         Parameters(params): Parameters<CompleteParams>,
@@ -311,20 +314,22 @@ impl WatchdogMcpService {
                     &transport,
                     parse_session_id(&params.session_id)?,
                     &params.event_key,
-                    parse_outcome(&params.outcome)?,
+                    params.outcome.into(),
                 )
                 .await,
         )
     }
 
-    #[tool(description = "Set, pause, resume, or clear a session check-in deadline")]
+    #[tool(
+        description = "Set an absolute expected check-in time, pause or resume timer accounting, or clear the explicit deadline"
+    )]
     async fn update_deadline(
         &self,
         Parameters(params): Parameters<DeadlineParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        let command = parse_deadline(&params.action, params.deadline_ms)?;
+        let command = params.action.command(params.deadline_ms)?;
         json_result(
             self.api
                 .update_deadline(
@@ -337,7 +342,7 @@ impl WatchdogMcpService {
         )
     }
 
-    #[tool(description = "Read one normalized in-scope session with agent diagnostics")]
+    #[tool(description = "Read one normalized session in the bound tree with agent diagnostics")]
     async fn get_session(
         &self,
         Parameters(params): Parameters<SessionParams>,
@@ -351,7 +356,9 @@ impl WatchdogMcpService {
         )
     }
 
-    #[tool(description = "List sessions in the bound tree with optional normalized-state filters")]
+    #[tool(
+        description = "List up to 1000 sessions in the bound tree with optional normalized-state filters"
+    )]
     async fn list_sessions(
         &self,
         Parameters(params): Parameters<ListSessionsParams>,
@@ -362,8 +369,8 @@ impl WatchdogMcpService {
             .states
             .unwrap_or_default()
             .into_iter()
-            .map(|value| parse_state(&value))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(Into::into)
+            .collect::<Vec<DetailedState>>();
         let limit = params.limit.unwrap_or(MAX_TREE_SESSIONS);
         if limit == 0 || limit > MAX_TREE_SESSIONS {
             return Err(invalid_params(format!(
@@ -391,7 +398,9 @@ impl WatchdogMcpService {
         json_result(self.api.session_tree(&transport).await)
     }
 
-    #[tool(description = "Read durable parent events after a caller-confirmed cursor")]
+    #[tool(
+        description = "Read up to 500 durable tree events; after acknowledges a previously processed next_cursor before reading later events"
+    )]
     async fn list_events(
         &self,
         Parameters(params): Parameters<ListEventsParams>,
@@ -409,7 +418,7 @@ impl WatchdogMcpService {
         )
     }
 
-    #[tool(description = "Read Watchdog storage and runtime-adapter health warnings")]
+    #[tool(description = "Read Watchdog storage and runtime-adapter health for the bound tree")]
     async fn get_watchdog_health(
         &self,
         context: RequestContext<RoleServer>,
@@ -434,7 +443,7 @@ impl ServerHandler for WatchdogMcpService {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "Register or bind the coordinating main session first. Durable list_events delivery remains authoritative."
+            "Register the coordinating main session first to bind this transport to one tree. For every mutation, generate a fresh event_key and reuse it only when retrying the identical mutation. Treat list_events as a durable inbox: process the returned events, then pass that page's next_cursor as after to acknowledge them."
                 .to_owned(),
         );
         info
@@ -443,72 +452,233 @@ impl ServerHandler for WatchdogMcpService {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RegisterSessionParams {
-    runtime: String,
+    /// Runtime namespace containing the native session identifier.
+    runtime: RegisterSessionRuntime,
+    /// Runtime-native session, job, or thread identifier; not a Watchdog UUID.
     native_id: String,
-    kind: String,
+    /// Role of this session in the monitored hierarchy.
+    kind: SessionKindParam,
+    /// Watchdog session UUID returned by registration. Required when kind is child; omit for main.
     parent_session_id: Option<String>,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RegisterSessionRuntime {
+    ClaudeCode,
+    CodexCli,
+    CodexCompanion,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SessionKindParam {
+    Main,
+    Child,
+}
+
+impl From<SessionKindParam> for SessionKind {
+    fn from(kind: SessionKindParam) -> Self {
+        match kind {
+            SessionKindParam::Main => Self::Main,
+            SessionKindParam::Child => Self::Child,
+        }
+    }
+}
+
+impl From<RegisterSessionRuntime> for RuntimeKind {
+    fn from(runtime: RegisterSessionRuntime) -> Self {
+        match runtime {
+            RegisterSessionRuntime::ClaudeCode => Self::ClaudeCode,
+            RegisterSessionRuntime::CodexCli => Self::CodexCli,
+            RegisterSessionRuntime::CodexCompanion => Self::CodexCompanion,
+        }
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RegisterDelegationParams {
+    /// Watchdog UUID of an existing parent session in the bound tree.
     parent_session_id: String,
+    /// Watchdog UUID of an existing child session in the bound tree.
     child_session_id: String,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
+    /// Optional absolute Unix epoch time in milliseconds for the child's expected check-in.
     deadline_ms: Option<i64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RegisterWatchPathParams {
+    /// Watchdog session UUID returned by registration.
     session_id: String,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
+    /// Existing directory beneath a configured worktree prefix.
     path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ProgressParams {
+    /// Watchdog session UUID returned by registration.
     session_id: String,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
+    /// Bounded human-readable description of current progress.
     summary: String,
+    /// Optional free-text operation label included with the progress summary.
     operation: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WaitingParams {
+    /// Watchdog session UUID returned by registration.
     session_id: String,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
-    waiting_for: String,
+    /// Reason the session is waiting.
+    waiting_for: WaitingKindParam,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WaitingKindParam {
+    Agent,
+    Tool,
+    User,
+    Intentional,
+}
+
+impl From<WaitingKindParam> for WaitingKind {
+    fn from(kind: WaitingKindParam) -> Self {
+        match kind {
+            WaitingKindParam::Agent => Self::Agent,
+            WaitingKindParam::Tool => Self::Tool,
+            WaitingKindParam::User => Self::User,
+            WaitingKindParam::Intentional => Self::Intentional,
+        }
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CompleteParams {
+    /// Watchdog session UUID returned by registration.
     session_id: String,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
-    outcome: String,
+    /// Terminal result to record.
+    outcome: CompletionOutcomeParam,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum CompletionOutcomeParam {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<CompletionOutcomeParam> for CompletionOutcome {
+    fn from(outcome: CompletionOutcomeParam) -> Self {
+        match outcome {
+            CompletionOutcomeParam::Completed => Self::Completed,
+            CompletionOutcomeParam::Failed => Self::Failed,
+            CompletionOutcomeParam::Cancelled => Self::Cancelled,
+        }
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct DeadlineParams {
+    /// Watchdog session UUID returned by registration.
     session_id: String,
+    /// Idempotency key; reuse only to retry the identical mutation.
     event_key: String,
-    action: String,
+    /// Deadline operation to apply.
+    action: DeadlineActionParam,
+    /// Absolute Unix epoch time in milliseconds; required only for action=set.
     deadline_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum DeadlineActionParam {
+    Set,
+    Pause,
+    Resume,
+    Clear,
+}
+
+impl DeadlineActionParam {
+    fn command(self, deadline_ms: Option<i64>) -> Result<DeadlineCommand, rmcp::ErrorData> {
+        match self {
+            Self::Set => deadline_ms
+                .map(|value| DeadlineCommand::Set(WallTimeMs::new(value)))
+                .ok_or_else(|| invalid_params("set requires deadline_ms")),
+            Self::Pause => Ok(DeadlineCommand::Pause),
+            Self::Resume => Ok(DeadlineCommand::Resume),
+            Self::Clear => Ok(DeadlineCommand::Clear),
+        }
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SessionParams {
+    /// Watchdog session UUID returned by registration.
     session_id: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListSessionsParams {
-    states: Option<Vec<String>>,
+    /// Normalized states to include; omit or pass [] for all states.
+    states: Option<Vec<SessionStateParam>>,
+    /// Maximum results, from 1 through 1000; defaults to 1000.
     limit: Option<u32>,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SessionStateParam {
+    Starting,
+    Running,
+    WaitingForAgent,
+    WaitingForTool,
+    WaitingForUser,
+    Idle,
+    Stalled,
+    Completed,
+    Failed,
+    Cancelled,
+    Disappeared,
+    Unknown,
+}
+
+impl From<SessionStateParam> for DetailedState {
+    fn from(state: SessionStateParam) -> Self {
+        match state {
+            SessionStateParam::Starting => Self::Starting,
+            SessionStateParam::Running => Self::Running,
+            SessionStateParam::WaitingForAgent => Self::WaitingForAgent,
+            SessionStateParam::WaitingForTool => Self::WaitingForTool,
+            SessionStateParam::WaitingForUser => Self::WaitingForUser,
+            SessionStateParam::Idle => Self::Idle,
+            SessionStateParam::Stalled => Self::Stalled,
+            SessionStateParam::Completed => Self::Completed,
+            SessionStateParam::Failed => Self::Failed,
+            SessionStateParam::Cancelled => Self::Cancelled,
+            SessionStateParam::Disappeared => Self::Disappeared,
+            SessionStateParam::Unknown => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListEventsParams {
+    /// Previously processed `next_cursor` to acknowledge; omit to resume the durable cursor.
     after: Option<u64>,
+    /// Maximum events, from 1 through 500; defaults to 100.
     limit: Option<u32>,
 }
 
@@ -524,81 +694,6 @@ fn transport_key(context: &RequestContext<RoleServer>) -> Result<TransportKey, r
 fn parse_session_id(value: &str) -> Result<SessionId, rmcp::ErrorData> {
     serde_json::from_value(serde_json::Value::String(value.to_owned()))
         .map_err(|_| invalid_params("session_id must be a UUID"))
-}
-
-fn parse_runtime(value: &str) -> Result<RuntimeKind, rmcp::ErrorData> {
-    match value {
-        "claude_code" => Ok(RuntimeKind::ClaudeCode),
-        "codex_cli" => Ok(RuntimeKind::CodexCli),
-        "codex_companion" => Ok(RuntimeKind::CodexCompanion),
-        _ => Err(invalid_params("runtime is unsupported in v1")),
-    }
-}
-
-fn parse_kind(value: &str) -> Result<SessionKind, rmcp::ErrorData> {
-    match value {
-        "main" => Ok(SessionKind::Main),
-        "child" => Ok(SessionKind::Child),
-        _ => Err(invalid_params("kind must be main or child")),
-    }
-}
-
-fn parse_waiting(value: &str) -> Result<WaitingKind, rmcp::ErrorData> {
-    match value {
-        "agent" => Ok(WaitingKind::Agent),
-        "tool" => Ok(WaitingKind::Tool),
-        "user" => Ok(WaitingKind::User),
-        "intentional" => Ok(WaitingKind::Intentional),
-        _ => Err(invalid_params(
-            "waiting_for must be agent, tool, user, or intentional",
-        )),
-    }
-}
-
-fn parse_outcome(value: &str) -> Result<CompletionOutcome, rmcp::ErrorData> {
-    match value {
-        "completed" => Ok(CompletionOutcome::Completed),
-        "failed" => Ok(CompletionOutcome::Failed),
-        "cancelled" => Ok(CompletionOutcome::Cancelled),
-        _ => Err(invalid_params(
-            "outcome must be completed, failed, or cancelled",
-        )),
-    }
-}
-
-fn parse_deadline(
-    action: &str,
-    deadline_ms: Option<i64>,
-) -> Result<DeadlineCommand, rmcp::ErrorData> {
-    match action {
-        "set" => deadline_ms
-            .map(|value| DeadlineCommand::Set(WallTimeMs::new(value)))
-            .ok_or_else(|| invalid_params("set requires deadline_ms")),
-        "pause" => Ok(DeadlineCommand::Pause),
-        "resume" => Ok(DeadlineCommand::Resume),
-        "clear" => Ok(DeadlineCommand::Clear),
-        _ => Err(invalid_params(
-            "action must be set, pause, resume, or clear",
-        )),
-    }
-}
-
-fn parse_state(value: &str) -> Result<DetailedState, rmcp::ErrorData> {
-    match value {
-        "starting" => Ok(DetailedState::Starting),
-        "running" => Ok(DetailedState::Running),
-        "waiting_for_agent" => Ok(DetailedState::WaitingForAgent),
-        "waiting_for_tool" => Ok(DetailedState::WaitingForTool),
-        "waiting_for_user" => Ok(DetailedState::WaitingForUser),
-        "idle" => Ok(DetailedState::Idle),
-        "stalled" => Ok(DetailedState::Stalled),
-        "completed" => Ok(DetailedState::Completed),
-        "failed" => Ok(DetailedState::Failed),
-        "cancelled" => Ok(DetailedState::Cancelled),
-        "disappeared" => Ok(DetailedState::Disappeared),
-        "unknown" => Ok(DetailedState::Unknown),
-        _ => Err(invalid_params("states contains an unsupported value")),
-    }
 }
 
 fn json_result<T: Serialize>(
@@ -639,7 +734,7 @@ mod tests {
     use rmcp::model::ErrorCode;
     use watchdog_domain::{DeadlineCommand, WallTimeMs};
 
-    use super::{AgentApiError, api_error, parse_deadline};
+    use super::{AgentApiError, DeadlineActionParam, api_error};
 
     #[test]
     fn unavailable_server_state_is_not_reported_as_invalid_caller_input() {
@@ -654,21 +749,21 @@ mod tests {
     #[test]
     fn deadline_tool_actions_parse_to_their_domain_commands() {
         assert!(matches!(
-            parse_deadline("set", Some(42)),
+            DeadlineActionParam::Set.command(Some(42)),
             Ok(DeadlineCommand::Set(value)) if value == WallTimeMs::new(42)
         ));
         assert!(matches!(
-            parse_deadline("pause", None),
+            DeadlineActionParam::Pause.command(None),
             Ok(DeadlineCommand::Pause)
         ));
         assert!(matches!(
-            parse_deadline("resume", None),
+            DeadlineActionParam::Resume.command(None),
             Ok(DeadlineCommand::Resume)
         ));
         assert!(matches!(
-            parse_deadline("clear", None),
+            DeadlineActionParam::Clear.command(None),
             Ok(DeadlineCommand::Clear)
         ));
-        assert!(parse_deadline("set", None).is_err());
+        assert!(DeadlineActionParam::Set.command(None).is_err());
     }
 }
