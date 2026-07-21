@@ -355,6 +355,34 @@ async fn child_registration_progress_and_completion_are_idempotent_and_scoped() 
 }
 
 #[tokio::test]
+async fn progress_returns_a_waiting_session_to_running_and_resumes_timers() {
+    let (api, _store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("progress-resumes").expect("transport should be valid");
+    let main = register_main(&api, &transport, "progress-main", "register-main").await;
+
+    let waiting = api
+        .report_waiting(&transport, main, "wait-for-agent", WaitingKind::Intentional)
+        .await
+        .expect("intentional wait should commit");
+    assert_eq!(waiting.snapshot.state(), DetailedState::WaitingForAgent);
+    assert!(waiting.snapshot.timers_paused());
+
+    let running = api
+        .report_progress(
+            &transport,
+            main,
+            "work-resumed",
+            "processing the child result".to_owned(),
+            None,
+        )
+        .await
+        .expect("progress should commit");
+
+    assert_eq!(running.snapshot.state(), DetailedState::Running);
+    assert!(!running.snapshot.timers_paused());
+}
+
+#[tokio::test]
 async fn intentional_wait_commits_state_and_timer_pause_in_one_observation() {
     let (api, _store, _clock) = api_fixture().await;
     let transport = TransportKey::new("intentional-wait").expect("transport should be valid");

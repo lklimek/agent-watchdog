@@ -47,9 +47,13 @@ const MAX_CODEX_ROLLOUT_RECORDS: usize = 128;
 const MAX_CODEX_BOOTSTRAP_TAIL_BYTES: usize = 1_024 * 1_024;
 const MAX_CODEX_CORRELATION_LOG_CACHE: usize = 2_048;
 const MAX_DISCOVERY_WARNING_LOG_SITES: usize = 256;
+const MAX_RECONCILE_FAILURES: usize = 2_048;
 
 type DiscoveryWarningSite = (&'static str, u32, u32);
 static DISCOVERY_WARNING_LOG_SITES: OnceLock<Mutex<BoundedLru<DiscoveryWarningSite, ()>>> =
+    OnceLock::new();
+type ReconcileFailureKey = (RuntimeKind, &'static str, SessionId);
+static RECONCILE_FAILURES: OnceLock<Mutex<BoundedLru<ReconcileFailureKey, String>>> =
     OnceLock::new();
 
 struct BoundedLru<K, V> {
@@ -86,6 +90,22 @@ where
 
     fn insert(&mut self, key: K, value: V) -> bool {
         self.insert_evicting_where(key, value, |_| true)
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let (owned, value) = self.entries.remove_entry(key)?;
+        if let Some(index) = self
+            .recency
+            .iter()
+            .position(|candidate| candidate == &owned)
+        {
+            self.recency.remove(index);
+        }
+        Some(value)
     }
 
     fn insert_evicting_where(
@@ -589,6 +609,13 @@ impl DiscoveryAliasRegistry {
         }
     }
 
+    fn mark_ambiguous(&self, alias: NativeSessionKey) {
+        self.aliases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(alias, None);
+    }
+
     fn resolve(&self, alias: &NativeSessionKey) -> Option<SessionId> {
         self.aliases
             .lock()
@@ -742,6 +769,9 @@ impl ClaudeDiscovery {
         worktree_mappings: &[WorktreePathMapping],
     ) -> ClaudeDiscoveryReport {
         let mut report = RuntimeDiscoveryReport::default();
+        if self.hydrate_native_aliases().await.is_err() {
+            report.warn();
+        }
         let mut mains = BTreeSet::new();
         let mut children = BTreeSet::new();
         let Ok(budget) = ScanBudget::new(MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES)
@@ -834,6 +864,24 @@ impl ClaudeDiscovery {
         self.complete_absent_live_mains_if_complete(live_registry_present, &mut report)
             .await;
         report
+    }
+
+    async fn hydrate_native_aliases(&self) -> Result<(), StoreError> {
+        let aliases = self
+            .store
+            .discovery_aliases(
+                RuntimeKind::ClaudeCode,
+                u32::try_from(MAX_DISCOVERY_ALIAS_CACHE).unwrap_or(u32::MAX),
+            )
+            .await?;
+        for (alias, canonical) in aliases {
+            if let Some(canonical) = canonical {
+                self.native_aliases.bind(alias, canonical);
+            } else {
+                self.native_aliases.mark_ambiguous(alias);
+            }
+        }
+        Ok(())
     }
 
     async fn complete_absent_live_mains_if_complete(
@@ -1202,51 +1250,11 @@ impl ClaudeDiscovery {
                 {
                     report.warn();
                 }
-                if !member.is_active()
-                    && self
-                        .ingest_inactive_team_member(member, child_id)
-                        .await
-                        .is_err()
-                {
-                    report.warn();
-                }
                 if children.insert(child_id) {
                     report.child_sessions = report.child_sessions.saturating_add(1);
                 }
             }
         }
-    }
-
-    async fn ingest_inactive_team_member(
-        &self,
-        member: &watchdog_claude::ClaudeTeamMember,
-        session_id: SessionId,
-    ) -> Result<(), ()> {
-        let event_key = format!("{session_id}:inactive");
-        let observation = ObservationEnvelope::new(
-            ObservationId::from_native(RuntimeKind::ClaudeCode, "team-inactive", event_key)
-                .map_err(|_| ())?,
-            member.subject().clone(),
-            self.clock.now(),
-            ObservationSource::new(
-                AdapterIdentity::new(
-                    RuntimeKind::ClaudeCode,
-                    watchdog_claude::TESTED_CLAUDE_VERSION,
-                )
-                .map_err(|_| ())?,
-                "team-config:inactive",
-                EvidenceTrust::Corroborating,
-                None,
-            )
-            .map_err(|_| ())?,
-            ObservationPayload::NativeState(DetailedState::Completed),
-        )
-        .map_err(|_| ())?;
-        self.api
-            .ingest_native_observation(observation)
-            .await
-            .map(|_| ())
-            .map_err(|_| ())
     }
 
     async fn reconcile_team_tasks(
@@ -1448,6 +1456,8 @@ impl ClaudeDiscovery {
             report.warn();
             return;
         };
+        self.persist_transcript_alias(&candidate, session_id, report)
+            .await;
         self.enrich_claude_warning(root, &candidate, view.session, &bootstrap, report)
             .await;
         if self
@@ -1474,6 +1484,29 @@ impl ClaudeDiscovery {
                 report.child_sessions = report.child_sessions.saturating_add(1);
             }
             SessionKind::Main | SessionKind::Child => {}
+        }
+    }
+
+    async fn persist_transcript_alias(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        canonical: SessionId,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
+        if candidate.transcript_session == candidate.subject {
+            return;
+        }
+        if self
+            .store
+            .save_discovery_alias(
+                &candidate.transcript_session,
+                canonical,
+                self.clock.now().wall_time(),
+            )
+            .await
+            .is_err()
+        {
+            report.warn();
         }
     }
 
@@ -1569,6 +1602,34 @@ impl ClaudeDiscovery {
                     candidate.transcript_session.clone(),
                     SessionId::from_native(&candidate.subject),
                 );
+            } else if let Some(canonical) =
+                self.native_aliases.resolve(&candidate.transcript_session)
+            {
+                let record = self
+                    .store
+                    .session_by_id(canonical)
+                    .await
+                    .map_err(|_| ())?
+                    .ok_or(())?;
+                let identity = record.session;
+                candidate.subject = record.native;
+                candidate.kind = match identity {
+                    SessionIdentity::Main(_) => {
+                        candidate.parent = None;
+                        SessionKind::Main
+                    }
+                    SessionIdentity::Child(_) => {
+                        candidate.parent = Some(
+                            self.store
+                                .selected_parent(canonical)
+                                .await
+                                .map_err(|_| ())?
+                                .ok_or(())?
+                                .native,
+                        );
+                        SessionKind::Child
+                    }
+                };
             } else if let Some(alias) = aliases.resolve(&bootstrap) {
                 tracing::info!(
                     event = "discovery.correlation_selected",
@@ -2399,11 +2460,17 @@ impl CompanionDiscovery {
             )
             .await
             {
-                log_reconcile_failure(RuntimeKind::CodexCompanion, "parent", &error);
+                log_session_reconcile_failure(
+                    RuntimeKind::CodexCompanion,
+                    "parent",
+                    parent_id,
+                    &error,
+                );
                 report.warn();
                 return false;
             }
         }
+        clear_session_reconcile_failure(RuntimeKind::CodexCompanion, "parent", parent_id);
 
         let child_id = SessionId::from_native(reconciled.subject());
         // Companion's workspaceRoot identifies where the dispatch was issued,
@@ -2426,7 +2493,7 @@ impl CompanionDiscovery {
             })
             .await
         {
-            log_reconcile_failure(RuntimeKind::CodexCompanion, "child", &error);
+            log_session_reconcile_failure(RuntimeKind::CodexCompanion, "child", child_id, &error);
             report.warn();
             return false;
         }
@@ -2436,10 +2503,11 @@ impl CompanionDiscovery {
             return false;
         };
         if let Err(error) = self.api.ingest_native_observation(observation).await {
-            log_reconcile_failure(RuntimeKind::CodexCompanion, "child", &error);
+            log_session_reconcile_failure(RuntimeKind::CodexCompanion, "child", child_id, &error);
             report.warn();
             return false;
         }
+        clear_session_reconcile_failure(RuntimeKind::CodexCompanion, "child", child_id);
         #[cfg(target_os = "linux")]
         self.ingest_companion_process(reconciled_job).await;
         if children.insert(child_id) {
@@ -4032,6 +4100,56 @@ fn log_reconcile_failure(
         session_kind,
         error = %error,
         "Runtime-native session could not be reconciled"
+    );
+}
+
+fn log_session_reconcile_failure(
+    runtime: RuntimeKind,
+    session_kind: &'static str,
+    session_id: SessionId,
+    error: &crate::AgentApiError,
+) {
+    let key = (runtime, session_kind, session_id);
+    let error = error.to_string();
+    let mut failures = RECONCILE_FAILURES
+        .get_or_init(|| Mutex::new(BoundedLru::new(MAX_RECONCILE_FAILURES)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if failures.get_cloned(&key).as_deref() == Some(error.as_str()) {
+        return;
+    }
+    failures.insert(key, error.clone());
+    drop(failures);
+    tracing::warn!(
+        event = "adapter.session_reconcile_failed",
+        runtime = runtime.as_str(),
+        session_kind,
+        session_id = %session_id,
+        error,
+        "Runtime-native session could not be reconciled"
+    );
+}
+
+fn clear_session_reconcile_failure(
+    runtime: RuntimeKind,
+    session_kind: &'static str,
+    session_id: SessionId,
+) {
+    let key = (runtime, session_kind, session_id);
+    let mut failures = RECONCILE_FAILURES
+        .get_or_init(|| Mutex::new(BoundedLru::new(MAX_RECONCILE_FAILURES)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if failures.remove(&key).is_none() {
+        return;
+    }
+    drop(failures);
+    tracing::info!(
+        event = "adapter.session_reconcile_recovered",
+        runtime = runtime.as_str(),
+        session_kind,
+        session_id = %session_id,
+        "Runtime-native session reconciliation recovered"
     );
 }
 

@@ -399,7 +399,61 @@ async fn initialization_enables_required_sqlite_pragmas_and_schema() {
     assert_eq!(health.journal_mode, "wal");
     assert!(health.foreign_keys);
     assert!(health.schema_version >= 1);
-    assert_eq!(health.application_table_count, 16);
+    assert_eq!(health.application_table_count, 17);
+}
+
+#[tokio::test]
+async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
+    let database = TestDatabase::new("discovery-aliases");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("database should open");
+    store
+        .apply_observation(&fixture_for("canonical-1", "canonical-1", 1, 1))
+        .await
+        .expect("first canonical session should persist");
+    store
+        .apply_observation(&fixture_for("canonical-2", "canonical-2", 2, 1))
+        .await
+        .expect("second canonical session should persist");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper-session")
+        .expect("alias should validate");
+    let canonical_1 = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "canonical-1")
+            .expect("canonical identity should validate"),
+    );
+    let canonical_2 = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "canonical-2")
+            .expect("canonical identity should validate"),
+    );
+
+    store
+        .save_discovery_alias(&alias, canonical_1, WallTimeMs::new(2_000))
+        .await
+        .expect("alias should persist");
+    drop(store);
+    let reopened = WatchdogStore::open(database.path())
+        .await
+        .expect("database should reopen");
+    assert_eq!(
+        reopened
+            .discovery_aliases(RuntimeKind::ClaudeCode, 10)
+            .await
+            .expect("aliases should load"),
+        vec![(alias.clone(), Some(canonical_1))]
+    );
+
+    reopened
+        .save_discovery_alias(&alias, canonical_2, WallTimeMs::new(3_000))
+        .await
+        .expect("conflicting evidence should persist");
+    assert_eq!(
+        reopened
+            .discovery_aliases(RuntimeKind::ClaudeCode, 10)
+            .await
+            .expect("ambiguous aliases should load"),
+        vec![(alias, None)]
+    );
 }
 
 #[tokio::test]
