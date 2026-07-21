@@ -73,6 +73,110 @@ async fn test_api() -> AgentApi {
     .expect("agent API should initialize")
 }
 
+fn listed_tool<'a>(listed: &'a Value, name: &str) -> &'a Value {
+    listed["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array")
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .expect("expected tool should be listed")
+}
+
+fn assert_register_session_contract(listed: &Value) {
+    let register_session = listed_tool(listed, "register_session");
+    let advertised_runtimes =
+        register_session["inputSchema"]["$defs"]["RegisterSessionRuntime"]["enum"]
+            .as_array()
+            .expect("register_session runtime should be an enum");
+    assert_eq!(
+        advertised_runtimes,
+        &["claude_code", "codex_cli", "codex_companion"],
+        "only supported v1 runtimes should be advertised"
+    );
+
+    let event_key_description =
+        register_session["inputSchema"]["properties"]["event_key"]["description"]
+            .as_str()
+            .unwrap_or_default();
+    let event_key_description_lower = event_key_description.to_ascii_lowercase();
+    assert!(
+        event_key_description_lower.contains("idempotency")
+            && event_key_description_lower.contains("identical mutation"),
+        "event_key retry semantics should be discoverable: {event_key_description}"
+    );
+    let parent_description =
+        register_session["inputSchema"]["properties"]["parent_session_id"]["description"]
+            .as_str()
+            .unwrap_or_default();
+    assert!(
+        parent_description.contains("Required when kind is child"),
+        "conditional parent requirement should be discoverable: {parent_description}"
+    );
+}
+
+fn assert_finite_inputs_are_enums(listed: &Value) {
+    for (tool_name, definition, expected) in [
+        (
+            "register_session",
+            "SessionKindParam",
+            &["main", "child"][..],
+        ),
+        (
+            "report_waiting",
+            "WaitingKindParam",
+            &["agent", "tool", "user", "intentional"][..],
+        ),
+        (
+            "complete_session",
+            "CompletionOutcomeParam",
+            &["completed", "failed", "cancelled"][..],
+        ),
+        (
+            "update_deadline",
+            "DeadlineActionParam",
+            &["set", "pause", "resume", "clear"][..],
+        ),
+        (
+            "list_sessions",
+            "SessionStateParam",
+            &[
+                "starting",
+                "running",
+                "waiting_for_agent",
+                "waiting_for_tool",
+                "waiting_for_user",
+                "idle",
+                "stalled",
+                "completed",
+                "failed",
+                "cancelled",
+                "disappeared",
+                "unknown",
+            ][..],
+        ),
+    ] {
+        let tool = listed_tool(listed, tool_name);
+        assert_eq!(
+            tool["inputSchema"]["$defs"][definition]["enum"]
+                .as_array()
+                .expect("finite input should be an enum"),
+            expected,
+            "{tool_name} should advertise all accepted {definition} values"
+        );
+    }
+}
+
+fn assert_event_cursor_contract(listed: &Value) {
+    let list_events = listed_tool(listed, "list_events");
+    let after_description = list_events["inputSchema"]["properties"]["after"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        after_description.contains("acknowledge") && after_description.contains("next_cursor"),
+        "durable cursor semantics should be discoverable: {after_description}"
+    );
+}
+
 #[tokio::test]
 async fn http_mcp_route_requires_the_configured_bearer_token() {
     let router = mcp_router(
@@ -172,6 +276,10 @@ async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
     ] {
         assert!(names.contains(&expected), "missing MCP tool {expected}");
     }
+
+    assert_register_session_contract(&listed);
+    assert_finite_inputs_are_enums(&listed);
+    assert_event_cursor_contract(&listed);
 
     for (index, native_id) in ["main-a", "main-b"].into_iter().enumerate() {
         let registered = response(
