@@ -2143,15 +2143,28 @@ mod admission_tests {
     }
 
     async fn wait_for_queue_len(lane: &super::SessionLane, expected: usize) {
-        for _ in 0..100 {
+        // Wall-clock deadline rather than a fixed yield-count: under a
+        // contended parallel test-suite run, `tokio::task::yield_now()`
+        // alone does not guarantee the background task(s) populating the
+        // queue actually get scheduled within a bounded number of yields
+        // (confirmed flaky: intermittent "queue did not reach expected
+        // length" panics under `cargo test --workspace`, always passing
+        // standalone / single-threaded). A short real sleep between checks
+        // gives the scheduler genuine wall-clock time to make progress
+        // instead of assuming cooperative yields are enough.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
             let admission = lane.admission.lock().await;
             if admission.draining && admission.queue.len() == expected {
                 return;
             }
             drop(admission);
-            tokio::task::yield_now().await;
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "queue did not reach expected length"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        panic!("queue did not reach expected length");
     }
 
     fn spawn_wait(
