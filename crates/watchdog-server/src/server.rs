@@ -188,9 +188,20 @@ fn check_liveness(address: SocketAddr) -> Result<(), ServerError> {
     }
 }
 
+fn load_server_config(path: &Path) -> Result<ConfigManager, ServerError> {
+    ConfigManager::load(path).map_err(|error| {
+        tracing::error!(
+            event = "configuration.load_failed",
+            error = %error,
+            error_variant = ?error,
+            "Server configuration could not be loaded"
+        );
+        ServerError::Configuration
+    })
+}
+
 async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
-    let config =
-        ConfigManager::load(&bootstrap.config_path).map_err(|_| ServerError::Configuration)?;
+    let config = load_server_config(&bootstrap.config_path)?;
     let current = config.current();
     let clock = Arc::new(SystemClock::new());
     let store = WatchdogStore::open(&bootstrap.database_path).await?;
@@ -954,11 +965,18 @@ fn spawn_dashboard_worker(
                     ComponentStatus::Healthy,
                     None,
                 ),
-                Err(_) => health.record(
-                    ComponentId::DashboardDelivery,
-                    ComponentStatus::Degraded,
-                    Some("Dashboard delivery is degraded"),
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "dashboard.delivery_failed",
+                        error = %error,
+                        "Dashboard event delivery failed"
+                    );
+                    health.record(
+                        ComponentId::DashboardDelivery,
+                        ComponentStatus::Degraded,
+                        Some("Dashboard delivery is degraded"),
+                    );
+                }
             }
         }
     })

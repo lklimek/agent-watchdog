@@ -34,8 +34,10 @@ use watchdog_domain::{
 
 use crate::{
     AgentApi, AgentApiError, BearerAuthenticator, CompletionOutcome, RegisterSession, TransportKey,
-    WaitingKind,
+    WaitingKind, agent_api::MAX_TREE_SESSIONS,
 };
+
+const DEFAULT_EVENT_PAGE_SIZE: u32 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TransportScope(McpSessionId);
@@ -153,6 +155,11 @@ pub fn mcp_router(api: AgentApi, authenticator: BearerAuthenticator) -> Router {
                         .get(axum::http::header::AUTHORIZATION)
                         .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
                     if !authorized {
+                        tracing::warn!(
+                            event = "auth.rejected",
+                            route = "/mcp",
+                            "MCP bearer credential rejected"
+                        );
                         return axum::http::StatusCode::UNAUTHORIZED.into_response();
                     }
                     let response: Response = next.run(request).await;
@@ -357,9 +364,11 @@ impl WatchdogMcpService {
             .into_iter()
             .map(|value| parse_state(&value))
             .collect::<Result<Vec<_>, _>>()?;
-        let limit = params.limit.unwrap_or(1_000);
-        if limit == 0 || limit > 1_000 {
-            return Err(invalid_params("limit must be between 1 and 1000"));
+        let limit = params.limit.unwrap_or(MAX_TREE_SESSIONS);
+        if limit == 0 || limit > MAX_TREE_SESSIONS {
+            return Err(invalid_params(format!(
+                "limit must be between 1 and {MAX_TREE_SESSIONS}"
+            )));
         }
         let mut sessions = self
             .api
@@ -391,7 +400,11 @@ impl WatchdogMcpService {
         let transport = transport_key(&context)?;
         json_result(
             self.api
-                .list_events(&transport, params.after, params.limit.unwrap_or(100))
+                .list_events(
+                    &transport,
+                    params.after,
+                    params.limit.unwrap_or(DEFAULT_EVENT_PAGE_SIZE),
+                )
                 .await,
         )
     }
@@ -601,7 +614,10 @@ fn success<T: Serialize>(value: &T) -> Result<CallToolResult, rmcp::ErrorData> {
 
 fn api_error(error: AgentApiError) -> rmcp::ErrorData {
     match error {
-        AgentApiError::Store(_) | AgentApiError::Coordinator(_) => internal_error(),
+        AgentApiError::Store(_)
+        | AgentApiError::Coordinator(_)
+        | AgentApiError::ReducerSnapshotUnavailable
+        | AgentApiError::WatchPathUnavailable => internal_error(),
         other => invalid_params(other.to_string()),
     }
 }
@@ -616,4 +632,43 @@ fn internal_error() -> rmcp::ErrorData {
         "Agent Watchdog internal persistence failure".to_owned(),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::model::ErrorCode;
+    use watchdog_domain::{DeadlineCommand, WallTimeMs};
+
+    use super::{AgentApiError, api_error, parse_deadline};
+
+    #[test]
+    fn unavailable_server_state_is_not_reported_as_invalid_caller_input() {
+        for error in [
+            AgentApiError::ReducerSnapshotUnavailable,
+            AgentApiError::WatchPathUnavailable,
+        ] {
+            assert_eq!(api_error(error).code, ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    #[test]
+    fn deadline_tool_actions_parse_to_their_domain_commands() {
+        assert!(matches!(
+            parse_deadline("set", Some(42)),
+            Ok(DeadlineCommand::Set(value)) if value == WallTimeMs::new(42)
+        ));
+        assert!(matches!(
+            parse_deadline("pause", None),
+            Ok(DeadlineCommand::Pause)
+        ));
+        assert!(matches!(
+            parse_deadline("resume", None),
+            Ok(DeadlineCommand::Resume)
+        ));
+        assert!(matches!(
+            parse_deadline("clear", None),
+            Ok(DeadlineCommand::Clear)
+        ));
+        assert!(parse_deadline("set", None).is_err());
+    }
 }
