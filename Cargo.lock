@@ -2797,6 +2797,7 @@ dependencies = [
  "maud",
  "reqwest",
  "rmcp",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

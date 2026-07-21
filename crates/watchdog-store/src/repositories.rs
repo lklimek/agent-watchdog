@@ -11,7 +11,121 @@ use crate::{
     bounded_json, sqlite_integer,
 };
 
+const MAX_PERSISTED_QUEUE_REJECTIONS_PER_SESSION: i64 = 64;
+
 impl WatchdogStore {
+    /// Persist uncertainty for durable evidence rejected by bounded admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the rejection marker cannot be persisted.
+    pub async fn save_observation_queue_rejection(
+        &self,
+        observation: ObservationId,
+        session: SessionIdentity,
+        rejected_at: watchdog_domain::WallTimeMs,
+    ) -> Result<(), StoreError> {
+        let session_id = session.session_id().to_string();
+        let observation_id = observation.to_string();
+        let mut transaction = self.pool.begin().await?;
+        let existing_session: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM observation_queue_rejections WHERE observation_id = ?",
+        )
+        .bind(&observation_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if existing_session
+            .as_deref()
+            .is_some_and(|stored| stored != session_id.as_str())
+        {
+            return Err(StoreError::IdentityMismatch);
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_queue_rejections WHERE session_id = ?",
+        )
+        .bind(&session_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if existing_session.is_none() && count >= MAX_PERSISTED_QUEUE_REJECTIONS_PER_SESSION {
+            sqlx::query(
+                "INSERT INTO observation_queue_rejection_overflow \
+                 (session_id, rejected_at_ms) VALUES (?, ?) \
+                 ON CONFLICT(session_id) DO UPDATE SET rejected_at_ms = excluded.rejected_at_ms",
+            )
+            .bind(&session_id)
+            .bind(rejected_at.value())
+            .execute(&mut *transaction)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO observation_queue_rejections \
+             (observation_id, session_id, rejected_at_ms) VALUES (?, ?, ?) \
+             ON CONFLICT(observation_id) DO UPDATE SET rejected_at_ms = excluded.rejected_at_ms",
+            )
+            .bind(observation_id)
+            .bind(&session_id)
+            .bind(rejected_at.value())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Clear one exactly retried rejection and report whether any uncertainty remains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the marker cannot be cleared or counted atomically.
+    pub async fn clear_observation_queue_rejection(
+        &self,
+        observation: ObservationId,
+        session: SessionIdentity,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM observation_queue_rejections \
+             WHERE observation_id = ? AND session_id = ?",
+        )
+        .bind(observation.to_string())
+        .bind(session.session_id().to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT \
+             (SELECT COUNT(*) FROM observation_queue_rejections WHERE session_id = ?) + \
+             (SELECT COUNT(*) FROM observation_queue_rejection_overflow WHERE session_id = ?)",
+        )
+        .bind(session.session_id().to_string())
+        .bind(session.session_id().to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(remaining != 0)
+    }
+
+    /// Sessions with durable observations rejected and unreconciled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the rejection markers cannot be queried.
+    pub async fn observation_queue_uncertain_sessions(
+        &self,
+    ) -> Result<Vec<SessionIdentity>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT sessions.* FROM sessions JOIN ( \
+             SELECT session_id FROM observation_queue_rejections \
+             UNION SELECT session_id FROM observation_queue_rejection_overflow \
+             ) AS uncertain ON uncertain.session_id = sessions.session_id \
+             ORDER BY sessions.session_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| decode_session_row(row, None).map(|record| record.session))
+            .collect()
+    }
+
     /// Persist one scoped watch path with caller-key idempotency.
     ///
     /// Returns `true` only for a newly inserted session/path pair.

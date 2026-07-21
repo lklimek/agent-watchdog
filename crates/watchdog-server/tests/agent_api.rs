@@ -10,7 +10,7 @@ use watchdog_domain::{
 };
 use watchdog_server::{
     AgentApi, AgentApiError, AgentEventView, CompletionOutcome, DiscoveredSession, RegisterSession,
-    RepositoryMetadata, TransportKey,
+    RepositoryMetadata, TransportKey, WaitingKind,
 };
 use watchdog_store::{ActivityEvidence, ActivitySampleRecord, OutboxDestination, WatchdogStore};
 use watchdog_testkit::FakeClock;
@@ -153,6 +153,48 @@ async fn child_registration_progress_and_completion_are_idempotent_and_scoped() 
             .len(),
         2
     );
+}
+
+#[tokio::test]
+async fn intentional_wait_commits_state_and_timer_pause_in_one_observation() {
+    let (api, _store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("intentional-wait").expect("transport should be valid");
+    let main = register_main(&api, &transport, "waiting-main", "register-main").await;
+    let before = api
+        .get_session(&transport, main)
+        .await
+        .expect("registered session should load");
+
+    let waiting = api
+        .report_waiting(
+            &transport,
+            main,
+            "intentional-wait-1",
+            WaitingKind::Intentional,
+        )
+        .await
+        .expect("intentional wait should commit atomically");
+
+    assert_eq!(waiting.snapshot.state(), DetailedState::WaitingForAgent);
+    assert!(waiting.snapshot.timers_paused());
+    assert_eq!(waiting.snapshot.revision(), before.snapshot.revision() + 1);
+}
+
+#[tokio::test]
+async fn intentional_wait_uses_a_new_idempotency_namespace_after_legacy_waiting_evidence() {
+    let (api, _store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("intentional-wait-upgrade").expect("transport should work");
+    let main = register_main(&api, &transport, "waiting-upgrade-main", "register-main").await;
+    api.report_waiting(&transport, main, "shared-event", WaitingKind::Agent)
+        .await
+        .expect("legacy waiting evidence should persist");
+
+    let intentional = api
+        .report_waiting(&transport, main, "shared-event", WaitingKind::Intentional)
+        .await
+        .expect("intentional wait should not conflict with the legacy namespace");
+
+    assert!(intentional.snapshot.timers_paused());
 }
 
 #[tokio::test]

@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, RwLock},
 };
 
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock as AsyncRwLock};
+use tokio::sync::{Mutex, RwLock as AsyncRwLock, oneshot};
 use watchdog_domain::{
     AdapterIdentity, BoundedText, ChildSessionId, Clock, CorrelationBasis, DeadlineCommand,
     DetailedState, DomainEvent, DomainInputError, EvidenceTrust, MainSessionId, NativeSessionKey,
@@ -13,7 +13,10 @@ use watchdog_domain::{
     ProcessIdentity, ReducerPolicy, RuntimeKind, SessionId, SessionIdentity, SessionKind,
     SessionSnapshot, TimePoint, WallTimeMs,
 };
-use watchdog_runtime::{CoordinatorError, EventSequence, SessionCoordinator};
+use watchdog_runtime::{
+    AdmissionError, CoordinatorError, EventSequence, HealthScope, ObservationClass,
+    SessionCoordinator, SessionQueue,
+};
 use watchdog_store::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, ApplyResult, InboxOffsetRecord,
     OutboxDestination, RelationRecord, SessionMetadataRecord, StoreError, StoredSessionRecord,
@@ -22,6 +25,8 @@ use watchdog_store::{
 
 const MAX_TREE_SESSIONS: u32 = 1_000;
 const MAX_EVENTS: u32 = 500;
+const OBSERVATION_QUEUE_CAPACITY: usize = 64;
+const MAX_REJECTED_OBSERVATIONS: usize = 64;
 
 /// Bounded opaque MCP transport identity used only for application scoping.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -272,6 +277,74 @@ struct ScopeRegistry {
     roots: RwLock<HashMap<TransportKey, MainSessionId>>,
 }
 
+#[derive(Debug)]
+struct SessionAdmission<T> {
+    queue: SessionQueue<T>,
+    draining: bool,
+    rejected_observations: BTreeSet<ObservationId>,
+    rejected_overflow: bool,
+}
+
+impl<T> SessionAdmission<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: SessionQueue::new(capacity)
+                .unwrap_or_else(|_| unreachable!("observation queue capacity is positive")),
+            draining: false,
+            rejected_observations: BTreeSet::new(),
+            rejected_overflow: false,
+        }
+    }
+
+    fn push(&mut self, class: ObservationClass, value: T) -> Result<Option<T>, AdmissionError<T>> {
+        self.queue.try_push_replacing(class, value)
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.queue.pop()
+    }
+
+    #[cfg(test)]
+    fn is_degraded(&self) -> bool {
+        self.queue.is_degraded()
+    }
+
+    fn record_rejected(&mut self, observation_id: ObservationId) {
+        if self.rejected_observations.len() == MAX_REJECTED_OBSERVATIONS
+            && !self.rejected_observations.contains(&observation_id)
+        {
+            self.rejected_overflow = true;
+            return;
+        }
+        self.rejected_observations.insert(observation_id);
+    }
+
+    fn reconcile_rejected(&mut self, observation_id: ObservationId) -> bool {
+        self.rejected_observations.remove(&observation_id);
+        if self.rejected_overflow
+            || !self.rejected_observations.is_empty()
+            || !self.queue.is_degraded()
+        {
+            return false;
+        }
+        self.queue.mark_reconciled();
+        true
+    }
+}
+
+#[derive(Debug)]
+struct PendingObservation {
+    observation: ObservationEnvelope,
+    completion: oneshot::Sender<Result<ApplyResult, AgentApiError>>,
+}
+
+#[derive(Debug)]
+struct SessionLane {
+    record: StoredSessionRecord,
+    coordinator: Mutex<SessionCoordinator>,
+    admission: Mutex<SessionAdmission<PendingObservation>>,
+}
+
 impl ScopeRegistry {
     fn bind_once(&self, transport: TransportKey, root: MainSessionId) -> Result<(), AgentApiError> {
         let mut roots = self
@@ -304,7 +377,10 @@ struct AgentApiInner {
     event_sequence: Arc<EventSequence>,
     policy: RwLock<ReducerPolicy>,
     scopes: ScopeRegistry,
-    lanes: AsyncRwLock<HashMap<SessionId, Arc<Mutex<SessionCoordinator>>>>,
+    lanes: AsyncRwLock<HashMap<SessionId, Arc<SessionLane>>>,
+    health: RwLock<Option<crate::HealthService>>,
+    queue_uncertain: RwLock<BTreeSet<SessionIdentity>>,
+    queue_health_transition: Mutex<()>,
     watch_paths: RwLock<Option<crate::watch_paths::WatchPathRegistry>>,
 }
 
@@ -347,6 +423,11 @@ impl AgentApi {
         policy: ReducerPolicy,
     ) -> Result<Self, AgentApiError> {
         let event_sequence = Arc::new(EventSequence::from_store(&store).await?);
+        let queue_uncertain = store
+            .observation_queue_uncertain_sessions()
+            .await?
+            .into_iter()
+            .collect();
         Ok(Self {
             inner: Arc::new(AgentApiInner {
                 store,
@@ -355,6 +436,9 @@ impl AgentApi {
                 policy: RwLock::new(policy),
                 scopes: ScopeRegistry::default(),
                 lanes: AsyncRwLock::new(HashMap::new()),
+                health: RwLock::new(None),
+                queue_uncertain: RwLock::new(queue_uncertain),
+                queue_health_transition: Mutex::new(()),
                 watch_paths: RwLock::new(None),
             }),
         })
@@ -366,6 +450,28 @@ impl AgentApi {
             .watch_paths
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registry);
+    }
+
+    pub(crate) fn configure_health(&self, health: crate::HealthService) {
+        *self
+            .inner
+            .health
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(health);
+        for session in self
+            .inner
+            .queue_uncertain
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+        {
+            self.record_queue_health(
+                session,
+                watchdog_runtime::ComponentStatus::Degraded,
+                Some("Durable observation admission requires an exact retry"),
+            );
+        }
     }
 
     /// Apply reloaded reducer thresholds to existing and future session lanes.
@@ -384,7 +490,7 @@ impl AgentApi {
             .cloned()
             .collect::<Vec<_>>();
         for lane in lanes {
-            lane.lock().await.set_policy(policy);
+            lane.coordinator.lock().await.set_policy(policy);
         }
     }
 
@@ -448,7 +554,11 @@ impl AgentApi {
         for record in sessions {
             let observation = restart_observation(&record, now)?;
             let lane = self.lane(&record, now).await?;
-            lane.lock().await.apply_restarted(observation).await?;
+            lane.coordinator
+                .lock()
+                .await
+                .apply_restarted(observation)
+                .await?;
         }
         Ok(())
     }
@@ -471,7 +581,11 @@ impl AgentApi {
         let observation =
             reconciliation_observation(&record, now, adapter_version, evidence_source)?;
         let lane = self.lane(&record, now).await?;
-        lane.lock().await.apply_reconciled(observation).await?;
+        lane.coordinator
+            .lock()
+            .await
+            .apply_reconciled(observation)
+            .await?;
         Ok(())
     }
 
@@ -502,7 +616,14 @@ impl AgentApi {
         for record in &sessions {
             let observation = scheduler_observation(record, now)?;
             let lane = self.lane(record, now).await?;
-            if lane.lock().await.apply_tick(observation).await? == ApplyResult::Applied {
+            if lane
+                .coordinator
+                .lock()
+                .await
+                .apply_tick(observation)
+                .await?
+                == ApplyResult::Applied
+            {
                 changed_sessions += 1;
             }
         }
@@ -850,32 +971,26 @@ impl AgentApi {
         kind: WaitingKind,
     ) -> Result<SessionView, AgentApiError> {
         validate_event_key(event_key)?;
-        let state = match kind {
-            WaitingKind::Agent | WaitingKind::Intentional => DetailedState::WaitingForAgent,
-            WaitingKind::Tool => DetailedState::WaitingForTool,
-            WaitingKind::User => DetailedState::WaitingForUser,
-        };
-        let view = self
-            .mutate_scoped(
-                transport,
-                session_id,
+        let (operation, payload) = match kind {
+            WaitingKind::Agent => (
                 "report_waiting",
-                event_key,
-                ObservationPayload::NativeState(state),
-            )
-            .await?;
-        if kind == WaitingKind::Intentional {
-            self.mutate_scoped(
-                transport,
-                session_id,
-                "report_waiting_pause",
-                &format!("{event_key}:pause"),
-                ObservationPayload::Deadline(DeadlineCommand::Pause),
-            )
+                ObservationPayload::NativeState(DetailedState::WaitingForAgent),
+            ),
+            WaitingKind::Tool => (
+                "report_waiting",
+                ObservationPayload::NativeState(DetailedState::WaitingForTool),
+            ),
+            WaitingKind::User => (
+                "report_waiting",
+                ObservationPayload::NativeState(DetailedState::WaitingForUser),
+            ),
+            WaitingKind::Intentional => (
+                "report_intentional_wait",
+                ObservationPayload::IntentionalWait,
+            ),
+        };
+        self.mutate_scoped(transport, session_id, operation, event_key, payload)
             .await
-        } else {
-            Ok(view)
-        }
     }
 
     /// Report a terminal outcome for one in-scope session.
@@ -1130,10 +1245,161 @@ impl AgentApi {
     async fn apply_observation(
         &self,
         record: &StoredSessionRecord,
-        mut observation: ObservationEnvelope,
+        observation: ObservationEnvelope,
     ) -> Result<ApplyResult, AgentApiError> {
         let lane = self.lane(record, observation.observed_at()).await?;
-        let mut lane = lane.lock().await;
+        let (completion, receiver) = oneshot::channel();
+        let pending = PendingObservation {
+            observation,
+            completion,
+        };
+        let mut admission = lane.admission.lock().await;
+        let class = observation_class(pending.observation.payload());
+        let replaced = match admission.push(class, pending) {
+            Ok(replaced) => replaced,
+            Err(AdmissionError::Backpressure(pending)) => {
+                let observation_id = pending.observation.observation_id();
+                admission.record_rejected(observation_id);
+                self.persist_queue_rejection(record, &pending.observation)
+                    .await?;
+                self.record_queue_health(
+                    record.session,
+                    watchdog_runtime::ComponentStatus::Degraded,
+                    Some("Durable observation admission queue is full"),
+                );
+                return Err(AgentApiError::ObservationBackpressure);
+            }
+            Err(AdmissionError::ActivitySaturated(pending)) => {
+                let observation_id = pending.observation.observation_id();
+                admission.record_rejected(observation_id);
+                self.persist_queue_rejection(record, &pending.observation)
+                    .await?;
+                self.record_queue_health(
+                    record.session,
+                    watchdog_runtime::ComponentStatus::Degraded,
+                    Some("Activity observation admission queue is full"),
+                );
+                return Err(AgentApiError::ObservationActivitySaturated);
+            }
+        };
+        if let Some(replaced) = replaced {
+            let _ = replaced
+                .completion
+                .send(Err(AgentApiError::ObservationCoalesced));
+        }
+        let start_drainer = !admission.draining;
+        admission.draining = true;
+        drop(admission);
+        if start_drainer {
+            let api = self.clone();
+            let lane = Arc::clone(&lane);
+            tokio::spawn(async move { api.drain_observations(lane).await });
+        }
+        receiver
+            .await
+            .map_err(|_| AgentApiError::ObservationQueueStopped)?
+    }
+
+    async fn drain_observations(&self, lane: Arc<SessionLane>) {
+        loop {
+            let pending = {
+                let mut admission = lane.admission.lock().await;
+                let Some(pending) = admission.pop() else {
+                    admission.draining = false;
+                    return;
+                };
+                pending
+            };
+            let observation_id = pending.observation.observation_id();
+            let mut result = self
+                .apply_queued_observation(&lane, pending.observation)
+                .await;
+            if result.is_ok()
+                && let Err(error) = self
+                    .reconcile_rejected_observation(&lane, observation_id)
+                    .await
+            {
+                result = Err(error);
+            }
+            let _ = pending.completion.send(result);
+        }
+    }
+
+    async fn reconcile_rejected_observation(
+        &self,
+        lane: &SessionLane,
+        observation_id: ObservationId,
+    ) -> Result<(), AgentApiError> {
+        let _transition = self.inner.queue_health_transition.lock().await;
+        let uncertain = self
+            .inner
+            .queue_uncertain
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&lane.record.session);
+        if uncertain {
+            let remaining = self
+                .inner
+                .store
+                .clear_observation_queue_rejection(observation_id, lane.record.session)
+                .await?;
+            if !remaining {
+                self.inner
+                    .queue_uncertain
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&lane.record.session);
+                self.record_queue_health(
+                    lane.record.session,
+                    watchdog_runtime::ComponentStatus::Healthy,
+                    None,
+                );
+            }
+        }
+        let mut admission = lane.admission.lock().await;
+        if !admission.reconcile_rejected(observation_id) {
+            return Ok(());
+        }
+        self.record_queue_health(
+            lane.record.session,
+            watchdog_runtime::ComponentStatus::Healthy,
+            None,
+        );
+        Ok(())
+    }
+
+    async fn persist_queue_rejection(
+        &self,
+        record: &StoredSessionRecord,
+        observation: &ObservationEnvelope,
+    ) -> Result<(), AgentApiError> {
+        let _transition = self.inner.queue_health_transition.lock().await;
+        self.inner
+            .queue_uncertain
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.session);
+        self.record_queue_health(
+            record.session,
+            watchdog_runtime::ComponentStatus::Degraded,
+            Some("Durable observation admission requires an exact retry"),
+        );
+        self.inner
+            .store
+            .save_observation_queue_rejection(
+                observation.observation_id(),
+                record.session,
+                observation.observed_at().wall_time(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_queued_observation(
+        &self,
+        lane: &SessionLane,
+        mut observation: ObservationEnvelope,
+    ) -> Result<ApplyResult, AgentApiError> {
         if let Some(existing) = self
             .inner
             .store
@@ -1152,15 +1418,42 @@ impl AgentApi {
                 observation.payload().clone(),
             )?;
         }
-        let result = lane.apply_observation(observation).await?;
+        let result = lane
+            .coordinator
+            .lock()
+            .await
+            .apply_observation(observation)
+            .await?;
         Ok(result)
+    }
+
+    fn record_queue_health(
+        &self,
+        session: SessionIdentity,
+        status: watchdog_runtime::ComponentStatus,
+        message: Option<&str>,
+    ) {
+        if let Some(health) = self
+            .inner
+            .health
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            health.record_scoped(
+                watchdog_runtime::ComponentId::ObservationQueue,
+                status,
+                HealthScope::Session(session),
+                message,
+            );
+        }
     }
 
     async fn lane(
         &self,
         record: &StoredSessionRecord,
         now: TimePoint,
-    ) -> Result<Arc<Mutex<SessionCoordinator>>, AgentApiError> {
+    ) -> Result<Arc<SessionLane>, AgentApiError> {
         if let Some(lane) = self
             .inner
             .lanes
@@ -1178,17 +1471,21 @@ impl AgentApi {
                 .ok_or(AgentApiError::ReducerSnapshotUnavailable)?,
             None => SessionSnapshot::new(record.session, record.root, now),
         };
-        let lane = Arc::new(Mutex::new(SessionCoordinator::new(
-            self.inner.store.clone(),
-            snapshot,
-            *self
-                .inner
-                .policy
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Arc::clone(&self.inner.event_sequence),
-            [OutboxDestination::ParentInbox, OutboxDestination::Sse],
-        )));
+        let lane = Arc::new(SessionLane {
+            record: record.clone(),
+            coordinator: Mutex::new(SessionCoordinator::new(
+                self.inner.store.clone(),
+                snapshot,
+                *self
+                    .inner
+                    .policy
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Arc::clone(&self.inner.event_sequence),
+                [OutboxDestination::ParentInbox, OutboxDestination::Sse],
+            )),
+            admission: Mutex::new(SessionAdmission::new(OBSERVATION_QUEUE_CAPACITY)),
+        });
         let mut lanes = self.inner.lanes.write().await;
         Ok(lanes
             .entry(record.session.session_id())
@@ -1562,6 +1859,14 @@ fn validate_event_key(event_key: &str) -> Result<(), AgentApiError> {
     Ok(())
 }
 
+const fn observation_class(payload: &ObservationPayload) -> ObservationClass {
+    if matches!(payload, ObservationPayload::Progress(_)) {
+        ObservationClass::Activity
+    } else {
+        ObservationClass::Durable
+    }
+}
+
 /// Scoped API failure without credentials or native payload content.
 #[derive(Debug, Error)]
 pub enum AgentApiError {
@@ -1601,6 +1906,18 @@ pub enum AgentApiError {
     /// Watch-path registration is not available in this server process.
     #[error("MCP watch path registration is unavailable")]
     WatchPathUnavailable,
+    /// Durable observation admission requires producer retry.
+    #[error("Session observation queue is full; retry durable evidence")]
+    ObservationBackpressure,
+    /// Activity admission could not find a safe coalescing slot.
+    #[error("Session activity queue is saturated; reconcile before retrying")]
+    ObservationActivitySaturated,
+    /// The session queue worker stopped before reporting an outcome.
+    #[error("Session observation queue worker stopped")]
+    ObservationQueueStopped,
+    /// Newer activity displaced this coalescible observation before persistence.
+    #[error("Session activity observation was coalesced by newer evidence")]
+    ObservationCoalesced,
     /// Bounded input failed domain validation.
     #[error(transparent)]
     Domain(#[from] DomainInputError),
@@ -1613,4 +1930,231 @@ pub enum AgentApiError {
     /// Durable store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use watchdog_domain::{
+        Clock as _, DurationMs, MainSessionId, NativeSessionKey, RuntimeKind, SessionId,
+        SessionIdentity, SessionKind, TimePoint, WallTimeMs,
+    };
+    use watchdog_runtime::{AdmissionError, ComponentId, ComponentStatus, ObservationClass};
+    use watchdog_store::WatchdogStore;
+    use watchdog_testkit::FakeClock;
+
+    use super::{
+        AgentApi, AgentApiError, RegisterSession, SessionAdmission, TransportKey, WaitingKind,
+    };
+    use crate::HealthService;
+
+    #[test]
+    fn production_lane_coalesces_activity_and_backpressures_durable_evidence() {
+        let mut admission = SessionAdmission::new(2);
+        assert_eq!(
+            admission
+                .push(ObservationClass::Activity, "activity-1")
+                .expect("first activity should fit"),
+            None
+        );
+        assert_eq!(
+            admission
+                .push(ObservationClass::Activity, "activity-2")
+                .expect("new activity should coalesce"),
+            Some("activity-1")
+        );
+        admission
+            .push(ObservationClass::Durable, "waiting-user")
+            .expect("durable evidence should use reserved capacity");
+        assert_eq!(
+            admission.push(ObservationClass::Durable, "failed"),
+            Err(AdmissionError::Backpressure("failed"))
+        );
+        assert!(admission.is_degraded());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the production queue contract is clearer as one end-to-end scenario"
+    )]
+    async fn live_agent_lane_bounds_coalesced_waiters_and_stays_degraded_until_reconciliation() {
+        let directory = tempfile::tempdir().expect("fixture directory should exist");
+        let store = WatchdogStore::open(&directory.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(WallTimeMs::new(0), 0)));
+        let api = AgentApi::new(store.clone(), clock.clone())
+            .await
+            .expect("API should initialize");
+        let health = healthy_service(clock.clone());
+        api.configure_health(health.clone());
+        let transport = TransportKey::new("queue-test").expect("transport should validate");
+        let session = api
+            .register_session(
+                &transport,
+                RegisterSession {
+                    runtime: RuntimeKind::ClaudeCode,
+                    native_id: "queue-main".to_owned(),
+                    kind: SessionKind::Main,
+                    parent: None,
+                    event_key: "register-main".to_owned(),
+                },
+            )
+            .await
+            .expect("session should register")
+            .session;
+        let record = store
+            .session_by_id(session.session_id())
+            .await
+            .expect("session lookup should work")
+            .expect("session should exist");
+        let lane = api
+            .lane(&record, clock.now())
+            .await
+            .expect("lane should exist");
+        *lane.admission.lock().await = SessionAdmission::new(1);
+        let coordinator = lane.coordinator.lock().await;
+
+        let blocker = spawn_wait(
+            api.clone(),
+            transport.clone(),
+            session.session_id(),
+            "blocker",
+        );
+        wait_for_queue_len(&lane, 0).await;
+        let old_activity = spawn_progress(
+            api.clone(),
+            transport.clone(),
+            session.session_id(),
+            "activity-1",
+        );
+        wait_for_queue_len(&lane, 1).await;
+        let latest_activity = spawn_progress(
+            api.clone(),
+            transport.clone(),
+            session.session_id(),
+            "activity-2",
+        );
+        let old_activity_result = tokio::time::timeout(Duration::from_secs(1), old_activity)
+            .await
+            .expect("a displaced progress caller must not be retained without bound")
+            .expect("old activity task should finish");
+        assert!(matches!(
+            api.report_waiting(
+                &transport,
+                session.session_id(),
+                "rejected-durable",
+                WaitingKind::User,
+            )
+            .await,
+            Err(AgentApiError::ObservationBackpressure)
+        ));
+        assert!(!health.destructive_automation_allowed(RuntimeKind::ClaudeCode, session));
+        let restarted = AgentApi::new(store.clone(), clock.clone())
+            .await
+            .expect("restarted API should initialize");
+        let restarted_health = healthy_service(clock.clone());
+        restarted.configure_health(restarted_health.clone());
+        assert!(
+            !restarted_health.destructive_automation_allowed(RuntimeKind::ClaudeCode, session),
+            "durable admission uncertainty must survive a process restart"
+        );
+        let unaffected = SessionIdentity::Main(MainSessionId::from(SessionId::from_native(
+            &NativeSessionKey::new(RuntimeKind::ClaudeCode, "queue-unaffected")
+                .expect("unaffected identity should validate"),
+        )));
+        assert!(
+            restarted_health.destructive_automation_allowed(RuntimeKind::ClaudeCode, unaffected),
+            "recovered queue uncertainty must remain session-scoped"
+        );
+
+        drop(coordinator);
+        blocker
+            .await
+            .expect("blocker task should finish")
+            .expect("blocker observation should persist");
+        assert!(matches!(
+            old_activity_result,
+            Err(AgentApiError::ObservationCoalesced)
+        ));
+        latest_activity
+            .await
+            .expect("latest activity task should finish")
+            .expect("latest activity should persist");
+        assert!(
+            !health.destructive_automation_allowed(RuntimeKind::ClaudeCode, session),
+            "draining accepted work cannot reconcile rejected durable evidence"
+        );
+
+        clock.advance(DurationMs::new(1));
+        api.mark_native_reconciled(session.session_id(), "test", "test:reconcile")
+            .await
+            .expect("authoritative reconciliation should succeed");
+        assert!(
+            !health.destructive_automation_allowed(RuntimeKind::ClaudeCode, session),
+            "unrelated native evidence cannot reconstruct a rejected MCP command"
+        );
+        api.report_waiting(
+            &transport,
+            session.session_id(),
+            "rejected-durable",
+            WaitingKind::User,
+        )
+        .await
+        .expect("retrying the rejected durable observation should persist");
+        assert!(health.destructive_automation_allowed(RuntimeKind::ClaudeCode, session));
+    }
+
+    fn healthy_service(clock: Arc<FakeClock>) -> HealthService {
+        let health = HealthService::new(clock);
+        for component in [
+            ComponentId::Store,
+            ComponentId::Watcher,
+            ComponentId::FilesystemReconciliation,
+            ComponentId::ObservationQueue,
+            ComponentId::ProcessSampler,
+            ComponentId::Adapter(RuntimeKind::ClaudeCode),
+        ] {
+            health.record(component, ComponentStatus::Healthy, None);
+        }
+        health
+    }
+
+    async fn wait_for_queue_len(lane: &super::SessionLane, expected: usize) {
+        for _ in 0..100 {
+            let admission = lane.admission.lock().await;
+            if admission.draining && admission.queue.len() == expected {
+                return;
+            }
+            drop(admission);
+            tokio::task::yield_now().await;
+        }
+        panic!("queue did not reach expected length");
+    }
+
+    fn spawn_wait(
+        api: AgentApi,
+        transport: TransportKey,
+        session: watchdog_domain::SessionId,
+        event_key: &'static str,
+    ) -> tokio::task::JoinHandle<Result<super::SessionView, AgentApiError>> {
+        tokio::spawn(async move {
+            api.report_waiting(&transport, session, event_key, WaitingKind::Agent)
+                .await
+        })
+    }
+
+    fn spawn_progress(
+        api: AgentApi,
+        transport: TransportKey,
+        session: watchdog_domain::SessionId,
+        event_key: &'static str,
+    ) -> tokio::task::JoinHandle<Result<super::SessionView, AgentApiError>> {
+        tokio::spawn(async move {
+            api.report_progress(&transport, session, event_key, event_key.to_owned(), None)
+                .await
+        })
+    }
 }

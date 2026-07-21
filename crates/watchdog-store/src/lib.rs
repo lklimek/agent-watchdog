@@ -588,6 +588,8 @@ impl WatchdogStore {
             "DELETE FROM deadlines",
             "DELETE FROM file_cursors",
             "DELETE FROM activity_samples",
+            "DELETE FROM observation_queue_rejections",
+            "DELETE FROM observation_queue_rejection_overflow",
             "DELETE FROM registered_watch_paths",
             "DELETE FROM state_transitions",
             "DELETE FROM session_snapshots",

@@ -79,15 +79,32 @@ impl<T> SessionQueue<T> {
     /// Returns backpressure for durable evidence, or saturation for activity
     /// when the queue contains no coalescible activity slot.
     pub fn try_push(&mut self, class: ObservationClass, value: T) -> Result<(), AdmissionError<T>> {
+        self.try_push_replacing(class, value).map(drop)
+    }
+
+    /// Admit an item and return activity displaced by coalescing.
+    ///
+    /// # Errors
+    ///
+    /// Returns backpressure for durable evidence, or saturation for activity
+    /// when the queue contains no coalescible activity slot.
+    pub fn try_push_replacing(
+        &mut self,
+        class: ObservationClass,
+        value: T,
+    ) -> Result<Option<T>, AdmissionError<T>> {
         if class == ObservationClass::Activity
-            && let Some(existing) = self
+            && let Some(index) = self
                 .entries
-                .iter_mut()
-                .rev()
-                .find(|entry| entry.class == ObservationClass::Activity)
+                .iter()
+                .rposition(|entry| entry.class == ObservationClass::Activity)
         {
-            existing.value = value;
-            return Ok(());
+            let displaced = self
+                .entries
+                .remove(index)
+                .unwrap_or_else(|| unreachable!("activity index came from the same queue"));
+            self.entries.push_back(QueueEntry { class, value });
+            return Ok(Some(displaced.value));
         }
         if self.entries.len() == self.capacity {
             self.degraded = true;
@@ -97,7 +114,7 @@ impl<T> SessionQueue<T> {
             });
         }
         self.entries.push_back(QueueEntry { class, value });
-        Ok(())
+        Ok(None)
     }
 
     /// Remove the oldest accepted value.

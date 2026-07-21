@@ -93,6 +93,12 @@ impl HealthRegistry {
             .insert((health.component, health.scope), health.status);
     }
 
+    /// Return the latest exact component and scope report.
+    #[must_use]
+    pub fn status(&self, component: ComponentId, scope: HealthScope) -> Option<ComponentStatus> {
+        self.reports.get(&(component, scope)).copied()
+    }
+
     /// Critical global failures fail readiness; isolated adapters remain contained.
     #[must_use]
     pub fn is_ready(&self) -> bool {
@@ -110,8 +116,24 @@ impl HealthRegistry {
         runtime: RuntimeKind,
         session: SessionIdentity,
     ) -> bool {
-        self.reports.iter().all(|((_component, scope), status)| {
-            *status == ComponentStatus::Healthy || !scope_applies(*scope, runtime, session)
+        [
+            ComponentId::Store,
+            ComponentId::Watcher,
+            ComponentId::FilesystemReconciliation,
+            ComponentId::ObservationQueue,
+            ComponentId::ProcessSampler,
+            ComponentId::Adapter(runtime),
+        ]
+        .into_iter()
+        .all(|required| {
+            self.reports
+                .iter()
+                .filter(|((component, scope), _status)| {
+                    *component == required && scope_applies(*scope, runtime, session)
+                })
+                .map(|(_key, status)| *status)
+                .max()
+                == Some(ComponentStatus::Healthy)
         })
     }
 }
