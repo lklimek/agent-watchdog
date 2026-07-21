@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use sqlx::sqlite::SqliteConnectOptions;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, Clock, CorrelationBasis, DeadlineCommand, DetailedState,
-    DomainEventKind, DurationMs, EvidenceTrust, NativeSessionKey, ObservationEnvelope,
-    ObservationId, ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, RuntimeKind,
-    SessionId, SessionKind, TimePoint, WallTimeMs,
+    DomainEventKind, DurationMs, EvidenceTrust, MainSessionId, NativeSessionKey,
+    ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource, ProcessId,
+    ProcessIdentity, RuntimeKind, SessionId, SessionKind, TimePoint, WallTimeMs,
 };
 use watchdog_server::{
     AgentApi, AgentApiError, AgentEventView, CompletionOutcome, DiscoveredSession, RegisterSession,
@@ -222,7 +223,7 @@ async fn session_tree_returns_bound_sessions_and_selected_relations() {
 
 #[tokio::test]
 async fn watchdog_health_returns_each_persisted_runtime_adapter() {
-    let (api, store, _clock) = api_fixture().await;
+    let (api, store, clock) = api_fixture().await;
     let transport = TransportKey::new("health-tool").expect("transport should be valid");
     register_main(&api, &transport, "health-main", "register-main").await;
     for runtime in [
@@ -248,6 +249,7 @@ async fn watchdog_health_returns_each_persisted_runtime_adapter() {
         .await
         .expect("watchdog health should load");
 
+    assert_eq!(health.server_time, clock.now().wall_time());
     assert!(health.store_wal);
     assert!(health.store_foreign_keys);
     assert_eq!(health.adapters.len(), 3);
@@ -1059,4 +1061,96 @@ async fn durable_event_cursor_never_advances_beyond_the_latest_committed_event()
         .expect("events after the clamped acknowledgement should remain deliverable");
     assert!(!page.events.is_empty());
     assert!(page.next_cursor > latest_before);
+}
+
+#[tokio::test]
+async fn oversized_acknowledgement_cannot_skip_another_roots_undelivered_events() {
+    let (api, _store, _clock) = api_fixture().await;
+    let first_transport =
+        TransportKey::new("cursor-root-first").expect("transport should be valid");
+    let second_transport =
+        TransportKey::new("cursor-root-second").expect("transport should be valid");
+    let first = register_main(
+        &api,
+        &first_transport,
+        "cursor-first-main",
+        "register-first-main",
+    )
+    .await;
+    api.complete_session(
+        &first_transport,
+        first,
+        "complete-first-main",
+        CompletionOutcome::Completed,
+    )
+    .await
+    .expect("the first root should have one undelivered event");
+    register_main(
+        &api,
+        &second_transport,
+        "cursor-second-main",
+        "register-second-main",
+    )
+    .await;
+
+    let page = api
+        .list_events(&first_transport, Some(u64::MAX), 10)
+        .await
+        .expect("oversized acknowledgement should be clamped to delivered events");
+
+    assert_eq!(page.after, 0);
+    assert!(
+        page.events
+            .iter()
+            .any(|event| event.session.session.session_id() == first),
+        "the first root's undelivered event must remain visible"
+    );
+}
+
+#[tokio::test]
+async fn failed_event_page_assembly_does_not_advance_the_delivered_ceiling() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("watchdog.db");
+    let store = WatchdogStore::open(&path)
+        .await
+        .expect("database should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(10_000),
+        5_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock)
+        .await
+        .expect("agent API should initialize");
+    let transport = TransportKey::new("cursor-failed-page").expect("transport should be valid");
+    let main = register_main(&api, &transport, "cursor-failed-main", "register-main").await;
+    api.complete_session(
+        &transport,
+        main,
+        "complete-main",
+        CompletionOutcome::Completed,
+    )
+    .await
+    .expect("the root should have an event");
+    let pool = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("a corruption fixture connection should open");
+    sqlx::query("UPDATE session_snapshots SET snapshot_json = X'7B' WHERE session_id = ?")
+        .bind(main.to_string())
+        .execute(&pool)
+        .await
+        .expect("the snapshot fixture should become unreadable");
+
+    assert!(api.list_events(&transport, None, 10).await.is_err());
+    assert_eq!(
+        store
+            .inbox_offset(MainSessionId::from(main))
+            .await
+            .expect("inbox lookup should work"),
+        None,
+        "a page the caller never received must not become acknowledgeable"
+    );
 }

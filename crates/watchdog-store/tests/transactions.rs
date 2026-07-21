@@ -844,6 +844,7 @@ async fn assert_saga_and_inbox(store: &WatchdogStore, root: MainSessionId, child
     let offset = InboxOffsetRecord {
         parent: root,
         last_event_id: EventId::new(20),
+        last_delivered_event_id: EventId::new(20),
         updated_at: WallTimeMs::new(2_000),
     };
     assert!(
@@ -857,6 +858,7 @@ async fn assert_saga_and_inbox(store: &WatchdogStore, root: MainSessionId, child
             .save_inbox_offset(InboxOffsetRecord {
                 parent: root,
                 last_event_id: EventId::new(19),
+                last_delivered_event_id: EventId::new(20),
                 updated_at: WallTimeMs::new(3_000),
             })
             .await
@@ -952,6 +954,63 @@ async fn adapter_health_preserves_version_specific_evidence() {
     assert_eq!(stored.adapter.version(), "2.1.214");
     assert_eq!(stored.status, AdapterHealthStatus::Healthy);
     assert_eq!(stored.last_success, Some(WallTimeMs::new(2_000)));
+}
+
+#[tokio::test]
+async fn queue_rejections_retain_every_identity_until_its_exact_retry() {
+    let database = TestDatabase::new("queue-rejection-overflow-recovery");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("store should open");
+    store
+        .apply_observation(&fixture("queue-session", 1, 1))
+        .await
+        .expect("session should persist");
+    let native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "session-1")
+        .expect("native session should be valid");
+    let session = SessionIdentity::Main(MainSessionId::from(SessionId::from_native(&native)));
+    let mut rejected = Vec::new();
+    for index in 0..=64 {
+        let observation = ObservationId::from_native(
+            RuntimeKind::ClaudeCode,
+            "queue",
+            format!("rejected-{index}"),
+        )
+        .expect("rejection identity should be valid");
+        store
+            .save_observation_queue_rejection(observation, session, WallTimeMs::new(2_000))
+            .await
+            .expect("rejection should persist");
+        rejected.push(observation);
+    }
+
+    for observation in rejected.iter().take(64).copied() {
+        store
+            .clear_observation_queue_rejection(observation, session)
+            .await
+            .expect("tracked retry should clear");
+    }
+
+    assert!(
+        !store
+            .observation_queue_uncertain_sessions()
+            .await
+            .expect("uncertain sessions should load")
+            .is_empty(),
+        "an unretried 65th rejection must keep the session fail-closed"
+    );
+    store
+        .clear_observation_queue_rejection(rejected[64], session)
+        .await
+        .expect("the final exact retry should clear");
+    assert!(
+        store
+            .observation_queue_uncertain_sessions()
+            .await
+            .expect("uncertain sessions should load")
+            .is_empty(),
+        "uncertainty may clear only after every rejected identity is replayed"
+    );
 }
 
 #[test]

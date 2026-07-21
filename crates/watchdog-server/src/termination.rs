@@ -1,31 +1,40 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet},
     fmt,
+    path::PathBuf,
+    sync::Arc,
+};
+
+#[cfg(test)]
+use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
-        Arc, RwLock,
+        RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 use serde::Deserialize;
 use thiserror::Error;
+#[cfg(test)]
+use watchdog_domain::ProcessId;
 use watchdog_domain::{
     DetailedState, DomainEvent, DomainEventKind, DurationMs, EvidenceTrust, MainSessionId,
-    ProcessId, ProcessIdentity, RuntimeKind, SessionIdentity, SessionKind,
-    TerminationActionOutcome, TerminationBlocker, TerminationCandidate, TerminationComponent,
-    TerminationFacts, TerminationHealth, TerminationStage, TimePoint, WallTimeMs,
-    assess_termination,
+    ProcessIdentity, RuntimeKind, SessionIdentity, SessionKind, TerminationActionOutcome,
+    TerminationBlocker, TerminationCandidate, TerminationComponent, TerminationFacts,
+    TerminationHealth, TerminationStage, TimePoint, WallTimeMs, assess_termination,
 };
 use watchdog_process::{
     LinuxProcessControl, LinuxProcessSampler, ProcessControl, ProcessReadError, ProcessSignal,
 };
-use watchdog_runtime::{
-    CapabilityRoot, CoordinatorError, DirectoryScanner, EventSequence, ScanBudget,
-};
+#[cfg(test)]
+use watchdog_runtime::{CapabilityRoot, DirectoryScanner, ScanBudget};
+use watchdog_runtime::{CoordinatorError, EventSequence};
 use watchdog_store::{
     OutboxDestination, StoreError, TerminationAdvance, TerminationSafetyRecord,
     TerminationSagaRecord, WatchdogStore,
@@ -36,12 +45,19 @@ use crate::{AgentApi, HealthService};
 const TEN_MINUTES_MS: u64 = 10 * 60_000;
 const MAX_CHILD_SESSIONS: u32 = 1_000;
 const MAX_RELATIONS_PER_ROOT: u32 = 1_000;
+#[cfg(test)]
 const COMPANION_SCAN_DEPTH: usize = 4;
+#[cfg(test)]
 const COMPANION_SCAN_ENTRIES: usize = 2_048;
+#[cfg(test)]
 const COMPANION_SCAN_PATH_BYTES: usize = 2 * 1_024 * 1_024;
+#[cfg(test)]
 const COMPANION_RPC_BYTES: usize = 64 * 1_024;
+#[cfg(test)]
 const COMPANION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
 const COMPANION_CONTENT_BYTES: usize = 8 * 1_024 * 1_024;
+#[cfg(test)]
 const COMPANION_CONTENT_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,7 +127,6 @@ impl TerminationMonitor {
         store: WatchdogStore,
         clock: Arc<dyn watchdog_domain::Clock>,
         health: HealthService,
-        companion_roots: Vec<PathBuf>,
         config: TerminationConfig,
         terminate_after_stalled: DurationMs,
     ) -> Result<Self, TerminationEngineError> {
@@ -121,7 +136,7 @@ impl TerminationMonitor {
             store.clone(),
             api.event_sequence(),
             Arc::new(LinuxProcessControl::new()),
-            Arc::new(CompanionGracefulCanceller::new(companion_roots)),
+            Arc::new(NoGracefulCanceller),
             config,
         );
         Ok(Self::with_parts(
@@ -156,10 +171,8 @@ impl TerminationMonitor {
         &mut self,
         config: TerminationConfig,
         terminate_after_stalled: DurationMs,
-        companion_roots: &[PathBuf],
     ) {
         self.engine.set_config(config);
-        self.engine.configure_graceful_roots(companion_roots);
         self.terminate_after_stalled = terminate_after_stalled;
     }
 
@@ -417,6 +430,7 @@ impl GracefulCanceller for NoGracefulCanceller {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct CompanionGracefulCanceller {
     roots: RwLock<Vec<PathBuf>>,
@@ -425,6 +439,7 @@ struct CompanionGracefulCanceller {
     circuit_open: AtomicBool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum CompanionTarget {
     Active {
@@ -437,24 +452,28 @@ enum CompanionTarget {
     Unsupported,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize)]
 struct CompanionBrokerState {
     endpoint: String,
     pid: u32,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct VerifiedCompanionBroker {
     state: CompanionBrokerState,
     process: ProcessIdentity,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct CapabilityReadBudget {
     started: Instant,
     remaining_bytes: usize,
 }
 
+#[cfg(test)]
 impl CapabilityReadBudget {
     fn new() -> Self {
         Self {
@@ -472,6 +491,7 @@ impl CapabilityReadBudget {
     }
 }
 
+#[cfg(test)]
 impl CompanionGracefulCanceller {
     fn new(roots: Vec<PathBuf>) -> Self {
         Self {
@@ -582,6 +602,7 @@ impl CompanionGracefulCanceller {
     }
 }
 
+#[cfg(test)]
 impl GracefulCanceller for CompanionGracefulCanceller {
     fn prepare(&self) -> Result<(), GracefulCancelError> {
         self.prepared.store(false, Ordering::Release);
@@ -642,7 +663,7 @@ impl GracefulCanceller for CompanionGracefulCanceller {
             return Err(GracefulCancelError::EvidenceChanged);
         }
         let Some(broker) = broker else {
-            return Err(GracefulCancelError::Unavailable);
+            return Ok(GracefulCancelSupport::Unsupported);
         };
         if let Err(error) = interrupt_companion_turn(&broker, &thread_id, &turn_id) {
             self.circuit_open.store(true, Ordering::Release);
@@ -652,6 +673,7 @@ impl GracefulCanceller for CompanionGracefulCanceller {
     }
 }
 
+#[cfg(test)]
 fn read_companion_broker(
     root: &CapabilityRoot,
     relative: &Path,
@@ -684,6 +706,7 @@ fn read_companion_broker(
     }))
 }
 
+#[cfg(test)]
 fn read_capability_file(
     root: &CapabilityRoot,
     relative: &Path,
@@ -717,6 +740,7 @@ fn read_capability_file(
     Ok(Some(bytes))
 }
 
+#[cfg(test)]
 fn connect_companion_broker(
     broker: &VerifiedCompanionBroker,
 ) -> Result<UnixStream, GracefulCancelError> {
@@ -760,6 +784,7 @@ fn connect_companion_broker(
     Err(GracefulCancelError::Unavailable)
 }
 
+#[cfg(test)]
 fn interrupt_companion_turn(
     broker: &VerifiedCompanionBroker,
     thread_id: &str,
@@ -791,6 +816,7 @@ fn interrupt_companion_turn(
     read_rpc_response(&mut reader, 2)
 }
 
+#[cfg(test)]
 fn read_rpc_response(
     reader: &mut BufReader<UnixStream>,
     expected_id: u64,
@@ -886,10 +912,6 @@ impl TerminationEngine {
 
     const fn set_config(&mut self, config: TerminationConfig) {
         self.config = config;
-    }
-
-    fn configure_graceful_roots(&self, roots: &[PathBuf]) {
-        self.graceful.configure_roots(roots);
     }
 
     async fn prepare_graceful(&self) -> bool {
@@ -1374,6 +1396,15 @@ mod monitor_tests {
     use crate::{RegisterSession, TransportKey};
 
     #[test]
+    fn production_graceful_fallback_is_explicitly_unsupported() {
+        let process = companion_process(42);
+        assert_eq!(
+            NoGracefulCanceller.request_cancel(companion_child(&process)),
+            Ok(GracefulCancelSupport::Unsupported)
+        );
+    }
+
+    #[test]
     fn companion_graceful_canceller_sends_native_turn_interrupt() {
         let directory = tempfile::tempdir().expect("fixture directory should exist");
         let workspace = directory.path().join("workspace");
@@ -1550,7 +1581,7 @@ mod monitor_tests {
     }
 
     #[test]
-    fn companion_missing_broker_allows_signal_fallback() {
+    fn companion_without_an_authoritative_transport_is_unsupported() {
         let directory = companion_state_fixture("running", 42, false);
         let canceller = CompanionGracefulCanceller::new(vec![directory.path().to_owned()]);
         canceller
@@ -1559,7 +1590,7 @@ mod monitor_tests {
         let expected = companion_process(42);
         assert_eq!(
             canceller.request_cancel(companion_child(&expected)),
-            Err(GracefulCancelError::Unavailable)
+            Ok(GracefulCancelSupport::Unsupported)
         );
     }
 
@@ -1582,7 +1613,7 @@ mod monitor_tests {
         let expected = companion_process(42);
         assert_eq!(
             canceller.request_cancel(companion_child(&expected)),
-            Err(GracefulCancelError::Unavailable)
+            Ok(GracefulCancelSupport::Unsupported)
         );
     }
 

@@ -334,7 +334,11 @@ mod tests {
             )
             .await
             .expect("inside path should register");
-        assert_eq!(accepted.native_path(), "/host/repositories/inside");
+        assert_eq!(accepted.server_time, clock.now().wall_time());
+        assert_eq!(
+            accepted.registration.native_path(),
+            "/host/repositories/inside"
+        );
         assert_eq!(
             api.register_watch_path(
                 &transport,
