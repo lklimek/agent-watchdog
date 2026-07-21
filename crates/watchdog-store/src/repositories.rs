@@ -346,6 +346,103 @@ impl WatchdogStore {
         row.map(|row| decode_session_row(&row, None)).transpose()
     }
 
+    /// Retain one observed runtime-native alias for a canonical session.
+    ///
+    /// Multiple canonical targets are retained so callers can fail closed on
+    /// ambiguous evidence instead of allowing a later scan to overwrite it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the canonical session is absent or `SQLite`
+    /// persistence fails.
+    pub async fn save_discovery_alias(
+        &self,
+        alias: &NativeSessionKey,
+        canonical: SessionId,
+        observed_at: watchdog_domain::WallTimeMs,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO discovery_aliases \
+             (alias_runtime, alias_native_id, canonical_session_id, observed_at_ms) \
+             SELECT ?, ?, session_id, ? FROM sessions \
+             WHERE session_id = ? AND runtime = ? \
+             ON CONFLICT(alias_runtime, alias_native_id, canonical_session_id) DO UPDATE SET \
+             observed_at_ms = excluded.observed_at_ms",
+        )
+        .bind(alias.runtime().as_str())
+        .bind(alias.native_id())
+        .bind(observed_at.value())
+        .bind(canonical.to_string())
+        .bind(alias.runtime().as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Load bounded durable alias evidence for one runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an invalid limit, corrupt identity, or
+    /// `SQLite` failure.
+    pub async fn discovery_aliases(
+        &self,
+        runtime: RuntimeKind,
+        limit: u32,
+    ) -> Result<Vec<(NativeSessionKey, Option<SessionId>)>, StoreError> {
+        validate_limit(limit)?;
+        let rows = sqlx::query(
+            "SELECT alias_native_id, \
+             CASE WHEN COUNT(*) = 1 THEN MIN(canonical_session_id) ELSE NULL END \
+             AS canonical_session_id FROM discovery_aliases \
+             WHERE alias_runtime = ? GROUP BY alias_native_id \
+             ORDER BY alias_native_id LIMIT ?",
+        )
+        .bind(runtime.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let alias =
+                    NativeSessionKey::new(runtime, row.try_get::<String, _>("alias_native_id")?)
+                        .map_err(|_| StoreError::CorruptValue("invalid discovery alias"))?;
+                let canonical = row
+                    .try_get::<Option<String>, _>("canonical_session_id")?
+                    .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                    .transpose()?;
+                Ok((alias, canonical))
+            })
+            .collect()
+    }
+
+    /// Load the currently selected parent record for one child.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt stored identities or `SQLite` failure.
+    pub async fn selected_parent(
+        &self,
+        child: SessionId,
+    ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT sessions.session_id, sessions.kind, sessions.root_session_id, \
+             sessions.runtime, sessions.native_id FROM session_relations \
+             JOIN sessions ON sessions.session_id = session_relations.parent_session_id \
+             WHERE session_relations.child_session_id = ? \
+             AND session_relations.selected = 1 \
+             AND session_relations.valid_until_ms IS NULL \
+             ORDER BY session_relations.valid_from_ms DESC LIMIT 1",
+        )
+        .bind(child.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| decode_session_row(&row, None)).transpose()
+    }
+
     /// Load a bounded stable session list for one main-session tree.
     ///
     /// # Errors

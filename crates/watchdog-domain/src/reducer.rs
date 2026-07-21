@@ -362,8 +362,7 @@ fn apply_observation(
             }
         }
         ObservationPayload::Progress(summary) => {
-            snapshot.last_progress_summary = Some(summary.clone());
-            record_activity(snapshot, observation.observed_at(), events);
+            apply_progress(snapshot, summary, observation.observed_at(), events);
         }
         ObservationPayload::ProcessIdentity(identity) => {
             snapshot.process_identity = Some(identity.clone());
@@ -495,6 +494,27 @@ fn apply_intentional_wait(
     snapshot.suspect_emitted = false;
     snapshot.pause_started_monotonic_ms = Some(now.monotonic_ms());
     events.push(DomainEventKind::DeadlineChanged);
+}
+
+fn apply_progress(
+    snapshot: &mut SessionSnapshot,
+    summary: &BoundedText<2_048>,
+    now: TimePoint,
+    events: &mut Vec<DomainEventKind>,
+) {
+    snapshot.last_progress_summary = Some(summary.clone());
+    if matches!(
+        snapshot.state,
+        DetailedState::WaitingForAgent
+            | DetailedState::WaitingForTool
+            | DetailedState::WaitingForUser
+            | DetailedState::Idle
+            | DetailedState::Stalled
+    ) {
+        resume_clock(snapshot, now);
+        transition(snapshot, DetailedState::Running, now, events);
+    }
+    record_activity(snapshot, now, events);
 }
 
 fn pause_clock(snapshot: &mut SessionSnapshot, now: TimePoint) {

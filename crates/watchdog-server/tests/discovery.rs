@@ -844,7 +844,7 @@ async fn ambiguous_claude_team_lead_cwd_does_not_guess_an_alias() {
 }
 
 #[tokio::test]
-async fn inactive_claude_team_member_is_terminal_instead_of_stalling() {
+async fn inactive_claude_team_member_does_not_claim_a_terminal_state() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let teams = fixture.path().join("teams");
     let team = teams.join("watchdog-team");
@@ -887,7 +887,7 @@ async fn inactive_claude_team_member_is_terminal_instead_of_stalling() {
         .await
         .expect("children should query");
     assert_eq!(children.len(), 1);
-    assert_session_state(&store, children[0].session, DetailedState::Completed).await;
+    assert_session_state(&store, children[0].session, DetailedState::Starting).await;
 }
 
 #[tokio::test]
@@ -1160,6 +1160,10 @@ async fn claude_originated_codex_ignores_unreconciled_retained_parent() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart regression keeps its complete native fixture visible"
+)]
 async fn companion_wrapper_parent_reuses_the_claude_team_member_alias() {
     let fixture = tempfile::tempdir().expect("fixture root should exist");
     let projects = fixture.path().join("projects");
@@ -1230,12 +1234,12 @@ async fn companion_wrapper_parent_reuses_the_claude_team_member_alias() {
         aliases.clone(),
     )
     .reconcile(
-        &[projects, teams],
+        &[projects.clone(), teams.clone()],
         &runtime_mappings,
         std::slice::from_ref(&worktree_mapping),
     )
     .await;
-    CompanionDiscovery::with_alias_registry(api, store.clone(), clock, aliases)
+    CompanionDiscovery::with_alias_registry(api.clone(), store.clone(), clock.clone(), aliases)
         .reconcile(&[fixture.path().join("companion")], &[])
         .await;
 
@@ -1254,6 +1258,35 @@ async fn companion_wrapper_parent_reuses_the_claude_team_member_alias() {
         children
             .iter()
             .all(|child| child.root.session_id() == mains[0].root.session_id())
+    );
+
+    fs::remove_file(team.join("config.json")).expect("team config should be removable");
+    let restarted_aliases = DiscoveryAliasRegistry::default();
+    ClaudeDiscovery::with_alias_registry(
+        api.clone(),
+        store.clone(),
+        clock.clone(),
+        restarted_aliases.clone(),
+    )
+    .reconcile(
+        &[projects, teams],
+        &runtime_mappings,
+        std::slice::from_ref(&worktree_mapping),
+    )
+    .await;
+    let restarted =
+        CompanionDiscovery::with_alias_registry(api, store.clone(), clock, restarted_aliases)
+            .reconcile(&[fixture.path().join("companion")], &[])
+            .await;
+
+    assert_eq!(restarted.warning_count(), 0);
+    assert_eq!(
+        store
+            .sessions_by_kind(SessionKind::Main, 10)
+            .await
+            .expect("mains should query after restart")
+            .len(),
+        1
     );
 }
 
