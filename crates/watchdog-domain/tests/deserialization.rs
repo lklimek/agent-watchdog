@@ -21,6 +21,16 @@ fn bounded_and_nonempty_invariants_cannot_be_bypassed_by_json() {
 }
 
 #[test]
+fn legacy_version_specific_warning_recovers_detected_version() {
+    let warning = serde_json::from_str::<CompatibilityWarning>(
+        r#"{"kind":"upgrade","message":"Update Agent Watchdog's Claude adapter; detected Claude Code 2.2.0, tested with Claude Code 2.1.214"}"#,
+    )
+    .expect("legacy warning should deserialize");
+
+    assert_eq!(warning.detected_version(), Some("2.2.0"));
+}
+
+#[test]
 fn numeric_invariants_cannot_be_bypassed_by_json() {
     assert!(serde_json::from_str::<Confidence>("10001").is_err());
     assert!(serde_json::from_str::<ProcessId>("0").is_err());

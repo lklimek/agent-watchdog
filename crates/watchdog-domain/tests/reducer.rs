@@ -579,6 +579,51 @@ fn compatibility_only_evidence_does_not_clear_restart_reconciliation() {
 }
 
 #[test]
+fn versionless_compatibility_evidence_does_not_replace_detected_version() {
+    let version_specific = watchdog_domain::CompatibilityWarning::new_with_detected_version(
+        watchdog_domain::WarningKind::Upgrade,
+        "Detected 3.0.0, tested 2.1.214",
+        "3.0.0",
+    )
+    .expect("version-specific warning should be valid");
+    assert_eq!(version_specific.detected_version(), Some("3.0.0"));
+    let warned = reduce(
+        initial(),
+        ReducerInput::Observation(observation(
+            1,
+            time(1),
+            ObservationPayload::Compatibility(version_specific.clone()),
+        )),
+        ReducerPolicy::default(),
+    );
+    let generic = watchdog_domain::CompatibilityWarning::new(
+        watchdog_domain::WarningKind::Upgrade,
+        "Unknown record; update Agent Watchdog",
+    )
+    .expect("versionless warning should be valid");
+
+    let reduced = reduce(
+        warned.into_snapshot(),
+        ReducerInput::Observation(observation(
+            2,
+            time(2),
+            ObservationPayload::Compatibility(generic),
+        )),
+        ReducerPolicy::default(),
+    );
+
+    assert_eq!(
+        reduced.snapshot().compatibility_warning(),
+        Some(&version_specific)
+    );
+    assert!(
+        !reduced
+            .events()
+            .contains(&DomainEventKind::CompatibilityChanged)
+    );
+}
+
+#[test]
 fn scheduler_ticks_do_not_clear_restart_reconciliation() {
     let restarted = reduce(
         initial(),

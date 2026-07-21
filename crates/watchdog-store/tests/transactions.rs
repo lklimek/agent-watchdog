@@ -902,6 +902,50 @@ async fn assert_health_and_notification(store: &WatchdogStore) {
     );
 }
 
+#[tokio::test]
+async fn adapter_health_preserves_version_specific_evidence() {
+    let database = TestDatabase::new("adapter-health-version-richness");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("store should open");
+    let version_specific = AdapterHealthRecord {
+        adapter: AdapterIdentity::new(RuntimeKind::ClaudeCode, "2.1.214")
+            .expect("detected version should be valid"),
+        status: AdapterHealthStatus::Degraded,
+        last_success: None,
+        last_error: Some(WallTimeMs::new(1_000)),
+        affected_scope: None,
+        message: None,
+    };
+    store
+        .save_adapter_health(&version_specific)
+        .await
+        .expect("version-specific health should persist");
+    let versionless = AdapterHealthRecord {
+        adapter: AdapterIdentity::new(RuntimeKind::ClaudeCode, "unknown")
+            .expect("versionless marker should be bounded"),
+        status: AdapterHealthStatus::Healthy,
+        last_success: Some(WallTimeMs::new(2_000)),
+        last_error: None,
+        affected_scope: None,
+        message: None,
+    };
+
+    store
+        .save_adapter_health(&versionless)
+        .await
+        .expect("later health should persist");
+    let stored = store
+        .adapter_health(RuntimeKind::ClaudeCode)
+        .await
+        .expect("health should load")
+        .expect("health should exist");
+
+    assert_eq!(stored.adapter.version(), "2.1.214");
+    assert_eq!(stored.status, AdapterHealthStatus::Healthy);
+    assert_eq!(stored.last_success, Some(WallTimeMs::new(2_000)));
+}
+
 #[test]
 fn restart_record_invariants_reject_invalid_offsets_and_revisions() {
     let path_key = BoundedText::new("path_key", "runtime/file").expect("fixture should be valid");

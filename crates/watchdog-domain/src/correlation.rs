@@ -260,14 +260,12 @@ pub fn correlate(
         };
     }
 
-    let authoritative_explicit_parents = ranked
+    let explicit_parents = ranked
         .iter()
-        .filter(|candidate| {
-            candidate.trust == EvidenceTrust::Authoritative && candidate.basis.is_explicit()
-        })
+        .filter(|candidate| candidate.basis.is_explicit())
         .map(|candidate| candidate.parent)
         .collect::<std::collections::BTreeSet<_>>();
-    if authoritative_explicit_parents.len() > 1 {
+    if explicit_parents.len() > 1 {
         return CorrelationDecision::Ambiguous {
             candidates: all_ranked,
         };

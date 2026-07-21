@@ -145,6 +145,29 @@ fn conflicting_authoritative_relations_never_guess() {
 }
 
 #[test]
+fn conflicting_explicit_relations_never_guess_regardless_of_trust() {
+    let decision = correlate(
+        &[
+            candidate(
+                parent(1),
+                CorrelationBasis::McpRegistration,
+                EvidenceTrust::Corroborating,
+                9_000,
+            ),
+            candidate(
+                parent(2),
+                CorrelationBasis::McpRegistration,
+                EvidenceTrust::Corroborating,
+                9_000,
+            ),
+        ],
+        CorrelationPolicy::default(),
+    );
+
+    assert!(matches!(decision, CorrelationDecision::Ambiguous { .. }));
+}
+
+#[test]
 fn supporting_and_rejected_evidence_are_both_retained() {
     let selected_parent = parent(1);
     let decision = correlate(

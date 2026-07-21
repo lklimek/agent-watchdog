@@ -1719,6 +1719,7 @@ async fn codex_rollout_metadata_discovers_live_hierarchy_without_sqlite_visibili
         fs::create_dir(directory).expect("fixture directory should be created");
     }
     create_rollout_metadata_fixtures(&rollout_root);
+    append_rollout_completion(&rollout_root.join("rollout-main.jsonl"));
     let now_ms = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1763,6 +1764,7 @@ async fn codex_rollout_metadata_discovers_live_hierarchy_without_sqlite_visibili
         .expect("children should query");
     assert_eq!(mains.len(), 1);
     assert_eq!(children.len(), 1);
+    assert_session_state(&store, mains[0].session, DetailedState::WaitingForUser).await;
     assert_eq!(children[0].root, mains[0].root);
     assert_codex_child_metadata(&store, children[0].session).await;
 
@@ -1926,8 +1928,8 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
     ] {
         fs::create_dir(directory).expect("fixture directory should be created");
     }
-    create_rollout_fixtures(&rollout_root);
-    let now_ms = 2_000_000_000_000_i64;
+    create_rollout_metadata_fixtures(&rollout_root);
+    let now_ms = current_time_ms();
     create_codex_state(&state_root.join("state_5.sqlite"), now_ms).await;
     set_codex_version(&state_root.join("state_5.sqlite"), "codex-main", "0.999.0").await;
 
@@ -1946,10 +1948,11 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
         .expect("path mapping should be valid");
     let rollout_mapping = WorktreePathMapping::new("/state", &rollout_root)
         .expect("rollout path mapping should be valid");
+    let codex_roots = [state_root.clone(), rollout_root.clone()];
 
     let report = discovery
         .reconcile(
-            std::slice::from_ref(&state_root),
+            &codex_roots,
             std::slice::from_ref(&rollout_mapping),
             std::slice::from_ref(&mapping),
         )
@@ -1968,18 +1971,7 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
         .expect("children should query");
     assert_eq!(mains.len(), 1);
     assert_eq!(children.len(), 1);
-    assert!(
-        store
-            .snapshot(mains[0].session)
-            .await
-            .expect("main snapshot should query")
-            .expect("main snapshot should exist")
-            .reducer_snapshot()
-            .expect("reducer snapshot should exist")
-            .compatibility_warning()
-            .is_none(),
-        "a different version remains optimistic while its known schema parses"
-    );
+    assert_no_compatibility_warning(&store, mains[0].session).await;
     let child_metadata = store
         .session_metadata(children[0].session)
         .await
@@ -1992,12 +1984,12 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
     );
     assert_repository_metadata(&child_metadata);
 
-    append_rollout_activity(&rollout_root.join("codex-child.jsonl"));
+    append_rollout_activity(&rollout_root.join("rollout-child.jsonl"));
     clock.advance(DurationMs::new(1_000));
 
     let appended = discovery
         .reconcile(
-            std::slice::from_ref(&state_root),
+            &codex_roots,
             std::slice::from_ref(&rollout_mapping),
             std::slice::from_ref(&mapping),
         )
@@ -2015,16 +2007,86 @@ async fn codex_discovery_selects_recent_unarchived_threads_and_exact_spawn_edges
             .last_progress_summary(),
         Some("Codex rollout activity")
     );
+
+    assert_codex_version_drift(
+        &discovery,
+        &store,
+        &clock,
+        &codex_roots,
+        &rollout_root,
+        (&rollout_mapping, &mapping),
+        mains[0].session,
+    )
+    .await;
 }
 
-fn create_rollout_fixtures(rollout_root: &std::path::Path) {
-    for id in ["codex-main", "codex-child"] {
-        fs::write(
-            rollout_root.join(format!("{id}.jsonl")),
-            b"{\"type\":\"event_msg\",\"payload\":{}}\n",
+async fn assert_no_compatibility_warning(store: &WatchdogStore, session: SessionIdentity) {
+    let snapshot = load_snapshot(store, session).await;
+    assert!(
+        snapshot
+            .reducer_snapshot()
+            .expect("reducer snapshot should exist")
+            .compatibility_warning()
+            .is_none(),
+        "a different version remains optimistic while its known schema parses"
+    );
+}
+
+async fn assert_codex_version_drift(
+    discovery: &CodexDiscovery,
+    store: &WatchdogStore,
+    clock: &FakeClock,
+    codex_roots: &[PathBuf],
+    rollout_root: &Path,
+    mappings: (&WorktreePathMapping, &WorktreePathMapping),
+    main: SessionIdentity,
+) {
+    let (rollout_mapping, worktree_mapping) = mappings;
+    let mut rollout = fs::OpenOptions::new()
+        .append(true)
+        .open(rollout_root.join("rollout-main.jsonl"))
+        .expect("main rollout should reopen");
+    rollout
+        .write_all(b"{\"type\":\"future_record\",\"payload\":{}}\n")
+        .expect("schema drift should append");
+    clock.advance(DurationMs::new(1_000));
+
+    let drifted = discovery
+        .reconcile(
+            codex_roots,
+            std::slice::from_ref(rollout_mapping),
+            std::slice::from_ref(worktree_mapping),
         )
-        .expect("rollout fixture should be written");
-    }
+        .await;
+    assert_eq!(drifted.warning_count(), 1);
+    let snapshot = load_snapshot(store, main).await;
+    let warning = snapshot
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist")
+        .compatibility_warning()
+        .expect("major/minor schema drift should be actionable");
+    assert_upgrade_versions(warning, "Codex CLI 0.999.0", "Codex CLI 0.144.5");
+
+    rollout
+        .write_all(b"{\"type\":\"another_future_record\",\"payload\":{}}\n")
+        .expect("versionless schema drift should append");
+    clock.advance(DurationMs::new(1_000));
+    let rollout_roots = [rollout_root.to_path_buf()];
+    let versionless = discovery
+        .reconcile(
+            &rollout_roots,
+            std::slice::from_ref(rollout_mapping),
+            std::slice::from_ref(worktree_mapping),
+        )
+        .await;
+    assert_eq!(versionless.warning_count(), 1);
+    let snapshot = load_snapshot(store, main).await;
+    let warning = snapshot
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist")
+        .compatibility_warning()
+        .expect("versionless drift must not clear detected-version evidence");
+    assert_upgrade_versions(warning, "Codex CLI 0.999.0", "Codex CLI 0.144.5");
 }
 
 fn create_rollout_metadata_fixtures(rollout_root: &std::path::Path) {
@@ -2139,7 +2201,7 @@ async fn create_codex_state(path: &std::path::Path, now_ms: i64) {
     ] {
         sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, archived, git_branch, git_origin_url, cli_version, agent_nickname, recency_at_ms) VALUES (?, ?, 1, 1, 'cli', 'openai', ?, ?, '{}', 'default', ?, 'feat/watchdog', 'https://github.com/lklimek/agent-watchdog.git', '0.144.5', ?, ?)")
             .bind(id)
-            .bind(format!("/state/{id}.jsonl"))
+            .bind(format!("/state/rollout-{}.jsonl", id.trim_start_matches("codex-")))
             .bind(cwd)
             .bind(title)
             .bind(archived)

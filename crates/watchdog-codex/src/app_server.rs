@@ -8,8 +8,9 @@ use serde_json::Value;
 use thiserror::Error;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, CompatibilityWarning, DetailedState, DomainInputError,
-    EvidenceTrust, NativeSessionKey, ObservationEnvelope, ObservationError, ObservationId,
-    ObservationPayload, ObservationSource, RuntimeKind, SessionKind, TimePoint, WarningKind,
+    EvidenceTrust, MAX_ADAPTER_VERSION_BYTES, NativeSessionKey, ObservationEnvelope,
+    ObservationError, ObservationId, ObservationPayload, ObservationSource, RuntimeKind,
+    SessionKind, TimePoint, WarningKind,
 };
 
 /// Largest accepted app-server JSONL/WebSocket message.
@@ -393,21 +394,28 @@ impl CodexParseError {
     }
 
     fn compatibility_warning_message(detected_version: Option<&str>) -> CompatibilityWarning {
-        let message = detected_version.map_or_else(
-            || {
-                format!(
-                    "Update Agent Watchdog's Codex adapter; tested with Codex CLI {}",
-                    crate::TESTED_CODEX_VERSION
-                )
-            },
-            |detected_version| {
-                format!(
-                    "Update Agent Watchdog's Codex adapter; detected Codex CLI {detected_version}, tested with Codex CLI {}",
-                    crate::TESTED_CODEX_VERSION
-                )
-            },
-        );
-        CompatibilityWarning::new(WarningKind::Upgrade, message)
-            .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))
+        if let Some(detected_version) = detected_version
+            .filter(|version| !version.is_empty() && version.len() <= MAX_ADAPTER_VERSION_BYTES)
+        {
+            let message = format!(
+                "Update Agent Watchdog's Codex adapter; detected Codex CLI {detected_version}, tested with Codex CLI {}",
+                crate::TESTED_CODEX_VERSION
+            );
+            if let Ok(warning) = CompatibilityWarning::new_with_detected_version(
+                WarningKind::Upgrade,
+                message,
+                detected_version,
+            ) {
+                return warning;
+            }
+        }
+        CompatibilityWarning::new(
+            WarningKind::Upgrade,
+            format!(
+                "Update Agent Watchdog's Codex adapter; tested with Codex CLI {}",
+                crate::TESTED_CODEX_VERSION
+            ),
+        )
+        .unwrap_or_else(|_| unreachable!("static compatibility warning is bounded"))
     }
 }

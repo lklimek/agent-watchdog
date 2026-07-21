@@ -477,7 +477,7 @@ impl AdapterHealthStatus {
 /// Persisted adapter health without unbounded native error content.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdapterHealthRecord {
-    /// Runtime and tested version.
+    /// Runtime and best available native version evidence.
     pub adapter: AdapterIdentity,
     /// Current component health.
     pub status: AdapterHealthStatus,

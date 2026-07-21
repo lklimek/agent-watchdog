@@ -3,7 +3,8 @@ use thiserror::Error;
 
 use crate::{BoundedText, DomainInputError, RuntimeKind};
 
-const MAX_ADAPTER_VERSION_BYTES: usize = 128;
+/// Maximum UTF-8 bytes retained for native runtime version evidence.
+pub const MAX_ADAPTER_VERSION_BYTES: usize = 128;
 const MAX_SOURCE_FINGERPRINT_BYTES: usize = 512;
 
 /// Trust assigned to one evidence source before deterministic reduction.
@@ -62,7 +63,7 @@ pub struct ConfidenceError {
     basis_points: u16,
 }
 
-/// Runtime adapter name and tested native version.
+/// Runtime adapter name and best available native version evidence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct AdapterIdentity {
     runtime: RuntimeKind,

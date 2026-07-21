@@ -1,13 +1,15 @@
 //! Codex app-server and read-only state fallback contracts.
 
+use std::error::Error as _;
+
 use sqlx::sqlite::SqliteConnectOptions;
 use watchdog_codex::{
-    CodexAppServerParser, CodexHookParser, CodexParseError, CodexRolloutParser, CodexStateReader,
-    MAX_APP_SERVER_BYTES,
+    CodexAppServerParser, CodexHookParser, CodexParseError, CodexRolloutParser, CodexStateError,
+    CodexStateReader, MAX_APP_SERVER_BYTES,
 };
 use watchdog_domain::{
-    DetailedState, NativeSessionKey, ObservationPayload, RuntimeKind, SessionKind, TimePoint,
-    WallTimeMs,
+    DetailedState, DomainInputError, NativeSessionKey, ObservationPayload, RuntimeKind,
+    SessionKind, TimePoint, WallTimeMs,
 };
 
 fn now() -> TimePoint {
@@ -103,6 +105,7 @@ fn schema_drift_and_oversize_become_upgrade_errors() {
     let warning = drift.compatibility_warning_for_version("0.150.0");
     assert!(warning.message().contains("detected Codex CLI 0.150.0"));
     assert!(warning.message().contains("tested with Codex CLI 0.144.5"));
+    assert_eq!(warning.detected_version(), Some("0.150.0"));
     assert!(!drift.to_string().contains("future/event"));
 
     let oversized = vec![b'x'; MAX_APP_SERVER_BYTES + 1];
@@ -110,6 +113,38 @@ fn schema_drift_and_oversize_become_upgrade_errors() {
         parser.parse_notification(&oversized, "large", now()),
         Err(CodexParseError::InputTooLarge { .. })
     ));
+}
+
+#[test]
+fn oversized_detected_version_falls_back_to_bounded_warning() {
+    let parser = CodexAppServerParser::new("future-version").expect("version should be valid");
+    let error = parser
+        .parse_notification(
+            br#"{"method":"future/event","params":{}}"#,
+            "app-event-long-version",
+            now(),
+        )
+        .expect_err("unknown method should not invent state");
+
+    let warning = error.compatibility_warning_for_version(&"v".repeat(1_024));
+
+    assert_eq!(warning.badge(), "UPGRADE");
+    assert!(warning.message().contains("tested with Codex CLI"));
+    assert!(warning.detected_version().is_none());
+}
+
+#[test]
+fn codex_state_error_preserves_domain_source() {
+    let error = CodexStateError::from(DomainInputError::TooLong {
+        field: "cli_version",
+        max_bytes: 128,
+        actual_bytes: 129,
+    });
+
+    let source = error
+        .source()
+        .expect("domain error source should be retained");
+    assert!(source.to_string().contains("cli_version"));
 }
 
 #[test]

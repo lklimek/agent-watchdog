@@ -285,7 +285,7 @@ impl fmt::Debug for CodexThread {
 }
 
 /// Read-only local-state failure without database path or native SQL content.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CodexStateError {
     /// Database could not be opened read-only.
     #[error("Codex state database could not be opened read-only")]
@@ -298,13 +298,7 @@ pub enum CodexStateError {
     Schema,
     /// A selected native field violated a bounded domain contract.
     #[error("Codex state contains an invalid bounded field")]
-    Domain,
-}
-
-impl From<DomainInputError> for CodexStateError {
-    fn from(_value: DomainInputError) -> Self {
-        Self::Domain
-    }
+    Domain(#[from] DomainInputError),
 }
 
 fn native_key(value: &str) -> Result<NativeSessionKey, CodexStateError> {
