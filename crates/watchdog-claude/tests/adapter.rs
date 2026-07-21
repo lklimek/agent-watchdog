@@ -141,6 +141,24 @@ fn malformed_or_drifted_hook_returns_an_actionable_bounded_error() {
 }
 
 #[test]
+fn oversized_detected_version_falls_back_to_bounded_warning() {
+    let parser = ClaudeHookParser::new("future-version").expect("version should be bounded");
+    let error = parser
+        .parse_hook(
+            br#"{"session_id":"main-1","cwd":"/work","hook_event_name":"NewEvent"}"#,
+            "hook-file-long-version",
+            now(),
+        )
+        .expect_err("unknown event must not invent state");
+
+    let warning = error.compatibility_warning_for_version(&"v".repeat(1_024));
+
+    assert_eq!(warning.badge(), "UPGRADE");
+    assert!(warning.message().contains("tested with Claude Code"));
+    assert!(warning.detected_version().is_none());
+}
+
+#[test]
 fn oversized_hook_is_rejected_before_json_allocation() {
     let parser = ClaudeHookParser::new(TESTED_CLAUDE_VERSION).expect("version should be valid");
     let input = vec![b'x'; watchdog_claude::MAX_HOOK_BYTES + 1];

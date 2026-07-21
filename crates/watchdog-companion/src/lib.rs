@@ -519,7 +519,8 @@ fn normalize_state(status: &str) -> Result<DetailedState, CompanionParseError> {
     match status {
         "queued" => Ok(DetailedState::Starting),
         "running" => Ok(DetailedState::Running),
-        "completed" | "cancelled" => Ok(DetailedState::Completed),
+        "completed" => Ok(DetailedState::Completed),
+        "cancelled" => Ok(DetailedState::Cancelled),
         "failed" => Ok(DetailedState::Failed),
         _ => Err(CompanionParseError::UnsupportedState),
     }

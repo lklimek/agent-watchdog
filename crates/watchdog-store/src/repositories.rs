@@ -850,7 +850,7 @@ impl WatchdogStore {
         }))
     }
 
-    /// Upsert one runtime adapter's bounded health record.
+    /// Upsert health while preserving richer major/minor version evidence.
     ///
     /// # Errors
     ///
@@ -860,13 +860,20 @@ impl WatchdogStore {
         record: &AdapterHealthRecord,
     ) -> Result<(), StoreError> {
         let payload = bounded_json(record, "adapter health")?;
+        let version_richness = i64::from(version_has_major_minor_detail(record.adapter.version()));
         sqlx::query(
             "INSERT INTO adapter_health \
-             (adapter, runtime, version, status, last_success_ms, last_error_ms, affected_scope, message, health_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(adapter) DO UPDATE SET \
-             version = excluded.version, status = excluded.status, \
+             (adapter, runtime, version, status, last_success_ms, last_error_ms, affected_scope, message, health_json, version_richness) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(adapter) DO UPDATE SET \
+             version = CASE WHEN excluded.version_richness >= adapter_health.version_richness \
+                 THEN excluded.version ELSE adapter_health.version END, \
+             status = excluded.status, \
              last_success_ms = excluded.last_success_ms, last_error_ms = excluded.last_error_ms, \
-             affected_scope = excluded.affected_scope, message = excluded.message, health_json = excluded.health_json",
+             affected_scope = excluded.affected_scope, message = excluded.message, \
+             health_json = CASE WHEN excluded.version_richness >= adapter_health.version_richness \
+                 THEN excluded.health_json ELSE CAST(json_set(CAST(excluded.health_json AS TEXT), \
+                 '$.adapter.version', adapter_health.version) AS BLOB) END, \
+             version_richness = MAX(adapter_health.version_richness, excluded.version_richness)",
         )
         .bind(record.adapter.runtime().as_str())
         .bind(record.adapter.runtime().as_str())
@@ -877,6 +884,7 @@ impl WatchdogStore {
         .bind(record.affected_scope.as_ref().map(BoundedText::as_str))
         .bind(record.message.as_ref().map(BoundedText::as_str))
         .bind(payload)
+        .bind(version_richness)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1056,4 +1064,19 @@ fn decode_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, Stor
         });
     }
     Ok(serde_json::from_slice(payload)?)
+}
+
+fn version_has_major_minor_detail(version: &str) -> bool {
+    let core = version
+        .strip_prefix('v')
+        .unwrap_or(version)
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(version);
+    let mut parts = core.split('.');
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(major), Some(minor))
+            if major.parse::<u64>().is_ok() && minor.parse::<u64>().is_ok()
+    )
 }

@@ -370,10 +370,7 @@ fn apply_observation(
             apply_intentional_wait(snapshot, observation.observed_at(), events);
         }
         ObservationPayload::Compatibility(warning) => {
-            if snapshot.compatibility_warning.as_ref() != Some(warning) {
-                snapshot.compatibility_warning = Some(warning.clone());
-                events.push(DomainEventKind::CompatibilityChanged);
-            }
+            apply_compatibility_warning(snapshot, warning, events);
         }
         ObservationPayload::CompatibilityResolved => {
             if snapshot.compatibility_warning.take().is_some() {
@@ -405,6 +402,22 @@ fn apply_observation(
             }
         }
         ObservationPayload::SchedulerTick => {}
+    }
+}
+
+fn apply_compatibility_warning(
+    snapshot: &mut SessionSnapshot,
+    incoming: &CompatibilityWarning,
+    events: &mut Vec<DomainEventKind>,
+) {
+    let existing = snapshot.compatibility_warning.as_ref();
+    if existing != Some(incoming)
+        && !existing.is_some_and(|warning| {
+            warning.has_detected_version() && !incoming.has_detected_version()
+        })
+    {
+        snapshot.compatibility_warning = Some(incoming.clone());
+        events.push(DomainEventKind::CompatibilityChanged);
     }
 }
 

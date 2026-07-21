@@ -35,6 +35,7 @@ const MAX_CLAUDE_ALIAS_CACHE: usize = 2_048;
 const MAX_CLAUDE_SESSIONS: u32 = 1_000;
 const CODEX_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_CODEX_THREADS: u32 = 1_000;
+const CODEX_VERSION_UNKNOWN: &str = "unknown";
 const CODEX_ROLLOUT_PARSER_VERSION: u32 = 1;
 const MAX_CODEX_ROLLOUT_BATCHES: usize = 4;
 const MAX_CODEX_ROLLOUT_BATCH_BYTES: usize = 2 * 1_024 * 1_024;
@@ -1832,10 +1833,8 @@ impl ClaudeDiscovery {
         event_key: &str,
         warning: watchdog_domain::CompatibilityWarning,
     ) -> Option<ObservationId> {
-        if !warning.message().contains("detected Claude Code ")
-            && self
-                .warning_has_detected_claude_version(&candidate.subject)
-                .await
+        if !warning.has_detected_version()
+            && stored_warning_has_detected_version(&self.store, &candidate.subject).await
         {
             return None;
         }
@@ -1886,25 +1885,28 @@ impl ClaudeDiscovery {
             .ok()
             .map(|_| observation_id)
     }
+}
 
-    async fn warning_has_detected_claude_version(&self, subject: &NativeSessionKey) -> bool {
-        let session_id = SessionId::from_native(subject);
-        let Ok(Some(record)) = self.store.session_by_id(session_id).await else {
-            return false;
-        };
-        self.store
-            .snapshot(record.session)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|snapshot| {
-                snapshot
-                    .reducer_snapshot()
-                    .and_then(watchdog_domain::SessionSnapshot::compatibility_warning)
-                    .map(|warning| warning.message().contains("detected Claude Code "))
-            })
-            .unwrap_or(false)
-    }
+async fn stored_warning_has_detected_version(
+    store: &WatchdogStore,
+    subject: &NativeSessionKey,
+) -> bool {
+    let session_id = SessionId::from_native(subject);
+    let Ok(Some(record)) = store.session_by_id(session_id).await else {
+        return false;
+    };
+    store
+        .snapshot(record.session)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|snapshot| {
+            snapshot
+                .reducer_snapshot()
+                .and_then(watchdog_domain::SessionSnapshot::compatibility_warning)
+                .map(watchdog_domain::CompatibilityWarning::has_detected_version)
+        })
+        .unwrap_or(false)
 }
 
 fn claude_transcript_reader() -> IncrementalReader {
@@ -2581,15 +2583,16 @@ impl CodexDiscovery {
                 .value()
                 .saturating_sub(CODEX_BOOTSTRAP_WINDOW_MS),
         );
-        self.reconcile_rollout_roots(
-            codex_roots,
-            codex_path_mappings,
-            worktree_mappings,
-            &mut report,
-            &mut mains,
-            &mut children,
-        )
-        .await;
+        let rollout_sources = self
+            .reconcile_rollout_roots(
+                codex_roots,
+                codex_path_mappings,
+                worktree_mappings,
+                &mut report,
+                &mut mains,
+                &mut children,
+            )
+            .await;
         for configured_root in codex_roots {
             let Ok(root) = CapabilityRoot::new(configured_root) else {
                 report.warn();
@@ -2638,6 +2641,20 @@ impl CodexDiscovery {
             )
             .await;
         }
+        for source in rollout_sources {
+            self.reconcile_codex_rollout_source(
+                CodexRolloutTarget {
+                    subject: &source.subject,
+                    kind: source.kind,
+                },
+                CODEX_VERSION_UNKNOWN,
+                &source.candidate.root,
+                &source.candidate.relative,
+                &source.candidate.path_key,
+                &mut report,
+            )
+            .await;
+        }
         report
     }
 
@@ -2649,7 +2666,8 @@ impl CodexDiscovery {
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
-    ) {
+    ) -> Vec<CodexBootstrapRollout> {
+        let mut sources = Vec::new();
         let parent_index = if let Ok(index) = self.claude_parent_index(worktree_mappings).await {
             index
         } else {
@@ -2659,7 +2677,7 @@ impl CodexDiscovery {
         let Ok(budget) = ScanBudget::new(MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES)
         else {
             report.warn();
-            return;
+            return sources;
         };
         let scanner = DirectoryScanner::new(budget).with_order(ScanOrder::Descending);
         for configured_root in codex_roots {
@@ -2683,17 +2701,26 @@ impl CodexDiscovery {
                 ) else {
                     continue;
                 };
-                self.reconcile_rollout_candidate(
-                    &candidate,
-                    &parent_index,
-                    worktree_mappings,
-                    report,
-                    mains,
-                    children,
-                )
-                .await;
+                if let Some((subject, kind)) = self
+                    .reconcile_rollout_candidate(
+                        &candidate,
+                        &parent_index,
+                        worktree_mappings,
+                        report,
+                        mains,
+                        children,
+                    )
+                    .await
+                {
+                    sources.push(CodexBootstrapRollout {
+                        candidate,
+                        subject,
+                        kind,
+                    });
+                }
             }
         }
+        sources
     }
 
     async fn reconcile_rollout_candidate(
@@ -2704,18 +2731,18 @@ impl CodexDiscovery {
         report: &mut RuntimeDiscoveryReport,
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
-    ) {
+    ) -> Option<(NativeSessionKey, SessionKind)> {
         let metadata = match parse_codex_rollout_metadata(candidate, self.clock.now()) {
             Ok(Some(metadata)) => metadata,
-            Ok(None) => return,
+            Ok(None) => return None,
             Err(()) => {
                 report.warn();
-                return;
+                return None;
             }
         };
         let Some(mut kind) = metadata.kind() else {
             report.warn();
-            return;
+            return None;
         };
         let mut parent = match metadata.parent() {
             Some(parent) => {
@@ -2738,7 +2765,7 @@ impl CodexDiscovery {
                         .is_err()
                     {
                         report.warn();
-                        return;
+                        return None;
                     }
                     mains.insert(parent_id);
                     report.main_sessions = report.main_sessions.saturating_add(1);
@@ -2772,7 +2799,7 @@ impl CodexDiscovery {
             .await
         else {
             report.warn();
-            return;
+            return None;
         };
         if self
             .enrich_rollout_repository(view.session, &metadata)
@@ -2789,18 +2816,7 @@ impl CodexDiscovery {
         {
             report.warn();
         }
-        self.reconcile_codex_rollout_source(
-            CodexRolloutTarget {
-                subject: metadata.subject(),
-                kind,
-            },
-            watchdog_codex::TESTED_CODEX_VERSION,
-            &candidate.root,
-            &candidate.relative,
-            &candidate.path_key,
-            report,
-        )
-        .await;
+        Some((metadata.subject().clone(), kind))
     }
 
     async fn reconcile_codex_bootstrap_tail(
@@ -3149,6 +3165,9 @@ impl CodexDiscovery {
             }
             Err(error) => {
                 report.warn();
+                if semver_compatibility_line(adapter_version).is_none() {
+                    return Ok(None);
+                }
                 if !minor_version_mismatch(adapter_version, watchdog_codex::TESTED_CODEX_VERSION) {
                     return Ok(self
                         .emit_codex_compatibility_resolution(
@@ -3201,6 +3220,11 @@ impl CodexDiscovery {
         event_key: &str,
         warning: watchdog_domain::CompatibilityWarning,
     ) -> Option<ObservationId> {
+        if !warning.has_detected_version()
+            && stored_warning_has_detected_version(&self.store, subject).await
+        {
+            return None;
+        }
         self.emit_codex_compatibility_payload(
             subject,
             adapter_version,
@@ -3424,6 +3448,12 @@ struct CodexRolloutCandidate {
     root: CapabilityRoot,
     relative: PathBuf,
     path_key: BoundedText<4_096>,
+}
+
+struct CodexBootstrapRollout {
+    candidate: CodexRolloutCandidate,
+    subject: NativeSessionKey,
+    kind: SessionKind,
 }
 
 #[derive(Clone, Copy)]
@@ -3818,13 +3848,18 @@ fn is_concrete_absolute(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink, path::Path};
+    use std::{fs, os::unix::fs::symlink, path::Path, sync::Arc};
 
-    use watchdog_domain::{NativeSessionKey, RuntimeKind, SessionId};
+    use watchdog_domain::{
+        CompatibilityWarning, NativeSessionKey, RuntimeKind, SessionId, SessionKind, TimePoint,
+        WallTimeMs, WarningKind,
+    };
+    use watchdog_store::WatchdogStore;
+    use watchdog_testkit::FakeClock;
 
     use super::{
-        CodexCorrelationLogCache, DiscoveryAliasRegistry, WorktreePathMapping,
-        minor_version_mismatch,
+        AgentApi, CODEX_VERSION_UNKNOWN, CodexCorrelationLogCache, CodexDiscovery,
+        DiscoveredSession, DiscoveryAliasRegistry, WorktreePathMapping, minor_version_mismatch,
     };
 
     fn session(runtime: RuntimeKind, native_id: &str) -> SessionId {
@@ -3869,6 +3904,80 @@ mod tests {
         assert!(minor_version_mismatch("2.2.0", "2.1.214"));
         assert!(minor_version_mismatch("3.1.0", "2.1.214"));
         assert!(!minor_version_mismatch("unknown", "2.1.214"));
+    }
+
+    #[tokio::test]
+    async fn codex_emitter_rejects_a_versionless_warning_downgrade() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(
+            WallTimeMs::new(1_000),
+            1_000,
+        )));
+        let api = AgentApi::new(store.clone(), clock.clone())
+            .await
+            .expect("API should initialize");
+        let view = api
+            .discover_session(DiscoveredSession {
+                runtime: RuntimeKind::CodexCli,
+                native_id: "codex-rich-warning".to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "codex-rich-warning-discovery".to_owned(),
+                adapter_version: "0.999.0".to_owned(),
+                evidence_source: "test:codex-rich-warning".to_owned(),
+                title: None,
+                startup_directory: None,
+            })
+            .await
+            .expect("session should be discovered");
+        let subject = NativeSessionKey::new(RuntimeKind::CodexCli, "codex-rich-warning")
+            .expect("subject should be valid");
+        let discovery = CodexDiscovery::new(api, store.clone(), clock);
+        let rich = CompatibilityWarning::new_with_detected_version(
+            WarningKind::Upgrade,
+            "detected Codex CLI 0.999.0, tested with Codex CLI 0.144.5",
+            "0.999.0",
+        )
+        .expect("rich warning should be valid");
+        assert!(
+            discovery
+                .emit_codex_compatibility_warning(&subject, "0.999.0", "rich", rich)
+                .await
+                .is_some()
+        );
+        let versionless = CompatibilityWarning::new(
+            WarningKind::Upgrade,
+            "Update Agent Watchdog's Codex adapter",
+        )
+        .expect("versionless warning should be valid");
+
+        assert!(
+            discovery
+                .emit_codex_compatibility_warning(
+                    &subject,
+                    CODEX_VERSION_UNKNOWN,
+                    "versionless",
+                    versionless,
+                )
+                .await
+                .is_none()
+        );
+        let snapshot = store
+            .snapshot(view.session)
+            .await
+            .expect("snapshot should query")
+            .expect("snapshot should exist");
+        assert_eq!(
+            snapshot
+                .reducer_snapshot()
+                .expect("reducer snapshot should exist")
+                .compatibility_warning()
+                .and_then(CompatibilityWarning::detected_version),
+            Some("0.999.0")
+        );
     }
 
     #[test]

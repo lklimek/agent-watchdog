@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
-use crate::{BoundedText, DomainInputError, WallTimeMs};
+use crate::{BoundedText, DomainInputError, MAX_ADAPTER_VERSION_BYTES, WallTimeMs};
 
 const MAX_WARNING_MESSAGE_BYTES: usize = 1_024;
 
@@ -147,6 +147,8 @@ pub enum WarningKind {
 pub struct CompatibilityWarning {
     kind: WarningKind,
     message: BoundedText<MAX_WARNING_MESSAGE_BYTES>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detected_version: Option<BoundedText<MAX_ADAPTER_VERSION_BYTES>>,
 }
 
 impl<'de> Deserialize<'de> for CompatibilityWarning {
@@ -158,10 +160,19 @@ impl<'de> Deserialize<'de> for CompatibilityWarning {
         struct RawCompatibilityWarning {
             kind: WarningKind,
             message: String,
+            #[serde(default)]
+            detected_version: Option<String>,
         }
 
         let raw = RawCompatibilityWarning::deserialize(deserializer)?;
-        Self::new(raw.kind, raw.message).map_err(de::Error::custom)
+        let detected_version = raw
+            .detected_version
+            .or_else(|| legacy_detected_version(&raw.message).map(std::borrow::ToOwned::to_owned));
+        match detected_version {
+            Some(version) => Self::new_with_detected_version(raw.kind, raw.message, version),
+            None => Self::new(raw.kind, raw.message),
+        }
+        .map_err(de::Error::custom)
     }
 }
 
@@ -176,7 +187,32 @@ impl CompatibilityWarning {
         if message.is_empty() {
             return Err(DomainInputError::Empty { field: "warning" });
         }
-        Ok(Self { kind, message })
+        Ok(Self {
+            kind,
+            message,
+            detected_version: None,
+        })
+    }
+
+    /// Construct a warning backed by a bounded detected native version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainInputError`] when the message or version is empty or oversized.
+    pub fn new_with_detected_version(
+        kind: WarningKind,
+        message: impl Into<String>,
+        detected_version: impl Into<String>,
+    ) -> Result<Self, DomainInputError> {
+        let mut warning = Self::new(kind, message)?;
+        let detected_version = BoundedText::new("detected_version", detected_version)?;
+        if detected_version.is_empty() {
+            return Err(DomainInputError::Empty {
+                field: "detected_version",
+            });
+        }
+        warning.detected_version = Some(detected_version);
+        Ok(warning)
     }
 
     /// Single-word actionable UI badge.
@@ -199,4 +235,28 @@ impl CompatibilityWarning {
     pub fn message(&self) -> &str {
         self.message.as_str()
     }
+
+    /// Detected native version supporting this warning, when available.
+    #[must_use]
+    pub fn detected_version(&self) -> Option<&str> {
+        self.detected_version.as_ref().map(BoundedText::as_str)
+    }
+
+    /// Whether this warning includes detected-version evidence.
+    #[must_use]
+    pub const fn has_detected_version(&self) -> bool {
+        self.detected_version.is_some()
+    }
+}
+
+fn legacy_detected_version(message: &str) -> Option<&str> {
+    ["detected Claude Code ", "detected Codex CLI "]
+        .into_iter()
+        .find_map(|prefix| {
+            message
+                .split_once(prefix)
+                .and_then(|(_, suffix)| suffix.split_once(", tested with "))
+                .map(|(version, _)| version)
+                .filter(|version| !version.is_empty() && version.len() <= MAX_ADAPTER_VERSION_BYTES)
+        })
 }

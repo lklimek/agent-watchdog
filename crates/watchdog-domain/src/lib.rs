@@ -21,7 +21,8 @@ pub use correlation::{
 };
 pub use event::{DomainEvent, DomainEventKind, EventId};
 pub use evidence::{
-    AdapterIdentity, Confidence, ConfidenceError, EvidenceTrust, ObservationSource,
+    AdapterIdentity, Confidence, ConfidenceError, EvidenceTrust, MAX_ADAPTER_VERSION_BYTES,
+    ObservationSource,
 };
 pub use identity::{
     ChildSessionId, MainSessionId, NativeSessionKey, ObservationId, RuntimeKind, SessionId,

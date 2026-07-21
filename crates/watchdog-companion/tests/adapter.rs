@@ -48,6 +48,20 @@ fn summary_exposes_workspace_session_pid_phase_and_status() {
 }
 
 #[test]
+fn cancelled_summary_remains_distinct_from_completed() {
+    let parser = CompanionParser::new("1.0.6").expect("version should be valid");
+    let snapshot = parser
+        .parse_summary(
+            br#"{"version":1,"jobs":[{
+                "id":"task-cancelled","workspaceRoot":"/work/tree","status":"cancelled"
+            }]}"#,
+        )
+        .expect("cancelled summary should parse");
+
+    assert_eq!(snapshot.jobs()[0].state(), DetailedState::Cancelled);
+}
+
+#[test]
 fn non_atomic_active_terminal_pair_becomes_unknown_not_false_completion() {
     let parser = CompanionParser::new("1.0.6").expect("version should be valid");
     let summary = parser
