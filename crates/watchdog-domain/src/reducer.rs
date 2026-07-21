@@ -176,6 +176,12 @@ impl SessionSnapshot {
         self.last_trusted_transition
     }
 
+    /// Observation that most recently advanced this snapshot, when present.
+    #[must_use]
+    pub const fn last_observation_id(&self) -> Option<ObservationId> {
+        self.last_observation_id
+    }
+
     /// Whether material sources currently disagree.
     #[must_use]
     pub const fn source_conflict(&self) -> bool {

@@ -10,15 +10,15 @@ use thiserror::Error;
 #[cfg(target_os = "linux")]
 use watchdog_domain::ProcessId;
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, Clock, DetailedState, EvidenceTrust, NativeSessionKey,
-    ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource, RuntimeKind,
-    SessionId, SessionIdentity, SessionKind, TimePoint,
+    AdapterIdentity, BoundedText, Clock, DetailedState, DomainInputError, EvidenceTrust,
+    NativeSessionKey, ObservationEnvelope, ObservationId, ObservationPayload, ObservationSource,
+    RuntimeKind, SessionId, SessionIdentity, SessionKind, TimePoint,
 };
 use watchdog_runtime::{
     CapabilityRoot, DirectoryScanner, FileCursor, FileIdentity, IncrementalReader, ReadBudget,
     ReadOutcome, ScanBudget, ScanOrder,
 };
-use watchdog_store::{FileCursorRecord, WatchdogStore};
+use watchdog_store::{FileCursorRecord, RecordInputError, StoreError, WatchdogStore};
 
 use crate::{AgentApi, DiscoveredSession, GitHubEnricher, RepositoryMetadata};
 
@@ -143,6 +143,16 @@ pub enum PathMappingError {
     InvalidMountedRoot,
 }
 
+#[derive(Debug, Error)]
+enum CursorPersistenceError {
+    #[error("Discovery cursor field is invalid: {0}")]
+    Domain(#[from] DomainInputError),
+    #[error("Discovery cursor record is invalid: {0}")]
+    Record(#[from] RecordInputError),
+    #[error("Discovery cursor could not be persisted: {0}")]
+    Store(#[from] StoreError),
+}
+
 /// Bounded best-effort result of one runtime reconciliation pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeDiscoveryReport {
@@ -179,6 +189,42 @@ impl RuntimeDiscoveryReport {
     fn warn(&mut self) {
         self.warning_count = self.warning_count.saturating_add(1);
     }
+}
+
+#[derive(Clone, Copy)]
+struct MainParentDiscovery<'a> {
+    runtime: RuntimeKind,
+    event_key_prefix: &'a str,
+    adapter_version: &'a str,
+    evidence_source: &'a str,
+}
+
+async fn ensure_main_parent(
+    api: &AgentApi,
+    parent: &NativeSessionKey,
+    discovery: MainParentDiscovery<'_>,
+    mains: &mut BTreeSet<SessionId>,
+    report: &mut RuntimeDiscoveryReport,
+) -> Result<SessionId, crate::AgentApiError> {
+    let parent_id = SessionId::from_native(parent);
+    if mains.contains(&parent_id) {
+        return Ok(parent_id);
+    }
+    api.discover_session(DiscoveredSession {
+        runtime: discovery.runtime,
+        native_id: parent.native_id().to_owned(),
+        kind: SessionKind::Main,
+        parent: None,
+        event_key: discovery_key(discovery.event_key_prefix, parent_id),
+        adapter_version: discovery.adapter_version.to_owned(),
+        evidence_source: discovery.evidence_source.to_owned(),
+        title: None,
+        startup_directory: None,
+    })
+    .await?;
+    mains.insert(parent_id);
+    report.main_sessions = report.main_sessions.saturating_add(1);
+    Ok(parent_id)
 }
 
 /// Claude team reconciliation report.
@@ -379,19 +425,43 @@ impl ClaudeTeamTranscriptAliases {
 /// Bounded in-process aliases from wrapper-native sessions to canonical
 /// discovered sessions. Claude reconciliation repopulates it before Companion
 /// reconciliation on every server start.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DiscoveryAliasRegistry {
     aliases: Arc<Mutex<HashMap<NativeSessionKey, Option<SessionId>>>>,
+    capacity: usize,
+}
+
+impl Default for DiscoveryAliasRegistry {
+    fn default() -> Self {
+        Self {
+            aliases: Arc::new(Mutex::new(HashMap::new())),
+            capacity: MAX_CLAUDE_ALIAS_CACHE,
+        }
+    }
 }
 
 impl DiscoveryAliasRegistry {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            aliases: Arc::new(Mutex::new(HashMap::new())),
+            capacity,
+        }
+    }
+
     fn bind(&self, alias: NativeSessionKey, canonical: SessionId) {
         let mut aliases = self
             .aliases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if aliases.len() >= MAX_CLAUDE_ALIAS_CACHE && !aliases.contains_key(&alias) {
-            aliases.clear();
+        if aliases.len() >= self.capacity && !aliases.contains_key(&alias) {
+            let removable = aliases
+                .iter()
+                .find_map(|(key, canonical)| canonical.is_some().then(|| key.clone()));
+            let Some(removable) = removable else {
+                return;
+            };
+            aliases.remove(&removable);
         }
         match aliases.entry(alias) {
             Entry::Vacant(entry) => {
@@ -1200,6 +1270,7 @@ impl ClaudeDiscovery {
             .prepare_transcript_candidate(root, candidate, aliases)
             .await
         else {
+            log_claude_transcript_prepare_failure();
             report.warn();
             return;
         };
@@ -1207,11 +1278,17 @@ impl ClaudeDiscovery {
             .ensure_transcript_parent(&candidate, mains, report)
             .await
         else {
+            log_claude_parent_failure();
             report.warn();
             return;
         };
         let session_id = SessionId::from_native(&candidate.subject);
         let Ok(existing) = self.existing_metadata(session_id).await else {
+            tracing::warn!(
+                event = "discovery.claude_metadata_failed",
+                session_id = %session_id,
+                "Claude transcript metadata could not be loaded"
+            );
             report.warn();
             return;
         };
@@ -1402,27 +1479,21 @@ impl ClaudeDiscovery {
         let Some(parent_native) = candidate.parent.as_ref() else {
             return Ok(None);
         };
-        let parent_id = SessionId::from_native(parent_native);
-        if mains.contains(&parent_id) {
-            return Ok(Some(parent_id));
-        }
-        self.api
-            .discover_session(DiscoveredSession {
+        ensure_main_parent(
+            &self.api,
+            parent_native,
+            MainParentDiscovery {
                 runtime: RuntimeKind::ClaudeCode,
-                native_id: parent_native.native_id().to_owned(),
-                kind: SessionKind::Main,
-                parent: None,
-                event_key: discovery_key("claude-transcript-parent", parent_id),
-                adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
-                evidence_source: "claude:transcript-path".to_owned(),
-                title: None,
-                startup_directory: None,
-            })
-            .await
-            .map_err(|_| ())?;
-        mains.insert(parent_id);
-        report.main_sessions = report.main_sessions.saturating_add(1);
-        Ok(Some(parent_id))
+                event_key_prefix: "claude-transcript-parent",
+                adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION,
+                evidence_source: "claude:transcript-path",
+            },
+            mains,
+            report,
+        )
+        .await
+        .map(Some)
+        .map_err(|_| ())
     }
 
     async fn existing_metadata(
@@ -1625,11 +1696,15 @@ impl ClaudeDiscovery {
             match reader.cursor_at_end(root, &candidate.relative, CLAUDE_TRANSCRIPT_PARSER_VERSION)
             {
                 Ok(cursor) => {
-                    if self
+                    if let Err(error) = self
                         .persist_claude_cursor(&candidate.path_key, &cursor, None)
                         .await
-                        .is_err()
                     {
+                        tracing::warn!(
+                            event = "discovery.claude_cursor_initialize_failed",
+                            error = %error,
+                            "Claude transcript cursor could not be initialized"
+                        );
                         report.warn();
                     }
                 }
@@ -1669,13 +1744,20 @@ impl ClaudeDiscovery {
                     CLAUDE_TRANSCRIPT_PARSER_VERSION,
                 ) {
                     Ok(new_cursor) => {
-                        let _ = self
+                        if let Err(error) = self
                             .persist_claude_cursor(
                                 &candidate.path_key,
                                 &new_cursor,
                                 last_observation_id,
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                event = "discovery.claude_cursor_recovery_failed",
+                                error = %error,
+                                "Claude transcript recovery cursor could not be persisted"
+                            );
+                        }
                     }
                     Err(_) => report.warn(),
                 }
@@ -1708,11 +1790,15 @@ impl ClaudeDiscovery {
                 }
             }
             cursor = batch.cursor().clone();
-            if self
+            if let Err(error) = self
                 .persist_claude_cursor(&candidate.path_key, &cursor, last_observation_id)
                 .await
-                .is_err()
             {
+                tracing::warn!(
+                    event = "discovery.claude_cursor_persist_failed",
+                    error = %error,
+                    "Claude transcript cursor could not be persisted"
+                );
                 report.warn();
                 return;
             }
@@ -1809,7 +1895,7 @@ impl ClaudeDiscovery {
         path_key: &BoundedText<4_096>,
         cursor: &FileCursor,
         last_observation_id: Option<ObservationId>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), CursorPersistenceError> {
         let record = FileCursorRecord::new(
             path_key.clone(),
             cursor.identity().device(),
@@ -1819,12 +1905,11 @@ impl ClaudeDiscovery {
             BoundedText::new(
                 "parser_version",
                 format!("claude-transcript-v{}", cursor.parser_version()),
-            )
-            .map_err(|_| ())?,
+            )?,
             last_observation_id,
-        )
-        .map_err(|_| ())?;
-        self.store.save_file_cursor(&record).await.map_err(|_| ())
+        )?;
+        self.store.save_file_cursor(&record).await?;
+        Ok(())
     }
 
     async fn emit_claude_compatibility_warning(
@@ -2188,30 +2273,25 @@ impl CompanionDiscovery {
                 return false;
             }
         } else {
-            if let Err(error) = self
-                .api
-                .discover_session(DiscoveredSession {
+            let adapter_version =
+                format!("companion-{}", watchdog_companion::TESTED_COMPANION_VERSION);
+            if let Err(error) = ensure_main_parent(
+                &self.api,
+                parent,
+                MainParentDiscovery {
                     runtime: RuntimeKind::ClaudeCode,
-                    native_id: parent.native_id().to_owned(),
-                    kind: SessionKind::Main,
-                    parent: None,
-                    event_key: discovery_key("companion-parent", parent_id),
-                    adapter_version: format!(
-                        "companion-{}",
-                        watchdog_companion::TESTED_COMPANION_VERSION
-                    ),
-                    evidence_source: "companion:parent-summary".to_owned(),
-                    title: None,
-                    startup_directory: None,
-                })
-                .await
+                    event_key_prefix: "companion-parent",
+                    adapter_version: &adapter_version,
+                    evidence_source: "companion:parent-summary",
+                },
+                mains,
+                report,
+            )
+            .await
             {
                 log_reconcile_failure(RuntimeKind::CodexCompanion, "parent", &error);
                 report.warn();
                 return false;
-            }
-            if mains.insert(parent_id) {
-                report.main_sessions = report.main_sessions.saturating_add(1);
             }
         }
 
@@ -2746,30 +2826,27 @@ impl CodexDiscovery {
         };
         let mut parent = match metadata.parent() {
             Some(parent) => {
-                let parent_id = SessionId::from_native(parent);
-                if !mains.contains(&parent_id) {
-                    if self
-                        .api
-                        .discover_session(DiscoveredSession {
-                            runtime: RuntimeKind::CodexCli,
-                            native_id: parent.native_id().to_owned(),
-                            kind: SessionKind::Main,
-                            parent: None,
-                            event_key: discovery_key("codex-rollout-parent", parent_id),
-                            adapter_version: watchdog_codex::TESTED_CODEX_VERSION.to_owned(),
-                            evidence_source: "codex:rollout-metadata".to_owned(),
-                            title: None,
-                            startup_directory: None,
-                        })
-                        .await
-                        .is_err()
-                    {
+                let parent_id = match ensure_main_parent(
+                    &self.api,
+                    parent,
+                    MainParentDiscovery {
+                        runtime: RuntimeKind::CodexCli,
+                        event_key_prefix: "codex-rollout-parent",
+                        adapter_version: watchdog_codex::TESTED_CODEX_VERSION,
+                        evidence_source: "codex:rollout-metadata",
+                    },
+                    mains,
+                    report,
+                )
+                .await
+                {
+                    Ok(parent_id) => parent_id,
+                    Err(error) => {
+                        log_reconcile_failure(RuntimeKind::CodexCli, "rollout_parent", &error);
                         report.warn();
                         return None;
                     }
-                    mains.insert(parent_id);
-                    report.main_sessions = report.main_sessions.saturating_add(1);
-                }
+                };
                 Some(parent_id)
             }
             None => None,
@@ -3037,11 +3114,12 @@ impl CodexDiscovery {
         let Some(saved) = saved else {
             match reader.cursor_at_end(root, relative, CODEX_ROLLOUT_PARSER_VERSION) {
                 Ok(cursor) => {
-                    if self
-                        .persist_codex_cursor(path_key, &cursor, None)
-                        .await
-                        .is_err()
-                    {
+                    if let Err(error) = self.persist_codex_cursor(path_key, &cursor, None).await {
+                        tracing::warn!(
+                            event = "discovery.codex_cursor_initialize_failed",
+                            error = %error,
+                            "Codex rollout cursor could not be initialized"
+                        );
                         report.warn();
                     }
                 }
@@ -3097,9 +3175,16 @@ impl CodexDiscovery {
                 report.warn();
                 match reader.cursor_at_end(root, relative, CODEX_ROLLOUT_PARSER_VERSION) {
                     Ok(new_cursor) => {
-                        let _ = self
+                        if let Err(error) = self
                             .persist_codex_cursor(path_key, &new_cursor, last_observation_id)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                event = "discovery.codex_cursor_recovery_failed",
+                                error = %error,
+                                "Codex rollout recovery cursor could not be persisted"
+                            );
+                        }
                     }
                     Err(_) => report.warn(),
                 }
@@ -3129,11 +3214,15 @@ impl CodexDiscovery {
                 }
             }
             cursor = batch.cursor().clone();
-            if self
+            if let Err(error) = self
                 .persist_codex_cursor(path_key, &cursor, last_observation_id)
                 .await
-                .is_err()
             {
+                tracing::warn!(
+                    event = "discovery.codex_cursor_persist_failed",
+                    error = %error,
+                    "Codex rollout cursor could not be persisted"
+                );
                 report.warn();
                 return;
             }
@@ -3194,12 +3283,11 @@ impl CodexDiscovery {
         path_key: &BoundedText<4_096>,
         cursor: &FileCursor,
         last_observation_id: Option<ObservationId>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), CursorPersistenceError> {
         let parser_version = BoundedText::new(
             "parser_version",
             format!("codex-rollout-v{}", cursor.parser_version()),
-        )
-        .map_err(|_| ())?;
+        )?;
         let record = FileCursorRecord::new(
             path_key.clone(),
             cursor.identity().device(),
@@ -3208,9 +3296,9 @@ impl CodexDiscovery {
             cursor.complete_offset(),
             parser_version,
             last_observation_id,
-        )
-        .map_err(|_| ())?;
-        self.store.save_file_cursor(&record).await.map_err(|_| ())
+        )?;
+        self.store.save_file_cursor(&record).await?;
+        Ok(())
     }
 
     async fn emit_codex_compatibility_warning(
@@ -3352,30 +3440,27 @@ impl CodexDiscovery {
             report.warn();
             return;
         };
-        let parent_id = SessionId::from_native(parent);
-        if !mains.contains(&parent_id) {
-            if let Err(error) = self
-                .api
-                .discover_session(DiscoveredSession {
-                    runtime: RuntimeKind::CodexCli,
-                    native_id: parent.native_id().to_owned(),
-                    kind: SessionKind::Main,
-                    parent: None,
-                    event_key: discovery_key("codex-state-parent", parent_id),
-                    adapter_version: watchdog_codex::TESTED_CODEX_VERSION.to_owned(),
-                    evidence_source: "codex:state-db".to_owned(),
-                    title: None,
-                    startup_directory: None,
-                })
-                .await
-            {
+        let parent_id = match ensure_main_parent(
+            &self.api,
+            parent,
+            MainParentDiscovery {
+                runtime: RuntimeKind::CodexCli,
+                event_key_prefix: "codex-state-parent",
+                adapter_version: watchdog_codex::TESTED_CODEX_VERSION,
+                evidence_source: "codex:state-db",
+            },
+            mains,
+            report,
+        )
+        .await
+        {
+            Ok(parent_id) => parent_id,
+            Err(error) => {
                 log_reconcile_failure(RuntimeKind::CodexCli, "parent", &error);
                 report.warn();
                 return;
             }
-            mains.insert(parent_id);
-            report.main_sessions = report.main_sessions.saturating_add(1);
-        }
+        };
         let child_id = SessionId::from_native(thread.subject());
         let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
         let title = thread
@@ -3775,6 +3860,20 @@ const fn state_key(state: DetailedState) -> &'static str {
     }
 }
 
+fn log_claude_transcript_prepare_failure() {
+    tracing::warn!(
+        event = "discovery.claude_transcript_prepare_failed",
+        "Claude transcript candidate could not be prepared"
+    );
+}
+
+fn log_claude_parent_failure() {
+    tracing::warn!(
+        event = "discovery.claude_parent_failed",
+        "Claude transcript parent could not be reconciled"
+    );
+}
+
 fn log_reconcile_failure(
     runtime: RuntimeKind,
     session_kind: &'static str,
@@ -3893,6 +3992,28 @@ mod tests {
         assert_eq!(aliases.resolve(&wrapper), None);
 
         aliases.bind(wrapper.clone(), first);
+        assert_eq!(aliases.resolve(&wrapper), None);
+    }
+
+    #[test]
+    fn conflicting_native_alias_remains_ambiguous_after_cache_pressure() {
+        let aliases = DiscoveryAliasRegistry::with_capacity(2);
+        let wrapper =
+            NativeSessionKey::new(RuntimeKind::ClaudeCode, "ambiguous-wrapper").expect("valid key");
+        aliases.bind(wrapper.clone(), session(RuntimeKind::ClaudeCode, "first"));
+        aliases.bind(wrapper.clone(), session(RuntimeKind::ClaudeCode, "second"));
+        aliases.bind(
+            NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper-1").expect("valid key"),
+            session(RuntimeKind::ClaudeCode, "canonical-1"),
+        );
+
+        aliases.bind(
+            NativeSessionKey::new(RuntimeKind::ClaudeCode, "overflow-wrapper").expect("valid key"),
+            session(RuntimeKind::ClaudeCode, "overflow-canonical"),
+        );
+
+        assert_eq!(aliases.resolve(&wrapper), None);
+        aliases.bind(wrapper.clone(), session(RuntimeKind::ClaudeCode, "first"));
         assert_eq!(aliases.resolve(&wrapper), None);
     }
 

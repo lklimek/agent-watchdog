@@ -6,13 +6,14 @@ use std::{
 
 use thiserror::Error;
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, ChildSessionId, Clock, EvidenceTrust, ObservationEnvelope,
-    ObservationId, ObservationPayload, ObservationSource, SessionIdentity, SessionKind,
+    AdapterIdentity, BoundedText, ChildSessionId, Clock, DomainInputError, EvidenceTrust,
+    ObservationEnvelope, ObservationError, ObservationId, ObservationPayload, ObservationSource,
+    SessionIdentity, SessionKind,
 };
 use watchdog_runtime::{Attribution, WorktreeOwners};
 use watchdog_store::{StoreError, StoredSessionRecord, WatchdogStore};
 
-use crate::AgentApi;
+use crate::{AgentApi, AgentApiError};
 
 const MAX_CHILD_SESSIONS: u32 = 1_000;
 const MAX_REGISTERED_PATHS: u32 = 4_096;
@@ -109,13 +110,25 @@ impl FilesystemActivityReconciler {
         }
         for (child, index) in attributed {
             let Some(record) = records.get(&child) else {
+                tracing::warn!(
+                    event = "filesystem_activity.session_missing",
+                    session_id = %child.session_id(),
+                    "Attributed filesystem activity has no retained child session"
+                );
                 report.warnings = report.warnings.saturating_add(1);
                 continue;
             };
-            if self.ingest(record, index).await.is_err() {
-                report.warnings = report.warnings.saturating_add(1);
-            } else {
-                report.attributed = report.attributed.saturating_add(1);
+            match self.ingest(record, index).await {
+                Ok(()) => report.attributed = report.attributed.saturating_add(1),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "filesystem_activity.observation_failed",
+                        session_id = %record.session.session_id(),
+                        error = %error,
+                        "Filesystem activity observation could not be ingested"
+                    );
+                    report.warnings = report.warnings.saturating_add(1);
+                }
             }
         }
         Ok(report)
@@ -160,37 +173,38 @@ impl FilesystemActivityReconciler {
         Ok((owners, by_child))
     }
 
-    async fn ingest(&self, record: &StoredSessionRecord, index: usize) -> Result<(), ()> {
+    async fn ingest(
+        &self,
+        record: &StoredSessionRecord,
+        index: usize,
+    ) -> Result<(), FilesystemActivityIngestError> {
         let now = self.clock.now();
         let source = ObservationSource::new(
-            AdapterIdentity::new(record.native.runtime(), "filesystem-v1").map_err(|_| ())?,
+            AdapterIdentity::new(record.native.runtime(), "filesystem-v1")?,
             "worktree:inotify",
             EvidenceTrust::Corroborating,
             None,
-        )
-        .map_err(|_| ())?;
+        )?;
         let event_key = format!(
             "{}:{}:{index}",
             record.session.session_id(),
             now.monotonic_ms()
         );
         let observation = ObservationEnvelope::new(
-            ObservationId::from_native(record.native.runtime(), "filesystem", event_key)
-                .map_err(|_| ())?,
+            ObservationId::from_native(record.native.runtime(), "filesystem", event_key)?,
             record.native.clone(),
             now,
             source,
-            ObservationPayload::Progress(
-                BoundedText::new("progress", "Filesystem activity in owned worktree")
-                    .map_err(|_| ())?,
-            ),
-        )
-        .map_err(|_| ())?;
+            ObservationPayload::Progress(BoundedText::new(
+                "progress",
+                "Filesystem activity in owned worktree",
+            )?),
+        )?;
         self.api
             .ingest_native_observation(observation)
             .await
-            .map(|_| ())
-            .map_err(|_| ())
+            .map(|_| ())?;
+        Ok(())
     }
 }
 
@@ -208,6 +222,16 @@ impl std::fmt::Debug for FilesystemActivityReconciler {
             .debug_struct("FilesystemActivityReconciler")
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Error)]
+enum FilesystemActivityIngestError {
+    #[error("Filesystem activity evidence is invalid: {0}")]
+    Domain(#[from] DomainInputError),
+    #[error("Filesystem activity observation is invalid: {0}")]
+    Observation(#[from] ObservationError),
+    #[error("Filesystem activity observation was rejected: {0}")]
+    AgentApi(#[from] AgentApiError),
 }
 
 /// Durable ownership metadata could not be loaded.

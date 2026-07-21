@@ -23,10 +23,12 @@ use watchdog_store::{
     WatchdogStore,
 };
 
-const MAX_TREE_SESSIONS: u32 = 1_000;
+pub(crate) const MAX_TREE_SESSIONS: u32 = 1_000;
 const MAX_EVENTS: u32 = 500;
 const OBSERVATION_QUEUE_CAPACITY: usize = 64;
 const MAX_REJECTED_OBSERVATIONS: usize = 64;
+// Retain a small recent sample without inflating every event response.
+const DIAGNOSTIC_ACTIVITY_SAMPLES: u32 = 8;
 
 /// Bounded opaque MCP transport identity used only for application scoping.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -148,6 +150,8 @@ pub enum CompletionOutcome {
 /// Agent-facing current session state and diagnostic evidence.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionView {
+    /// Server wall time at which this response view was assembled.
+    pub server_time: WallTimeMs,
     /// Role-preserving runtime-neutral identity.
     pub session: SessionIdentity,
     /// Main-session tree identity.
@@ -156,6 +160,8 @@ pub struct SessionView {
     pub runtime: RuntimeKind,
     /// Runtime-native identity for agent diagnostics.
     pub native_id: String,
+    /// Source of the latest observation that advanced the reducer snapshot.
+    pub provenance: Option<ObservationSource>,
     /// Complete reducer snapshot, including PID, warning, conflicts, and timers.
     pub snapshot: SessionSnapshot,
 }
@@ -1152,14 +1158,17 @@ impl AgentApi {
         }
         let root = self.inner.scopes.root(transport)?;
         let durable = self.inner.store.inbox_offset(root).await?;
-        let cursor =
-            after.unwrap_or_else(|| durable.map_or(0, |offset| offset.last_event_id.value()));
-        if let Some(confirmed) = after {
+        let stored_cursor = durable.map_or(0, |offset| offset.last_event_id.value());
+        let latest_event_id = self.inner.store.latest_event_id().await?.value();
+        let cursor = after.map_or(stored_cursor, |confirmed| {
+            confirmed.min(latest_event_id).max(stored_cursor)
+        });
+        if after.is_some() {
             self.inner
                 .store
                 .save_inbox_offset(InboxOffsetRecord {
                     parent: root,
-                    last_event_id: watchdog_domain::EventId::new(confirmed),
+                    last_event_id: watchdog_domain::EventId::new(cursor),
                     updated_at: self.inner.clock.now().wall_time(),
                 })
                 .await?;
@@ -1525,11 +1534,22 @@ impl AgentApi {
             .reducer_snapshot()
             .cloned()
             .ok_or(AgentApiError::ReducerSnapshotUnavailable)?;
+        let provenance = match snapshot.last_observation_id() {
+            Some(observation_id) => self
+                .inner
+                .store
+                .observation(observation_id)
+                .await?
+                .map(|observation| observation.source().clone()),
+            None => None,
+        };
         Ok(SessionView {
+            server_time: self.inner.clock.now().wall_time(),
             session: record.session,
             root: record.root,
             runtime: record.native.runtime(),
             native_id: record.native.native_id().to_owned(),
+            provenance,
             snapshot,
         })
     }
@@ -1543,7 +1563,7 @@ impl AgentApi {
         let process_activity = self
             .inner
             .store
-            .recent_activity(record.session, 8)
+            .recent_activity(record.session, DIAGNOSTIC_ACTIVITY_SAMPLES)
             .await?
             .into_iter()
             .filter(|sample| {

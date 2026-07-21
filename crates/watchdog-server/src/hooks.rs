@@ -173,6 +173,11 @@ async fn bearer_auth(
         .get(header::AUTHORIZATION)
         .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
     if !authorized {
+        tracing::warn!(
+            event = "auth.rejected",
+            route = request.uri().path(),
+            "Runtime hook bearer credential rejected"
+        );
         return StatusCode::UNAUTHORIZED.into_response();
     }
     next.run(request).await

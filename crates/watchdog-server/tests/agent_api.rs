@@ -3,16 +3,19 @@
 use std::sync::Arc;
 
 use watchdog_domain::{
-    AdapterIdentity, BoundedText, Clock, CorrelationBasis, DetailedState, DomainEventKind,
-    DurationMs, EvidenceTrust, NativeSessionKey, ObservationEnvelope, ObservationId,
-    ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, RuntimeKind, SessionId,
-    SessionKind, TimePoint, WallTimeMs,
+    AdapterIdentity, BoundedText, Clock, CorrelationBasis, DeadlineCommand, DetailedState,
+    DomainEventKind, DurationMs, EvidenceTrust, NativeSessionKey, ObservationEnvelope,
+    ObservationId, ObservationPayload, ObservationSource, ProcessId, ProcessIdentity, RuntimeKind,
+    SessionId, SessionKind, TimePoint, WallTimeMs,
 };
 use watchdog_server::{
     AgentApi, AgentApiError, AgentEventView, CompletionOutcome, DiscoveredSession, RegisterSession,
     RepositoryMetadata, TransportKey, WaitingKind,
 };
-use watchdog_store::{ActivityEvidence, ActivitySampleRecord, OutboxDestination, WatchdogStore};
+use watchdog_store::{
+    ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
+    OutboxDestination, WatchdogStore,
+};
 use watchdog_testkit::FakeClock;
 
 async fn api_fixture() -> (AgentApi, WatchdogStore, Arc<FakeClock>) {
@@ -54,6 +57,200 @@ async fn register_main(
     .expect("main should register")
     .session
     .session_id()
+}
+
+async fn register_child(
+    api: &AgentApi,
+    transport: &TransportKey,
+    parent: SessionId,
+    native_id: &str,
+    event_key: &str,
+) -> SessionId {
+    api.register_session(
+        transport,
+        RegisterSession {
+            runtime: RuntimeKind::CodexCompanion,
+            native_id: native_id.to_owned(),
+            kind: SessionKind::Child,
+            parent: Some(parent),
+            event_key: event_key.to_owned(),
+        },
+    )
+    .await
+    .expect("child should register")
+    .session
+    .session_id()
+}
+
+#[tokio::test]
+async fn session_views_include_server_time_and_latest_evidence_provenance() {
+    let (api, _store, clock) = api_fixture().await;
+    let transport = TransportKey::new("response-contract").expect("transport should be valid");
+
+    let registered = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: "response-main".to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "register-response-main".to_owned(),
+            },
+        )
+        .await
+        .expect("main should register");
+
+    assert_eq!(registered.server_time, clock.now().wall_time());
+    let provenance = registered
+        .provenance
+        .expect("the latest accepted observation should retain provenance");
+    assert_eq!(provenance.adapter().runtime(), RuntimeKind::ClaudeCode);
+    assert_eq!(provenance.fingerprint(), "mcp:register_session");
+}
+
+#[tokio::test]
+async fn register_delegation_updates_relation_and_rejects_main_as_child() {
+    let (api, _store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("delegation-tool").expect("transport should be valid");
+    let main = register_main(&api, &transport, "delegation-main", "register-main").await;
+    let child = register_child(&api, &transport, main, "delegation-child", "register-child").await;
+
+    let delegated = api
+        .register_delegation(&transport, main, child, "delegate-child", None)
+        .await
+        .expect("child delegation should succeed");
+    assert_eq!(delegated.session.session_id(), child);
+    let tree = api
+        .session_tree(&transport)
+        .await
+        .expect("session tree should load");
+    assert!(tree.relations.iter().any(|relation| {
+        relation.selected
+            && relation.child.session_id() == child
+            && relation.parent.session_id() == main
+            && relation
+                .provenance
+                .fingerprint()
+                .starts_with("mcp:register_delegation:")
+    }));
+    let deadline = WallTimeMs::new(90_000);
+    let delegated_with_deadline = api
+        .register_delegation(
+            &transport,
+            main,
+            child,
+            "delegate-child-with-deadline",
+            Some(DeadlineCommand::Set(deadline)),
+        )
+        .await
+        .expect("child delegation with a deadline should succeed");
+    assert_eq!(
+        delegated_with_deadline.snapshot.explicit_deadline(),
+        Some(deadline)
+    );
+
+    let rejected = api
+        .register_delegation(&transport, main, main, "delegate-main", None)
+        .await;
+    assert!(matches!(rejected, Err(AgentApiError::ChildSessionRequired)));
+}
+
+#[tokio::test]
+async fn update_deadline_supports_set_pause_resume_and_clear() {
+    let (api, _store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("deadline-tool").expect("transport should be valid");
+    let main = register_main(&api, &transport, "deadline-main", "register-main").await;
+    let child = register_child(&api, &transport, main, "deadline-child", "register-child").await;
+    let deadline = WallTimeMs::new(60_000);
+
+    let set = api
+        .update_deadline(
+            &transport,
+            child,
+            "deadline-set",
+            DeadlineCommand::Set(deadline),
+        )
+        .await
+        .expect("deadline should set");
+    assert_eq!(set.snapshot.explicit_deadline(), Some(deadline));
+
+    let paused = api
+        .update_deadline(&transport, child, "deadline-pause", DeadlineCommand::Pause)
+        .await
+        .expect("deadline timers should pause");
+    assert!(paused.snapshot.timers_paused());
+
+    let resumed = api
+        .update_deadline(
+            &transport,
+            child,
+            "deadline-resume",
+            DeadlineCommand::Resume,
+        )
+        .await
+        .expect("deadline timers should resume");
+    assert!(!resumed.snapshot.timers_paused());
+
+    let cleared = api
+        .update_deadline(&transport, child, "deadline-clear", DeadlineCommand::Clear)
+        .await
+        .expect("deadline should clear");
+    assert_eq!(cleared.snapshot.explicit_deadline(), None);
+}
+
+#[tokio::test]
+async fn session_tree_returns_bound_sessions_and_selected_relations() {
+    let (api, _store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("tree-tool").expect("transport should be valid");
+    let main = register_main(&api, &transport, "tree-main", "register-main").await;
+    let child = register_child(&api, &transport, main, "tree-child", "register-child").await;
+
+    let tree = api
+        .session_tree(&transport)
+        .await
+        .expect("session tree should load");
+
+    assert_eq!(tree.root.session_id(), main);
+    assert_eq!(tree.sessions.len(), 2);
+    assert!(tree.relations.iter().any(|relation| {
+        relation.selected
+            && relation.child.session_id() == child
+            && relation.parent.session_id() == main
+    }));
+}
+
+#[tokio::test]
+async fn watchdog_health_returns_each_persisted_runtime_adapter() {
+    let (api, store, _clock) = api_fixture().await;
+    let transport = TransportKey::new("health-tool").expect("transport should be valid");
+    register_main(&api, &transport, "health-main", "register-main").await;
+    for runtime in [
+        RuntimeKind::ClaudeCode,
+        RuntimeKind::CodexCli,
+        RuntimeKind::CodexCompanion,
+    ] {
+        store
+            .save_adapter_health(&AdapterHealthRecord {
+                adapter: AdapterIdentity::new(runtime, "test").expect("adapter should be valid"),
+                status: AdapterHealthStatus::Healthy,
+                last_success: Some(WallTimeMs::new(10_000)),
+                last_error: None,
+                affected_scope: None,
+                message: None,
+            })
+            .await
+            .expect("adapter health should persist");
+    }
+
+    let health = api
+        .health(&transport)
+        .await
+        .expect("watchdog health should load");
+
+    assert!(health.store_wal);
+    assert!(health.store_foreign_keys);
+    assert_eq!(health.adapters.len(), 3);
 }
 
 #[tokio::test]
@@ -804,4 +1001,62 @@ async fn durable_event_cursor_survives_api_and_transport_restart() {
         .expect("durable cursor should load");
     assert_eq!(after_restart.after, confirmed);
     assert!(after_restart.events.is_empty());
+}
+
+#[tokio::test]
+async fn durable_event_cursor_never_advances_beyond_the_latest_committed_event() {
+    let (api, store, clock) = api_fixture().await;
+    let first_transport =
+        TransportKey::new("cursor-clamp-first").expect("transport should be valid");
+    let main = register_main(&api, &first_transport, "cursor-clamp-main", "register-main").await;
+    let latest_before = store
+        .latest_event_id()
+        .await
+        .expect("latest event ID should load")
+        .value();
+
+    api.list_events(&first_transport, Some(latest_before + 1_000), 10)
+        .await
+        .expect("oversized acknowledgement should be safely clamped");
+    let root = store
+        .session_by_id(main)
+        .await
+        .expect("session lookup should succeed")
+        .expect("main should exist")
+        .root;
+    assert_eq!(
+        store
+            .inbox_offset(root)
+            .await
+            .expect("inbox offset should load")
+            .expect("acknowledgement should persist")
+            .last_event_id
+            .value(),
+        latest_before
+    );
+
+    api.complete_session(
+        &first_transport,
+        main,
+        "completion-after-clamp",
+        CompletionOutcome::Completed,
+    )
+    .await
+    .expect("new event should commit");
+    let restarted = AgentApi::new(store, clock)
+        .await
+        .expect("API should restart from store");
+    let second_transport =
+        TransportKey::new("cursor-clamp-second").expect("transport should be valid");
+    restarted
+        .bind_discovered_main(&second_transport, main)
+        .await
+        .expect("main should bind after restart");
+
+    let page = restarted
+        .list_events(&second_transport, None, 10)
+        .await
+        .expect("events after the clamped acknowledgement should remain deliverable");
+    assert!(!page.events.is_empty());
+    assert!(page.next_cursor > latest_before);
 }

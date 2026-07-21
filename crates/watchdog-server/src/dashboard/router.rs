@@ -119,6 +119,11 @@ async fn basic_auth(
         .get(header::AUTHORIZATION)
         .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
     if !authorized {
+        tracing::warn!(
+            event = "auth.rejected",
+            route = request.uri().path(),
+            "Dashboard basic credential rejected"
+        );
         return (
             StatusCode::UNAUTHORIZED,
             [(
@@ -171,7 +176,11 @@ impl From<DashboardError> for DashboardHttpError {
 
 impl IntoResponse for DashboardHttpError {
     fn into_response(self) -> Response {
-        let _ = self.0;
+        tracing::error!(
+            event = "dashboard.request_failed",
+            error = %self.0,
+            "Dashboard request could not be served"
+        );
         (StatusCode::INTERNAL_SERVER_ERROR, "Dashboard unavailable").into_response()
     }
 }

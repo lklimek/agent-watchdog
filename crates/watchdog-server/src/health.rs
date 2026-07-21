@@ -271,6 +271,11 @@ pub fn health_router(service: HealthService, authenticator: BasicAuthenticator) 
                         .get(header::AUTHORIZATION)
                         .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
                     if !authorized {
+                        tracing::warn!(
+                            event = "auth.rejected",
+                            route = "/health",
+                            "Health endpoint basic credential rejected"
+                        );
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
                     next.run(request).await
