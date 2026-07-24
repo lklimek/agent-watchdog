@@ -740,6 +740,14 @@ snapshot revision, normalized state, warnings, and evidence provenance; health
 and watch-path responses carry their domain-specific diagnostics or registration
 provenance. Tool text is bounded and treated as untrusted.
 
+The object-shaped responses from `get_session`, `get_session_tree`,
+`register_watch_path`, `list_events`, and `get_watchdog_health` derive
+`outputSchema` from the same Rust types serialized at runtime. Successful calls
+place that JSON in `structuredContent` and retain the equivalent compact JSON
+text block for clients that do not consume structured output. Validation and
+infrastructure failures remain JSON-RPC errors, so every successful result from
+an advertised tool satisfies its output schema.
+
 MCP resource subscription or server notification may hint that events are
 available, but it is never the delivery authority. Durable `list_events` remains
 the baseline because clients are not guaranteed to turn a protocol notification

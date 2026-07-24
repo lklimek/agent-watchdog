@@ -3,7 +3,19 @@ use serde::{Deserialize, Serialize};
 use crate::SessionId;
 
 /// Milliseconds since the Unix epoch for persistence and external presentation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct WallTimeMs(i64);
 
@@ -22,7 +34,7 @@ impl WallTimeMs {
 }
 
 /// One coherent wall and boot-relative time sample.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TimePoint {
     wall_time: WallTimeMs,
     monotonic_ms: u64,

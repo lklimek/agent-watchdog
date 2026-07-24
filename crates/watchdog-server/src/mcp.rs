@@ -10,7 +10,7 @@ use axum::{
 };
 use futures::Stream;
 use rmcp::{
-    RoleServer, ServerHandler,
+    Json, RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
     model::{
         CallToolResult, ClientJsonRpcMessage, ContentBlock, ErrorCode, Implementation,
@@ -33,7 +33,8 @@ use watchdog_domain::{
 };
 
 use crate::{
-    AgentApi, AgentApiError, BearerAuthenticator, CompletionOutcome, RegisterSession, TransportKey,
+    AgentApi, AgentApiError, AgentHealthView, BearerAuthenticator, CompletionOutcome, EventPage,
+    RegisterSession, RegisteredWatchPathView, SessionTreeView, SessionView, TransportKey,
     WaitingKind, agent_api::MAX_TREE_SESSIONS,
 };
 
@@ -246,9 +247,9 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<RegisterWatchPathParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<RegisteredWatchPathView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(
+        structured_json_result(
             self.api
                 .register_watch_path(
                     &transport,
@@ -347,9 +348,9 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<SessionParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(
+        structured_json_result(
             self.api
                 .get_session(&transport, parse_session_id(&params.session_id)?)
                 .await,
@@ -393,9 +394,9 @@ impl WatchdogMcpService {
     async fn get_session_tree(
         &self,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionTreeView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(self.api.session_tree(&transport).await)
+        structured_json_result(self.api.session_tree(&transport).await)
     }
 
     #[tool(
@@ -405,9 +406,9 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<ListEventsParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<EventPage>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(
+        structured_json_result(
             self.api
                 .list_events(
                     &transport,
@@ -422,9 +423,9 @@ impl WatchdogMcpService {
     async fn get_watchdog_health(
         &self,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<AgentHealthView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(self.api.health(&transport).await)
+        structured_json_result(self.api.health(&transport).await)
     }
 }
 
@@ -700,6 +701,10 @@ fn json_result<T: Serialize>(
     result: Result<T, AgentApiError>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     success(&result.map_err(api_error)?)
+}
+
+fn structured_json_result<T>(result: Result<T, AgentApiError>) -> Result<Json<T>, rmcp::ErrorData> {
+    result.map(Json).map_err(api_error)
 }
 
 fn success<T: Serialize>(value: &T) -> Result<CallToolResult, rmcp::ErrorData> {

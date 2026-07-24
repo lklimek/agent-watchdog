@@ -147,7 +147,7 @@ pub enum CompletionOutcome {
 }
 
 /// Agent-facing current session state and diagnostic evidence.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct SessionView {
     /// Server wall time at which this response view was assembled.
     pub server_time: WallTimeMs,
@@ -166,7 +166,7 @@ pub struct SessionView {
 }
 
 /// Durable transition paired with current detailed diagnostics for its subject.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct AgentEventView {
     /// Ordered durable transition metadata.
     pub event: DomainEvent,
@@ -177,7 +177,7 @@ pub struct AgentEventView {
 }
 
 /// Freshest bounded evidence needed to investigate a child alert.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct AgentDiagnosticView {
     /// Latest verified PID identity, including PID-reuse defenses.
     pub process_identity: Option<ProcessIdentity>,
@@ -200,7 +200,7 @@ pub struct AgentDiagnosticView {
 }
 
 /// Trusted timestamps included in parent diagnostics.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema)]
 pub struct AgentSignalTimes {
     /// Latest accepted reducer input.
     pub updated_at: TimePoint,
@@ -213,7 +213,7 @@ pub struct AgentSignalTimes {
 }
 
 /// Selected hierarchy evidence rendered explicitly for parent agents.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct AgentCorrelationView {
     /// Strongest basis represented by the selected relation.
     pub basis: CorrelationBasis,
@@ -224,7 +224,7 @@ pub struct AgentCorrelationView {
 }
 
 /// Durable parent event page independent from MCP transport replay.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct EventPage {
     /// Exclusive cursor used for this query.
     pub after: u64,
@@ -235,7 +235,7 @@ pub struct EventPage {
 }
 
 /// Agent-facing hierarchy with current sessions and retained relation evidence.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct SessionTreeView {
     /// Bound main-session tree.
     pub root: MainSessionId,
@@ -246,7 +246,7 @@ pub struct SessionTreeView {
 }
 
 /// Server-timestamped result of registering one capability-validated path.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct RegisteredWatchPathView {
     /// Server wall time used for response correlation.
     pub server_time: WallTimeMs,
@@ -255,7 +255,7 @@ pub struct RegisteredWatchPathView {
 }
 
 /// Agent-facing health needed to diagnose monitoring coverage.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct AgentHealthView {
     /// Server wall time used for client-relative display and correlation.
     pub server_time: WallTimeMs,

@@ -112,7 +112,7 @@ impl SessionMetadataRecord {
 }
 
 /// Durable capability-validated native path registered by one scoped agent.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct RegisteredWatchPathRecord {
     session: SessionIdentity,
     root: MainSessionId,
@@ -197,7 +197,7 @@ fn optional_bounded<const N: usize>(
 }
 
 /// Selected or candidate session hierarchy relation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct RelationRecord {
     /// Child whose parent is being correlated.
     pub child: ChildSessionId,
@@ -223,7 +223,7 @@ const fn legacy_relation_basis() -> CorrelationBasis {
 }
 
 /// Attributable activity evidence retained for restart diagnostics.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct ActivitySampleRecord {
     /// Session receiving the activity.
     pub session: SessionIdentity,
@@ -234,7 +234,7 @@ pub struct ActivitySampleRecord {
 }
 
 /// Activity signals that can corroborate progress without transcript storage.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ActivityEvidence {
     /// Runtime-native progress event.
@@ -455,7 +455,7 @@ pub struct InboxOffsetRecord {
 }
 
 /// Runtime adapter component health class.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterHealthStatus {
     /// Adapter evidence is current and recognized.
@@ -477,7 +477,7 @@ impl AdapterHealthStatus {
 }
 
 /// Persisted adapter health without unbounded native error content.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AdapterHealthRecord {
     /// Runtime and best available native version evidence.
     pub adapter: AdapterIdentity,
