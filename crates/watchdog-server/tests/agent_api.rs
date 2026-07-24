@@ -272,6 +272,180 @@ async fn transport_binds_once_and_cross_tree_access_fails() {
 }
 
 #[tokio::test]
+async fn rejected_main_rebinds_do_not_mutate_other_trees() {
+    let (api, store, clock) = api_fixture().await;
+    let transport = TransportKey::new("bound-transport").expect("transport should validate");
+    register_main(&api, &transport, "bound-main", "register-bound-main").await;
+
+    let direct_native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "rejected-direct-main")
+        .expect("direct identity should validate");
+    let direct = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: direct_native.runtime(),
+                native_id: direct_native.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "reject-direct-main".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(direct, Err(AgentApiError::TransportAlreadyBound)));
+    assert!(
+        store
+            .session_by_id(SessionId::from_native(&direct_native))
+            .await
+            .expect("direct target lookup should succeed")
+            .is_none(),
+        "rejected direct registration must not create another tree"
+    );
+
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "other-canonical-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-other-canonical".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:other-canonical".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("other canonical main should be discovered");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "other-wrapper-main")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            canonical.session.session_id(),
+            clock.now().wall_time(),
+        )
+        .await
+        .expect("wrapper alias should persist");
+    let before = store
+        .snapshot(canonical.session)
+        .await
+        .expect("canonical snapshot should load")
+        .expect("canonical snapshot should exist");
+
+    let aliased = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: alias.runtime(),
+                native_id: alias.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "reject-aliased-main".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(aliased, Err(AgentApiError::TransportAlreadyBound)));
+    assert_eq!(
+        store
+            .snapshot(canonical.session)
+            .await
+            .expect("canonical snapshot should reload")
+            .expect("canonical snapshot should remain"),
+        before,
+        "rejected aliased registration must not mutate another tree"
+    );
+}
+
+#[tokio::test]
+async fn mcp_main_registration_resolves_discovery_alias_before_child_retry() {
+    let (api, store, clock) = api_fixture().await;
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "canonical-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-canonical-main".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:canonical-main".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("canonical main should be discovered");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper-main")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            canonical.session.session_id(),
+            clock.now().wall_time(),
+        )
+        .await
+        .expect("wrapper alias should persist");
+    let discovered_alias_main = api
+        .discover_session(DiscoveredSession {
+            runtime: alias.runtime(),
+            native_id: alias.native_id().to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-wrapper-main".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:wrapper-main".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("known wrapper alias should enrich the canonical main");
+    assert_eq!(discovered_alias_main.session, canonical.session);
+    let discovered_child = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::CodexCompanion,
+            native_id: "companion-job".to_owned(),
+            kind: SessionKind::Child,
+            parent: Some(canonical.session.session_id()),
+            event_key: "discover-companion-job".to_owned(),
+            adapter_version: "1.0.6".to_owned(),
+            evidence_source: "companion:state-summary".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("Companion child should be discovered under the canonical main");
+
+    let transport = TransportKey::new("wrapper-transport").expect("transport should validate");
+    let registered_main = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: alias.runtime(),
+                native_id: alias.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "register-wrapper-main".to_owned(),
+            },
+        )
+        .await
+        .expect("known wrapper alias should bind the canonical main");
+    assert_eq!(registered_main.session, canonical.session);
+
+    let registered_child = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "companion-job".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(registered_main.session.session_id()),
+                event_key: "register-companion-job".to_owned(),
+            },
+        )
+        .await
+        .expect("discovered Companion child should accept exact MCP registration");
+    assert_eq!(registered_child.session, discovered_child.session);
+    assert_eq!(registered_child.root, canonical.root);
+}
+
+#[tokio::test]
 async fn child_registration_progress_and_completion_are_idempotent_and_scoped() {
     let (api, _store, _clock) = api_fixture().await;
     let transport = TransportKey::new("transport-main").expect("transport should be valid");

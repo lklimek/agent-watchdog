@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -28,6 +28,8 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
 use watchdog_domain::{
     DeadlineCommand, DetailedState, RuntimeKind, SessionId, SessionKind, WallTimeMs,
 };
@@ -39,18 +41,58 @@ use crate::{
 };
 
 const DEFAULT_EVENT_PAGE_SIZE: u32 = 100;
+const MAX_MCP_SESSIONS: usize = 64;
+const MCP_SESSION_IDLE_TTL: Duration = Duration::from_hours(48);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TransportScope(McpSessionId);
 
 /// rmcp session manager that injects the opaque transport identity into every
-/// request context for application-level main-session scoping.
-#[derive(Debug, Default)]
+/// request context for application-level main-session scoping. Sessions survive
+/// normal long idle periods, while abandoned transports expire after 48 hours.
+#[derive(Debug)]
 pub struct WatchdogSessionManager {
     inner: LocalSessionManager,
+    creation: Mutex<()>,
+    api: Option<AgentApi>,
+}
+
+/// Failure while managing one stateful MCP transport.
+#[derive(Debug, Error)]
+pub enum WatchdogSessionManagerError {
+    /// rmcp rejected the requested session operation.
+    #[error(transparent)]
+    Local(#[from] LocalSessionManagerError),
+    /// The bounded authenticated session pool is full.
+    #[error("MCP session capacity is exhausted")]
+    Capacity,
 }
 
 impl WatchdogSessionManager {
+    /// Construct an rmcp session manager that releases application scope when
+    /// a transport closes or expires.
+    #[must_use]
+    pub fn new(api: AgentApi) -> Self {
+        let mut inner = LocalSessionManager::default();
+        inner.session_config.keep_alive = Some(MCP_SESSION_IDLE_TTL);
+        Self {
+            inner,
+            creation: Mutex::new(()),
+            api: Some(api),
+        }
+    }
+
+    #[cfg(test)]
+    fn without_application_scope() -> Self {
+        let mut inner = LocalSessionManager::default();
+        inner.session_config.keep_alive = Some(MCP_SESSION_IDLE_TTL);
+        Self {
+            inner,
+            creation: Mutex::new(()),
+            api: None,
+        }
+    }
+
     fn scoped(id: &McpSessionId, mut message: ClientJsonRpcMessage) -> ClientJsonRpcMessage {
         message.insert_extension(TransportScope(id.clone()));
         message
@@ -58,11 +100,15 @@ impl WatchdogSessionManager {
 }
 
 impl SessionManager for WatchdogSessionManager {
-    type Error = LocalSessionManagerError;
+    type Error = WatchdogSessionManagerError;
     type Transport = <LocalSessionManager as SessionManager>::Transport;
 
     async fn create_session(&self) -> Result<(McpSessionId, Self::Transport), Self::Error> {
-        self.inner.create_session().await
+        let _creation = self.creation.lock().await;
+        if self.inner.sessions.read().await.len() >= MAX_MCP_SESSIONS {
+            return Err(WatchdogSessionManagerError::Capacity);
+        }
+        Ok(self.inner.create_session().await?)
     }
 
     async fn initialize_session(
@@ -70,17 +116,24 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<ServerJsonRpcMessage, Self::Error> {
-        self.inner
+        Ok(self
+            .inner
             .initialize_session(id, Self::scoped(id, message))
-            .await
+            .await?)
     }
 
     async fn has_session(&self, id: &McpSessionId) -> Result<bool, Self::Error> {
-        self.inner.has_session(id).await
+        Ok(self.inner.has_session(id).await?)
     }
 
     async fn close_session(&self, id: &McpSessionId) -> Result<(), Self::Error> {
-        self.inner.close_session(id).await
+        self.inner.close_session(id).await?;
+        if let Some(api) = &self.api
+            && let Ok(transport) = TransportKey::new(id.to_string())
+        {
+            api.release_transport_scope(&transport);
+        }
+        Ok(())
     }
 
     async fn create_stream(
@@ -88,9 +141,10 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        self.inner
+        Ok(self
+            .inner
             .create_stream(id, Self::scoped(id, message))
-            .await
+            .await?)
     }
 
     async fn accept_message(
@@ -98,16 +152,17 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<(), Self::Error> {
-        self.inner
+        Ok(self
+            .inner
             .accept_message(id, Self::scoped(id, message))
-            .await
+            .await?)
     }
 
     async fn create_standalone_stream(
         &self,
         id: &McpSessionId,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        self.inner.create_standalone_stream(id).await
+        Ok(self.inner.create_standalone_stream(id).await?)
     }
 
     async fn resume(
@@ -115,14 +170,20 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        self.inner.resume(id, last_event_id).await
+        Ok(self.inner.resume(id, last_event_id).await?)
     }
 
     async fn restore_session(
         &self,
         id: McpSessionId,
     ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
-        self.inner.restore_session(id).await
+        let _creation = self.creation.lock().await;
+        let sessions = self.inner.sessions.read().await;
+        if !sessions.contains_key(&id) && sessions.len() >= MAX_MCP_SESSIONS {
+            return Err(WatchdogSessionManagerError::Capacity);
+        }
+        drop(sessions);
+        Ok(self.inner.restore_session(id).await?)
     }
 }
 
@@ -131,7 +192,7 @@ impl SessionManager for WatchdogSessionManager {
 fn mcp_http_service(
     api: AgentApi,
 ) -> StreamableHttpService<WatchdogMcpService, WatchdogSessionManager> {
-    let manager = Arc::new(WatchdogSessionManager::default());
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
     StreamableHttpService::new(
         move || Ok(WatchdogMcpService::new(api.clone())),
         manager,
@@ -736,10 +797,19 @@ fn internal_error() -> rmcp::ErrorData {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use rmcp::model::ErrorCode;
+    use rmcp::transport::streamable_http_server::session::{
+        SessionId as McpSessionId, SessionManager,
+    };
+    use tokio::sync::Barrier;
     use watchdog_domain::{DeadlineCommand, WallTimeMs};
 
-    use super::{AgentApiError, DeadlineActionParam, api_error};
+    use super::{
+        AgentApiError, DeadlineActionParam, MAX_MCP_SESSIONS, RestoreOutcome,
+        WatchdogSessionManager, WatchdogSessionManagerError, api_error,
+    };
 
     #[test]
     fn unavailable_server_state_is_not_reported_as_invalid_caller_input() {
@@ -770,5 +840,146 @@ mod tests {
             Ok(DeadlineCommand::Clear)
         ));
         assert!(DeadlineActionParam::Set.command(None).is_err());
+    }
+
+    #[test]
+    fn mcp_session_idle_ttl_is_long_and_finite() {
+        let manager = WatchdogSessionManager::without_application_scope();
+
+        assert_eq!(
+            manager.inner.session_config.keep_alive,
+            Some(Duration::from_hours(48))
+        );
+    }
+
+    type Admission = Result<
+        (
+            McpSessionId,
+            <WatchdogSessionManager as SessionManager>::Transport,
+        ),
+        WatchdogSessionManagerError,
+    >;
+
+    fn spawn_concurrent_admissions(
+        manager: &Arc<WatchdogSessionManager>,
+    ) -> (Arc<Barrier>, Vec<tokio::task::JoinHandle<Admission>>) {
+        let attempts = MAX_MCP_SESSIONS * 2;
+        let barrier = Arc::new(Barrier::new(attempts + 1));
+        let mut tasks = Vec::with_capacity(attempts);
+        for index in 0..attempts {
+            let manager = Arc::clone(manager);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                let id: McpSessionId = format!("concurrent-restore-{index}").into();
+                barrier.wait().await;
+                if index % 2 == 0 {
+                    match manager.restore_session(id.clone()).await {
+                        Ok(RestoreOutcome::Restored(transport)) => Ok((id, transport)),
+                        Ok(RestoreOutcome::AlreadyPresent) => {
+                            panic!("unique restore id was already present")
+                        }
+                        Ok(_) => panic!("unexpected restore outcome"),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    manager.create_session().await
+                }
+            }));
+        }
+        (barrier, tasks)
+    }
+
+    async fn collect_admissions(
+        tasks: Vec<tokio::task::JoinHandle<Admission>>,
+    ) -> Vec<(
+        McpSessionId,
+        <WatchdogSessionManager as SessionManager>::Transport,
+    )> {
+        let attempts = tasks.len();
+        let mut admitted = Vec::with_capacity(MAX_MCP_SESSIONS);
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.expect("admission task should not panic") {
+                Ok(session) => admitted.push(session),
+                Err(WatchdogSessionManagerError::Capacity) => rejected += 1,
+                Err(error) => panic!("unexpected admission error: {error}"),
+            }
+        }
+        assert_eq!(admitted.len(), MAX_MCP_SESSIONS);
+        assert_eq!(rejected, attempts - MAX_MCP_SESSIONS);
+        admitted
+    }
+
+    async fn close_admitted(
+        manager: &WatchdogSessionManager,
+        admitted: Vec<(
+            McpSessionId,
+            <WatchdogSessionManager as SessionManager>::Transport,
+        )>,
+    ) {
+        for (session, _transport) in admitted {
+            manager
+                .close_session(&session)
+                .await
+                .expect("admitted session should close");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mcp_session_admission_is_atomic_under_concurrent_create_and_restore() {
+        let manager = Arc::new(WatchdogSessionManager::without_application_scope());
+
+        let creation = manager.creation.lock().await;
+        let (barrier, tasks) = spawn_concurrent_admissions(&manager);
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        assert!(
+            manager.inner.sessions.read().await.is_empty(),
+            "scheduled creation tasks must wait behind the admission mutex"
+        );
+        drop(creation);
+        let admitted = collect_admissions(tasks).await;
+        close_admitted(&manager, admitted).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_session_admission_is_bounded_and_close_releases_capacity() {
+        let manager = WatchdogSessionManager::without_application_scope();
+        let mut sessions = Vec::with_capacity(MAX_MCP_SESSIONS);
+        for _ in 0..MAX_MCP_SESSIONS {
+            sessions.push(
+                manager
+                    .create_session()
+                    .await
+                    .expect("session within capacity should be admitted"),
+            );
+        }
+        assert!(matches!(
+            manager.create_session().await,
+            Err(WatchdogSessionManagerError::Capacity)
+        ));
+        assert!(matches!(
+            manager.restore_session("overflow-session".into()).await,
+            Err(WatchdogSessionManagerError::Capacity)
+        ));
+        assert!(matches!(
+            manager.restore_session(sessions[0].0.clone()).await,
+            Ok(RestoreOutcome::AlreadyPresent)
+        ));
+
+        for (session, _transport) in sessions {
+            manager
+                .close_session(&session)
+                .await
+                .expect("explicit close should release capacity");
+        }
+        let (session, _transport) = manager
+            .create_session()
+            .await
+            .expect("capacity should be reusable after close");
+        manager
+            .close_session(&session)
+            .await
+            .expect("replacement session should close");
     }
 }

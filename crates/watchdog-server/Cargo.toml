@@ -38,6 +38,7 @@ watchdog-process = { path = "../watchdog-process", version = "=0.1.0" }
 jsonschema = { version = "=0.48.5", default-features = false }
 sqlx.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 watchdog-testkit = { path = "../watchdog-testkit", version = "=0.1.0" }
 

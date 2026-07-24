@@ -12,7 +12,7 @@ pub use records::{
 };
 pub use watchdog_domain::{TerminationGate, TerminationStage};
 
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::to_vec;
@@ -22,6 +22,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use thiserror::Error;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use watchdog_domain::{
     CompactState, DetailedState, DomainEvent, EventId, MainSessionId, ObservationEnvelope,
     SessionIdentity, SessionSnapshot, WallTimeMs,
@@ -29,6 +30,32 @@ use watchdog_domain::{
 
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 const MAX_RECORD_BYTES: usize = 16_384;
+
+/// Durable resolution state for one runtime-native discovery alias.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryAliasResolution {
+    /// No canonical target has been observed.
+    Absent,
+    /// Exactly one canonical session has been observed.
+    Unique(watchdog_domain::SessionId),
+    /// Conflicting canonical targets have been observed.
+    Ambiguous,
+}
+
+/// Stable in-process view of one discovery alias while a caller acts on it.
+#[derive(Debug)]
+pub struct DiscoveryAliasLease {
+    resolution: DiscoveryAliasResolution,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl DiscoveryAliasLease {
+    /// Return the alias resolution protected by this lease.
+    #[must_use]
+    pub const fn resolution(&self) -> DiscoveryAliasResolution {
+        self.resolution
+    }
+}
 
 /// One reducer snapshot update stored with an observation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -354,6 +381,7 @@ impl PendingOutboxEntry {
 #[derive(Clone, Debug)]
 pub struct WatchdogStore {
     pub(crate) pool: SqlitePool,
+    pub(crate) discovery_alias_lock: Arc<Mutex<()>>,
 }
 
 impl WatchdogStore {
@@ -375,7 +403,10 @@ impl WatchdogStore {
             .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            discovery_alias_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Load the first unallocated durable event identity for process startup.

@@ -1,21 +1,27 @@
 //! rmcp transport identity, tool surface, and scope integration tests.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
 };
 use futures::StreamExt;
 use rmcp::{
-    ServiceExt, model::ClientJsonRpcMessage,
-    transport::streamable_http_server::session::SessionManager,
+    ServiceExt,
+    model::ClientJsonRpcMessage,
+    transport::streamable_http_server::{
+        session::{SessionId as McpSessionId, SessionManager},
+        tower::{StreamableHttpServerConfig, StreamableHttpService},
+    },
 };
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use watchdog_domain::{NativeSessionKey, RuntimeKind, SessionId, TimePoint, WallTimeMs};
 use watchdog_server::{
-    AgentApi, BearerAuthenticator, WatchdogMcpService, WatchdogSessionManager, mcp_router,
+    AgentApi, AgentApiError, BearerAuthenticator, TransportKey, WatchdogMcpService,
+    WatchdogSessionManager, WatchdogSessionManagerError, mcp_router,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
@@ -55,6 +61,17 @@ async fn response(
     panic!("request stream ended without a JSON-RPC response")
 }
 
+fn http_json_rpc_body(body: &[u8]) -> Value {
+    if let Ok(value) = serde_json::from_slice(body) {
+        return value;
+    }
+    let text = std::str::from_utf8(body).expect("MCP response body should be UTF-8");
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(|data| serde_json::from_str(data).ok())
+        .unwrap_or_else(|| panic!("MCP response body should contain JSON-RPC data: {text}"))
+}
+
 async fn test_api() -> AgentApi {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
     let path = directory.path().join("watchdog.db");
@@ -71,6 +88,71 @@ async fn test_api() -> AgentApi {
     )
     .await
     .expect("agent API should initialize")
+}
+
+async fn initialize_http_session(router: &Router) -> McpSessionId {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    serde_json::to_vec(&initialize_request())
+                        .expect("initialize request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router is infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize response should carry a session ID")
+        .to_str()
+        .expect("session header should be text")
+        .to_owned()
+        .into();
+    axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("initialize response should be bounded");
+    session
+}
+
+async fn register_http_main(router: &Router, session: &McpSessionId) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("host", "localhost")
+                .header("mcp-session-id", session.to_string())
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    serde_json::to_vec(&message(json!({
+                        "jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                            "name":"register_session","arguments":{
+                                "runtime":"claude_code","native_id":"expiring-main","kind":"main",
+                                "event_key":"register-expiring-main"
+                            }
+                        }
+                    })))
+                    .expect("registration request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router is infallible");
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("registration response should be bounded");
+    assert!(
+        http_json_rpc_body(&body).get("error").is_none(),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 fn listed_tool<'a>(listed: &'a Value, name: &str) -> &'a Value {
@@ -233,6 +315,7 @@ async fn http_mcp_route_requires_the_configured_bearer_token() {
     }
 
     let response = router
+        .clone()
         .oneshot(
             Request::post("/mcp")
                 .header("host", "localhost")
@@ -248,16 +331,187 @@ async fn http_mcp_route_requires_the_configured_bearer_token() {
         .await
         .expect("router is infallible");
     let status = response.status();
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize response should carry a session ID")
+        .clone();
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .expect("response body should be bounded");
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let listed_response = router
+        .oneshot(
+            Request::post("/mcp")
+                .header("host", "localhost")
+                .header("authorization", "Bearer correct-secret")
+                .header("mcp-session-id", session_id)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    serde_json::to_vec(&message(
+                        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+                    ))
+                    .expect("tools/list request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router is infallible");
+    let listed_status = listed_response.status();
+    let listed_body = axum::body::to_bytes(listed_response.into_body(), 256 * 1024)
+        .await
+        .expect("tools/list response should be bounded");
+    assert_eq!(
+        listed_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&listed_body)
+    );
+    let listed = http_json_rpc_body(&listed_body);
+    for expected in [
+        "register_session",
+        "register_delegation",
+        "get_session",
+        "get_session_tree",
+        "list_events",
+        "get_watchdog_health",
+    ] {
+        listed_tool(&listed, expected);
+    }
+}
+
+#[tokio::test]
+async fn mcp_binding_survives_transport_idle_periods() {
+    let api = test_api().await;
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let (session, transport) = manager
+        .create_session()
+        .await
+        .expect("rmcp session should be created");
+    let server = WatchdogMcpService::new(api);
+    let service = tokio::spawn(async move { server.serve(transport).await });
+    manager
+        .initialize_session(&session, initialize_request())
+        .await
+        .expect("session should initialize");
+
+    let registered = response(
+        &manager,
+        &session,
+        message(json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"register_session","arguments":{
+                    "runtime":"claude_code","native_id":"idle-main","kind":"main",
+                    "event_key":"register-idle-main"
+                }
+            }
+        })),
+    )
+    .await;
+    assert!(registered.get("error").is_none(), "{registered}");
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_mins(40)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+
+    let tree = response(
+        &manager,
+        &session,
+        message(json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"get_session_tree","arguments":{}
+            }
+        })),
+    )
+    .await;
+    assert!(tree.get("error").is_none(), "{tree}");
+
+    manager
+        .close_session(&session)
+        .await
+        .expect("session should close");
+    let running = service
+        .await
+        .expect("server task should join")
+        .expect("server should initialize");
+    running.waiting().await.expect("closed server should stop");
+}
+
+#[tokio::test]
+async fn mcp_idle_expiry_reclaims_capacity_and_transport_scope() {
+    let api = test_api().await;
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let factory_api = api.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(WatchdogMcpService::new(factory_api.clone())),
+        Arc::clone(&manager),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = Router::new().nest_service("/mcp", service);
+    let session = initialize_http_session(&router).await;
+    register_http_main(&router, &session).await;
+    let transport = TransportKey::new(session.to_string()).expect("transport should validate");
+    api.session_tree(&transport)
+        .await
+        .expect("registration should bind the transport");
+
+    let mut fillers = Vec::with_capacity(63);
+    for _ in 0..63 {
+        fillers.push(
+            manager
+                .create_session()
+                .await
+                .expect("filler session should fit within capacity"),
+        );
+    }
+    assert!(matches!(
+        manager.create_session().await,
+        Err(WatchdogSessionManagerError::Capacity)
+    ));
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_hours(48) + Duration::from_secs(1)).await;
+    for _ in 0..32 {
+        if !manager
+            .has_session(&session)
+            .await
+            .expect("session lookup should succeed")
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !manager
+            .has_session(&session)
+            .await
+            .expect("session lookup should succeed"),
+        "HTTP worker idle expiry should remove its manager entry"
+    );
+    assert!(matches!(
+        api.session_tree(&transport).await,
+        Err(AgentApiError::TransportNotBound)
+    ));
+
+    let replacement = manager
+        .create_session()
+        .await
+        .expect("idle expiry should release admission capacity");
+    for (session, _transport) in fillers.into_iter().chain([replacement]) {
+        manager
+            .close_session(&session)
+            .await
+            .expect("test session should close");
+    }
 }
 
 #[tokio::test]
 async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
     let api = test_api().await;
-    let manager = Arc::new(WatchdogSessionManager::default());
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
     let mut sessions = Vec::new();
     let mut services = Vec::new();
     for _ in 0..2 {
