@@ -706,10 +706,30 @@ Every query/mutation resolves the supplied session ID within that root tree.
 
 The rmcp transport ID is surfaced by a Watchdog `SessionManager` wrapper as a
 typed request extension. The application binds that opaque ID exactly once;
-rebinding and cross-tree targets fail server-side. rmcp's SSE replay cursor is
-transport-only. Parent event delivery and acknowledgement use a separate
-durable SQLite inbox cursor, so transport loss or resume failure cannot discard
+rebinding and cross-tree targets fail server-side. Because that ID is also the
+application authorization scope, Watchdog sets rmcp's local idle-session expiry
+to 48 hours: a binding remains valid across realistic coordinator idle periods,
+while genuinely abandoned transports are eventually closed and reclaimed. A
+new or expired transport must register its main again. Explicit or idle closure
+also releases the application scope, and admission is hard-capped at 64
+concurrent authenticated sessions so process state remains bounded. rmcp's SSE
+replay cursor is
+transport-only. Parent event delivery and acknowledgement use a separate durable
+SQLite inbox cursor, so transport loss or resume failure cannot discard
 agent-visible events. This boundary is executable in the Phase 0 scoping test.
+
+Main registration resolves a uniquely persisted runtime-native discovery alias
+before persisting a new session. This lets wrapper or transcript identities
+bind the already discovered canonical main without creating a parallel tree.
+Single and bulk alias resolution use the same exact-session candidates, and
+resolution is leased against concurrent in-process discovery updates until
+the alias resolves and its transport binding commits. The native ID is
+self-asserted, and rmcp permits a client-chosen ID during session restoration;
+alias-binding safety therefore assumes the documented single-tenant deployment
+with one shared Bearer credential. A multi-tenant deployment must authenticate
+and partition both identities before reusing this design. Ambiguous aliases and
+rejected transport rebindings fail before applying observations; child history
+is never reparented to accommodate a conflicting registration.
 
 Proposed tools:
 

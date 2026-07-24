@@ -20,7 +20,9 @@ use watchdog_runtime::{
     CapabilityRoot, DirectoryScanner, FileCursor, FileIdentity, IncrementalReader, ReadBudget,
     ReadOutcome, ScanBudget, ScanOrder,
 };
-use watchdog_store::{FileCursorRecord, RecordInputError, StoreError, WatchdogStore};
+use watchdog_store::{
+    DiscoveryAliasResolution, FileCursorRecord, RecordInputError, StoreError, WatchdogStore,
+};
 
 use crate::{AgentApi, DiscoveredSession, GitHubEnricher, RepositoryMetadata};
 
@@ -874,11 +876,16 @@ impl ClaudeDiscovery {
                 u32::try_from(MAX_DISCOVERY_ALIAS_CACHE).unwrap_or(u32::MAX),
             )
             .await?;
-        for (alias, canonical) in aliases {
-            if let Some(canonical) = canonical {
-                self.native_aliases.bind(alias, canonical);
-            } else {
-                self.native_aliases.mark_ambiguous(alias);
+        for (alias, _) in aliases {
+            let lease = self.store.lease_discovery_alias(&alias).await?;
+            match lease.resolution() {
+                DiscoveryAliasResolution::Unique(canonical) => {
+                    self.native_aliases.bind(alias, canonical);
+                }
+                DiscoveryAliasResolution::Ambiguous => {
+                    self.native_aliases.mark_ambiguous(alias);
+                }
+                DiscoveryAliasResolution::Absent => {}
             }
         }
         Ok(())
@@ -1493,7 +1500,9 @@ impl ClaudeDiscovery {
         canonical: SessionId,
         report: &mut RuntimeDiscoveryReport,
     ) {
-        if candidate.transcript_session == candidate.subject {
+        if candidate.transcript_session == candidate.subject
+            || candidate.parent.as_ref() == Some(&candidate.transcript_session)
+        {
             return;
         }
         if self
@@ -1507,6 +1516,28 @@ impl ClaudeDiscovery {
             .is_err()
         {
             report.warn();
+            return;
+        }
+        let Ok(lease) = self
+            .store
+            .lease_discovery_alias(&candidate.transcript_session)
+            .await
+        else {
+            report.warn();
+            return;
+        };
+        match lease.resolution() {
+            DiscoveryAliasResolution::Unique(resolved) if resolved == canonical => {
+                self.native_aliases
+                    .bind(candidate.transcript_session.clone(), canonical);
+            }
+            DiscoveryAliasResolution::Ambiguous => {
+                self.native_aliases
+                    .mark_ambiguous(candidate.transcript_session.clone());
+            }
+            DiscoveryAliasResolution::Absent | DiscoveryAliasResolution::Unique(_) => {
+                report.warn();
+            }
         }
     }
 
@@ -1598,10 +1629,6 @@ impl ClaudeDiscovery {
         if candidate.kind == SessionKind::Main {
             if let Some(alias) = cached_alias {
                 candidate.bind_team_alias(&alias);
-                self.native_aliases.bind(
-                    candidate.transcript_session.clone(),
-                    SessionId::from_native(&candidate.subject),
-                );
             } else if let Some(canonical) =
                 self.native_aliases.resolve(&candidate.transcript_session)
             {
@@ -1639,10 +1666,6 @@ impl ClaudeDiscovery {
                     "Selected unique Claude transcript correlation"
                 );
                 candidate.bind_team_alias(&alias);
-                self.native_aliases.bind(
-                    candidate.transcript_session.clone(),
-                    SessionId::from_native(&candidate.subject),
-                );
                 self.cache_alias(&candidate.path_key, alias);
             }
         }

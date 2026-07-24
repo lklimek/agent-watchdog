@@ -18,9 +18,9 @@ use watchdog_runtime::{
     SessionCoordinator, SessionQueue,
 };
 use watchdog_store::{
-    ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, ApplyResult, InboxOffsetRecord,
-    OutboxDestination, RelationRecord, SessionMetadataRecord, StoreError, StoredSessionRecord,
-    WatchdogStore,
+    ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, ApplyResult,
+    DiscoveryAliasResolution, InboxOffsetRecord, OutboxDestination, RelationRecord,
+    SessionMetadataRecord, StoreError, StoredSessionRecord, WatchdogStore,
 };
 
 pub(crate) const MAX_TREE_SESSIONS: u32 = 1_000;
@@ -367,6 +367,13 @@ impl ScopeRegistry {
             .copied()
             .ok_or(AgentApiError::TransportNotBound)
     }
+
+    fn release(&self, transport: &TransportKey) {
+        self.roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(transport);
+    }
 }
 
 struct AgentApiInner {
@@ -397,6 +404,10 @@ impl std::fmt::Debug for AgentApi {
 impl AgentApi {
     pub(crate) fn event_sequence(&self) -> Arc<EventSequence> {
         Arc::clone(&self.inner.event_sequence)
+    }
+
+    pub(crate) fn release_transport_scope(&self, transport: &TransportKey) {
+        self.inner.scopes.release(transport);
     }
 
     pub(crate) async fn discovered_session_identity(
@@ -678,7 +689,9 @@ impl AgentApi {
             }
         };
         let transport = discovery_transport(root)?;
-        self.inner.scopes.bind_once(transport.clone(), root)?;
+        if request.kind == SessionKind::Child {
+            self.inner.scopes.bind_once(transport.clone(), root)?;
+        }
         let provenance = RegistrationProvenance::Native {
             adapter_version: request.adapter_version,
             evidence_source: request.evidence_source,
@@ -835,6 +848,20 @@ impl AgentApi {
         let native = NativeSessionKey::new(request.runtime, request.native_id)?;
         let session_id = SessionId::from_native(&native);
         let now = self.inner.clock.now();
+        // Native identity and restorable transport IDs are caller-asserted. Alias
+        // leasing therefore relies on the documented single-tenant bearer boundary.
+        let alias_lease = self.inner.store.lease_discovery_alias(&native).await?;
+        if request.kind == SessionKind::Main
+            && let Some(record) = self
+                .resolve_aliased_main(transport, alias_lease.resolution())
+                .await?
+        {
+            drop(alias_lease);
+            let observation =
+                registration_observation(&record, &request.event_key, now, &provenance)?;
+            self.apply_observation(&record, observation).await?;
+            return self.view_for_record(&record).await;
+        }
         let (session, root, parent) = match request.kind {
             SessionKind::Main => {
                 let root = MainSessionId::from(session_id);
@@ -860,6 +887,10 @@ impl AgentApi {
         {
             return Err(AgentApiError::SessionIdentityConflict);
         }
+        if request.kind == SessionKind::Main {
+            self.inner.scopes.bind_once(transport.clone(), root)?;
+        }
+        drop(alias_lease);
         let observation = registration_observation(&record, &request.event_key, now, &provenance)?;
         let result = self.apply_observation(&record, observation).await?;
         if let Some(parent) = parent
@@ -868,10 +899,37 @@ impl AgentApi {
             self.save_relation(&record, &parent, &request.event_key, now, &provenance)
                 .await?;
         }
-        if request.kind == SessionKind::Main {
-            self.inner.scopes.bind_once(transport.clone(), root)?;
-        }
         self.view_for_record(&record).await
+    }
+
+    async fn resolve_aliased_main(
+        &self,
+        transport: &TransportKey,
+        resolution: DiscoveryAliasResolution,
+    ) -> Result<Option<StoredSessionRecord>, AgentApiError> {
+        let canonical = match resolution {
+            DiscoveryAliasResolution::Absent => return Ok(None),
+            DiscoveryAliasResolution::Unique(canonical) => canonical,
+            DiscoveryAliasResolution::Ambiguous => {
+                return Err(AgentApiError::SessionIdentityConflict);
+            }
+        };
+        let record = self
+            .inner
+            .store
+            .session_by_id(canonical)
+            .await?
+            .ok_or(AgentApiError::SessionIdentityConflict)?;
+        let SessionIdentity::Main(main) = record.session else {
+            return Err(AgentApiError::SessionIdentityConflict);
+        };
+        if main != record.root {
+            return Err(AgentApiError::SessionIdentityConflict);
+        }
+        self.inner
+            .scopes
+            .bind_once(transport.clone(), record.root)?;
+        Ok(Some(record))
     }
 
     /// Bind a transport to an already auto-discovered main session.

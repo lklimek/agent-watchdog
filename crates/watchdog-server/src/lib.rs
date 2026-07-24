@@ -46,7 +46,9 @@ pub use filesystem_activity::{
 pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};
 pub use hooks::{ClaudeHookService, CodexHookService, claude_hook_router, codex_hook_router};
-pub use mcp::{WatchdogMcpService, WatchdogSessionManager, mcp_router};
+pub use mcp::{
+    WatchdogMcpService, WatchdogSessionManager, WatchdogSessionManagerError, mcp_router,
+};
 pub use notifications::{
     HumanNotification, HumanNotifier, HumanOutboxDispatcher, NotificationConfigError,
     NotificationDelivery, NotificationDeliveryError, NotificationEndpoints, WebhookEndpoint,
