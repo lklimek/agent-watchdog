@@ -26,3 +26,39 @@ Phase 0 architecture probes and their measured decisions are recorded under
 [`docs/spikes`](docs/spikes/README.md). Production crates live under `crates/`.
 
 License: [MIT](LICENSE)
+
+## Claude Code plugin
+
+Agent Watchdog ships as a Claude Code plugin with an HTTP MCP connection and a
+coordinator skill. Start the server first by following the
+[Linux Docker Compose operations guide](docs/OPERATIONS.md).
+
+Keep the endpoint and Bearer credential in the environment that launches
+Claude Code. `AGENT_WATCHDOG_URL` is the base URL without `/mcp`; it defaults to
+`http://localhost:8080`. `WATCHDOG_BEARER_TOKEN` is required and must match the
+server setting:
+
+```bash
+export AGENT_WATCHDOG_URL=http://localhost:8080
+export WATCHDOG_BEARER_TOKEN='<load from your secret manager>'
+claude
+```
+
+Do not commit the real token or place it in tracked shell, Claude, or project
+configuration. Use HTTPS for any endpoint that is not confined to the trusted
+local host or network.
+
+After the Agent Watchdog entry is published in the `lklimek/agents`
+marketplace, install it from inside Claude Code:
+
+```text
+/plugin marketplace add lklimek/agents
+/plugin install agent-watchdog@lklimek
+/reload-plugins
+```
+
+Confirm the server is connected with `/mcp`. Coordinators can then invoke
+`/agent-watchdog:agent-watchdog`, and Claude can load the skill automatically
+when coordinating delegated agents. For local development before marketplace
+publication, run `claude --plugin-dir .` from this repository and use
+`/reload-plugins` after edits.
