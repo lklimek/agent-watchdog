@@ -1,0 +1,13 @@
+{
+  "name": "agent-watchdog",
+  "version": "0.1.0",
+  "description": "Monitor delegated agents and coordinate their lifecycle safely through Agent Watchdog.",
+  "author": {
+    "name": "lklimek",
+    "url": "https://github.com/lklimek"
+  },
+  "repository": "https://github.com/lklimek/agent-watchdog",
+  "license": "MIT",
+  "keywords": ["agents", "monitoring", "orchestration", "productivity", "mcp"],
+  "mcpServers": "./.claude-plugin/.mcp.json"
+}
