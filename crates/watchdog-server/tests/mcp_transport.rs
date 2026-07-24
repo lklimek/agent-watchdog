@@ -259,6 +259,32 @@ fn assert_event_cursor_contract(listed: &Value) {
     );
 }
 
+fn assert_structured_result_matches_schema(listed: &Value, tool_name: &str, called: &Value) {
+    let schema = &listed_tool(listed, tool_name)["outputSchema"];
+    assert!(
+        schema.is_object(),
+        "{tool_name} should advertise an output schema: {schema}"
+    );
+    let structured = &called["result"]["structuredContent"];
+    assert!(
+        structured.is_object(),
+        "{tool_name} should return structured content: {called}"
+    );
+    let text = called["result"]["content"]
+        .as_array()
+        .and_then(|content| content.first())
+        .and_then(|content| content["text"].as_str())
+        .expect("legacy text content should remain available");
+    let legacy: Value = serde_json::from_str(text).expect("legacy text content should remain JSON");
+    assert_eq!(
+        &legacy, structured,
+        "{tool_name} text and structured content should agree"
+    );
+    if let Err(error) = jsonschema::draft202012::validate(schema, structured) {
+        panic!("{tool_name} structured content should match output schema: {error}");
+    }
+}
+
 #[tokio::test]
 async fn http_mcp_route_requires_the_configured_bearer_token() {
     let router = mcp_router(
@@ -586,4 +612,88 @@ async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
             .expect("server should initialize");
         running.waiting().await.expect("closed server should stop");
     }
+}
+
+#[tokio::test]
+async fn structured_output_schemas_validate_live_tool_results() {
+    let api = test_api().await;
+    let manager = Arc::new(WatchdogSessionManager::default());
+    let (session, transport) = manager
+        .create_session()
+        .await
+        .expect("rmcp session should be created");
+    let server = WatchdogMcpService::new(api);
+    let service = tokio::spawn(async move { server.serve(transport).await });
+    manager
+        .initialize_session(&session, initialize_request())
+        .await
+        .expect("session should initialize");
+
+    let listed = response(
+        &manager,
+        &session,
+        message(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})),
+    )
+    .await;
+    for tool_name in [
+        "get_session",
+        "get_session_tree",
+        "register_watch_path",
+        "list_events",
+        "get_watchdog_health",
+    ] {
+        assert!(
+            listed_tool(&listed, tool_name)["outputSchema"].is_object(),
+            "{tool_name} should advertise an output schema"
+        );
+    }
+
+    let registered = response(
+        &manager,
+        &session,
+        message(json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"register_session","arguments":{
+                    "runtime":"claude_code","native_id":"structured-main","kind":"main",
+                    "event_key":"register-structured-main"
+                }
+            }
+        })),
+    )
+    .await;
+    assert!(registered.get("error").is_none(), "{registered}");
+    let main = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "structured-main")
+            .expect("native ID should be valid"),
+    );
+
+    for (request_id, tool_name, arguments) in [
+        (4, "get_session", json!({"session_id": main.to_string()})),
+        (5, "get_session_tree", json!({})),
+        (6, "list_events", json!({"limit": 10})),
+        (7, "get_watchdog_health", json!({})),
+    ] {
+        let called = response(
+            &manager,
+            &session,
+            message(json!({
+                "jsonrpc":"2.0","id":request_id,"method":"tools/call","params":{
+                    "name":tool_name,"arguments":arguments
+                }
+            })),
+        )
+        .await;
+        assert!(called.get("error").is_none(), "{tool_name}: {called}");
+        assert_structured_result_matches_schema(&listed, tool_name, &called);
+    }
+
+    manager
+        .close_session(&session)
+        .await
+        .expect("session should close");
+    let running = service
+        .await
+        .expect("server task should join")
+        .expect("server should initialize");
+    running.waiting().await.expect("closed server should stop");
 }
