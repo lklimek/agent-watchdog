@@ -149,6 +149,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-STA-015 | A current Claude team config is re-observed after restart without new transcript activity. | The lead and listed members clear the restart gate without fabricating progress or changing native state. | FR-DIS-001, FR-DATA-001, FR-UI-001 |
 | T-STA-016 | Scheduler ticks and compatibility-only observations arrive for a retained session after restart. | Neither clears the restart gate; only fresh native/process reconciliation can return the session to the active projection. | FR-DATA-001, FR-UI-001 |
 | T-STA-017 | Companion summary-only evidence is followed by matching summary-plus-detail evidence with the same native timestamp and state. | The source/consistency change receives a distinct observation identity and reconciles without an idempotency conflict. | FR-STA-009 |
+| T-STA-018 | A Companion job remains `running` with a stale activity timestamp, its verified runtime disappears, and a real target-branch commit is newer than that timestamp. | The disappearance alert remains immediate, but its diagnostics mark the terminal outcome uncertain and require an exact target-branch/worktree cross-check before failure is inferred. | FR-STA-006, FR-STA-007 |
 
 ### 5.5 Termination safety
 

@@ -191,6 +191,8 @@ pub struct AgentDiagnosticView {
     pub active_operation: Option<String>,
     /// Actionable material source-conflict summaries.
     pub source_conflicts: Vec<String>,
+    /// Whether liveness evidence cannot establish the job's terminal outcome.
+    pub outcome_uncertain: bool,
     /// Selected parent relation and its retained evidence.
     pub correlation: Option<AgentCorrelationView>,
     /// Bounded deterministic checks the parent can perform next.
@@ -1596,6 +1598,10 @@ impl AgentApi {
         let source_conflicts = snapshot
             .source_conflict()
             .then(|| "Authoritative runtime and agent sources currently disagree".to_owned());
+        let outcome_uncertain = !matches!(
+            snapshot.state(),
+            DetailedState::Completed | DetailedState::Failed | DetailedState::Cancelled
+        );
         let suggested_checks = suggested_checks(snapshot, &process_activity);
         Ok(AgentDiagnosticView {
             process_identity: snapshot.process_identity().cloned(),
@@ -1608,6 +1614,7 @@ impl AgentApi {
             },
             active_operation: snapshot.last_progress_summary().map(ToOwned::to_owned),
             source_conflicts: source_conflicts.into_iter().collect(),
+            outcome_uncertain,
             correlation,
             suggested_checks,
             process_activity,
@@ -1877,6 +1884,13 @@ fn suggested_checks(
     }
     if snapshot.source_conflict() {
         checks.push("Reconcile the conflicting runtime and agent status sources".into());
+    }
+    if snapshot.state() == DetailedState::Disappeared {
+        checks.push(
+            "Inspect the exact target branch and worktree for commits or changes newer than \
+             the last trusted activity before treating runtime absence as failure"
+                .into(),
+        );
     }
     checks
 }
