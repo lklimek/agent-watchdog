@@ -617,7 +617,7 @@ async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
 #[tokio::test]
 async fn structured_output_schemas_validate_live_tool_results() {
     let api = test_api().await;
-    let manager = Arc::new(WatchdogSessionManager::default());
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
     let (session, transport) = manager
         .create_session()
         .await
