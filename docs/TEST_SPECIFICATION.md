@@ -197,6 +197,7 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-MCP-007 | Push is unsupported or fails. | Durable inbox remains correct. | FR-MCP-006 |
 | T-MCP-008 | Adapter detected version first differs only in patch, then differs in minor or major. | Patch-only drift has no `UPGRADE`; a major/minor mismatch includes an actionable warning in the tool response. | FR-MCP-007 |
 | T-MCP-009 | Root A has an undelivered event while root B advances the global event sequence; root A then sends an oversized acknowledgement. | Root A clamps to its highest delivered event and still receives its undelivered event. | FR-MCP-004 |
+| T-MCP-010 | A real rmcp client lists the object-shaped session, tree, watch-path, event-page, and health tools and calls representative successful responses. | Each named tool advertises an object output schema. Called responses provide schema-valid structured content and equivalent JSON text for legacy clients. | FR-MCP-003 |
 | T-HTTP-001 | Missing/wrong/oversized Basic credential requests UI/API. | Browser challenge/failure contains no session metadata. | FR-UI-008, FR-SEC-001 |
 | T-HTTP-002 | API attempts a state mutation. | No route exists or method is rejected. | FR-API-001 |
 | T-HTTP-003 | Native title contains HTML/script. | Rendered page escapes it; CSP blocks execution. | FR-SEC-003 |

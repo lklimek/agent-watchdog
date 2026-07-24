@@ -25,7 +25,7 @@ pub enum DomainInputError {
 }
 
 /// UTF-8 text whose allocation is capped at compile time.
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, schemars::JsonSchema)]
 pub struct BoundedText<const MAX_BYTES: usize>(Box<str>);
 
 impl<const MAX_BYTES: usize> BoundedText<MAX_BYTES> {

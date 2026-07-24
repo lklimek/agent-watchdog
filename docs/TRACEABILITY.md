@@ -69,7 +69,7 @@ not accepted deferrals.
 | FR-KILL-007 | T-KILL-013 | Adapter boundary is read-only; cancellation interface and OS signals are the only mutation capabilities | Automated contract and final security inspection passed |
 | FR-MCP-001 | T-MCP-001 | Bearer middleware before rmcp parsing/allocation; auth and transport tests | Automated |
 | FR-MCP-002 | T-MCP-002, T-MCP-003 | One immutable main-tree scope per transport and cross-tree rejection | Automated |
-| FR-MCP-003 | T-MCP-004 | Twelve bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated |
+| FR-MCP-003 | T-MCP-004, T-MCP-010 | Twelve bounded runtime-neutral MCP tools plus live rmcp input/output-schema, structured-content, and legacy-text compatibility tests | Automated |
 | FR-MCP-004 | T-DATA-003, T-MCP-005, T-MCP-009 | Transactional parent inbox with separate delivered/acknowledged ceilings across roots and restart | Automated |
 | FR-MCP-005 | T-MCP-006 | Durable `AgentEventView` includes the explicit bounded FR-STA-007 diagnostic bundle without transcript retrieval | Automated |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |

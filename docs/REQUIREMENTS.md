@@ -184,7 +184,7 @@ The UI may show detailed state as secondary text, but must remain understandable
 |---|---|---|
 | FR-MCP-001 | The service exposes Streamable HTTP MCP behind Bearer authentication. | Missing/wrong Bearer credentials fail closed. |
 | FR-MCP-002 | An MCP client supplies its session ID and may query only that session and its descendants. | A request for an unrelated tree is rejected even with the shared server token. |
-| FR-MCP-003 | Agents can register sessions/delegations, report progress/waiting/completion, manage deadlines, list their tree, read events, and read health. | Tool schemas use runtime-neutral IDs and return normalized states plus provenance. |
+| FR-MCP-003 | Agents can register sessions/delegations, report progress/waiting/completion, manage deadlines, list their tree, read events, and read health. | Tool schemas use runtime-neutral IDs. Object-shaped session, tree, watch-path, event-page, and health responses advertise output schemas and return normalized state/provenance JSON as both structured content and backward-compatible text. |
 | FR-MCP-004 | Every meaningful child event is available to the parent through a durable inbox. | Disconnecting and reconnecting does not lose undelivered events. |
 | FR-MCP-005 | Parent-facing alerts include PID and detailed diagnostic evidence. | The event includes the fields in FR-STA-007 without requiring transcript retrieval. |
 | FR-MCP-006 | Best-effort push is a nice-to-have when a runtime/client supports safe delivery. | Failure or lack of push support never replaces or blocks durable inbox delivery. |

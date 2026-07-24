@@ -80,7 +80,7 @@ pub enum ReducerPolicyError {
 }
 
 /// Durable reducer state for one normalized session.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct SessionSnapshot {
     session: SessionIdentity,
     root: MainSessionId,

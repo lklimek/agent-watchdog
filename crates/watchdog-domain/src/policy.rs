@@ -133,7 +133,7 @@ pub enum DeadlineCommand {
 }
 
 /// Actionable compatibility warning category.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningKind {
     /// Agent Watchdog needs an adapter update for this native version.
@@ -143,7 +143,7 @@ pub enum WarningKind {
 }
 
 /// Bounded compatibility warning returned to agents and the UI.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct CompatibilityWarning {
     kind: WarningKind,
     message: BoundedText<MAX_WARNING_MESSAGE_BYTES>,
