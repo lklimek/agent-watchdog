@@ -585,7 +585,13 @@ being treated as negative evidence. The timer does not perform an expensive
 transcript rescan. Each parent event carries an explicit bounded diagnostic
 bundle: PID identity, latest process deltas and provenance, trusted signal
 times, active-operation summary, source conflicts, selected correlation
-basis/evidence, and deterministic suggested checks.
+basis/evidence, an explicit outcome-uncertainty flag, and deterministic
+suggested checks. Process disappearance proves that the sampled runtime is
+absent, not whether its work succeeded. Before treating disappearance as
+failure, callers inspect the exact registered target branch and worktree for
+commits or changes newer than the last trusted activity. Git evidence can
+corroborate delivered work, but cannot synthesize `completed` without a trusted
+target branch, baseline commit, and exclusive job ownership.
 
 ## 12. Termination safety architecture
 

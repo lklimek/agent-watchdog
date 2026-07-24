@@ -321,3 +321,13 @@ are outside v1 scope.
   an exclusion outside every capability root, then send `SIGHUP` again.
 - UI says reconnecting: the last snapshot remains visible while SSE retries;
   there is intentionally no polling fallback.
+- An external `CODEX_GONE reason=runtime-gone` signal confirms process absence,
+  not job failure. Before retrying or replacing completed work, inspect the exact
+  target branch and worktree for commits or changes newer than the last trusted
+  activity. Agent Watchdog exposes the same distinction as
+  `outcome_uncertain=true` on disappearance diagnostics.
+
+  The Codex Companion runtime owns its job JSON/log finalization. If it commits
+  work and exits before durably publishing terminal status, Agent Watchdog
+  cannot repair that stale upstream record or safely infer `completed` without
+  the expected branch, baseline commit, and exclusive job ownership.
