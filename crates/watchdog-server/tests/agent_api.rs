@@ -1,8 +1,9 @@
 //! Scoped durable parent-agent API acceptance tests.
 
-use std::sync::Arc;
+use std::{fs, path::Path, process::Command, sync::Arc};
 
 use sqlx::sqlite::SqliteConnectOptions;
+use watchdog_companion::CompanionParser;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, Clock, CorrelationBasis, DeadlineCommand, DetailedState,
     DomainEventKind, DurationMs, EvidenceTrust, MainSessionId, NativeSessionKey,
@@ -832,6 +833,97 @@ async fn parent_alert_event_contains_complete_bounded_diagnostics() {
     assert_complete_diagnostics(alert);
 }
 
+#[tokio::test]
+async fn runtime_absence_with_a_later_commit_reports_an_uncertain_outcome() {
+    const STALE_STATUS_EPOCH: u64 = 1_784_715_604;
+    const COMMIT_EPOCH: u64 = 1_784_718_759;
+
+    let repository = tempfile::tempdir().expect("repository fixture should exist");
+    initialize_repository(repository.path());
+    let (api, _store, clock) = api_fixture().await;
+    let transport =
+        TransportKey::new("companion-runtime-absence").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &transport,
+        "companion-runtime-absence-main",
+        "register-main",
+    )
+    .await;
+    let child = register_child(
+        &api,
+        &transport,
+        main,
+        "task-mrvxk4m5-heu75i",
+        "register-child",
+    )
+    .await;
+    let parser = CompanionParser::new("1.0.6").expect("version should be valid");
+    let detail = parser
+        .parse_detail(
+            &serde_json::to_vec(&serde_json::json!({
+                "id": "task-mrvxk4m5-heu75i",
+                "sessionId": "companion-runtime-absence-main",
+                "workspaceRoot": repository.path(),
+                "status": "running",
+                "phase": "investigating",
+                "pid": 871_478,
+                "updatedAt": "2026-07-22T10:20:04Z",
+                "completedAt": null
+            }))
+            .expect("job fixture should serialize"),
+        )
+        .expect("stale running detail should parse");
+    let reconciled = parser
+        .reconcile(None, Some(&detail))
+        .expect("detail-only job should reconcile");
+    api.ingest_native_observation(
+        parser
+            .observation(&reconciled, "stale-running-status", clock.now())
+            .expect("stale status observation should be valid"),
+    )
+    .await
+    .expect("stale running status should apply");
+
+    create_deliverable_commit(repository.path());
+    let commit_epoch = latest_commit_epoch(repository.path());
+    assert_eq!(commit_epoch, COMMIT_EPOCH);
+    assert!(commit_epoch > STALE_STATUS_EPOCH);
+    clock.advance(DurationMs::new((COMMIT_EPOCH - STALE_STATUS_EPOCH) * 1_000));
+
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "task-mrvxk4m5-heu75i")
+        .expect("native identity should be valid");
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "runtime-absent")
+            .expect("observation ID should be valid"),
+        clock.now(),
+        DetailedState::Disappeared,
+    ))
+    .await
+    .expect("verified runtime absence should apply");
+
+    let page = api
+        .list_events(&transport, Some(0), 100)
+        .await
+        .expect("parent events should list");
+    let alert = page
+        .events
+        .iter()
+        .find(|view| {
+            view.event.subject().session_id() == child
+                && matches!(view.event.kind(), DomainEventKind::AlertDue)
+        })
+        .expect("runtime absence must still alert");
+    assert_eq!(alert.session.snapshot.state(), DetailedState::Disappeared);
+    assert!(alert.diagnostics.outcome_uncertain);
+    assert!(alert.diagnostics.suggested_checks.iter().any(|check| {
+        check
+            == "Inspect the exact target branch and worktree for commits or changes newer than \
+                the last trusted activity before treating runtime absence as failure"
+    }));
+}
+
 async fn prepare_diagnostic_child(
     api: &AgentApi,
     store: &WatchdogStore,
@@ -951,6 +1043,64 @@ fn assert_complete_diagnostics(alert: &AgentEventView) {
     assert_eq!(correlation.basis, CorrelationBasis::McpRegistration);
     assert!(correlation.evidence.starts_with("mcp:register_delegation:"));
     assert!(!alert.diagnostics.suggested_checks.is_empty());
+}
+
+fn initialize_repository(repository: &Path) {
+    run_git(
+        repository,
+        &["init", "-b", "chore/bump-platform-pin-pr3968"],
+    );
+    run_git(repository, &["config", "user.name", "Codex"]);
+    run_git(
+        repository,
+        &["config", "user.email", "codex@example.invalid"],
+    );
+}
+
+fn create_deliverable_commit(repository: &Path) {
+    fs::write(repository.join("deliverable.txt"), "completed work\n")
+        .expect("deliverable fixture should write");
+    run_git(repository, &["add", "deliverable.txt"]);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args([
+            "commit",
+            "-m",
+            "fix(wallet-backend): reap persisted FVK row on wallet removal",
+        ])
+        .env("GIT_AUTHOR_DATE", "2026-07-22T11:12:39Z")
+        .env("GIT_COMMITTER_DATE", "2026-07-22T11:12:39Z")
+        .output()
+        .expect("git commit should run");
+    assert!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn latest_commit_epoch(repository: &Path) -> u64 {
+    String::from_utf8(run_git(repository, &["log", "-1", "--format=%ct"]).stdout)
+        .expect("commit timestamp should be UTF-8")
+        .trim()
+        .parse()
+        .expect("commit timestamp should be numeric")
+}
+
+fn run_git(repository: &Path, arguments: &[&str]) -> std::process::Output {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn native_state_observation(

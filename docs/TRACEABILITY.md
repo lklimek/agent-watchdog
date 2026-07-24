@@ -57,7 +57,7 @@ not accepted deferrals.
 | FR-STA-004 | T-STA-002 | Adapter provenance plus global reducer fallback policy | Automated |
 | FR-STA-005 | T-STA-002 | Five-minute suspect and fifteen-minute stall defaults and fake-time tests | Automated |
 | FR-STA-006 | T-STA-007 | Authoritative failure and verified process disappearance reduce immediately | Automated |
-| FR-STA-007 | T-STA-008 | Process sampling precedes timer evaluation; `AgentDiagnosticView` includes PID, latest CPU delta/provenance, trusted times, operation, conflicts, correlation, and suggested checks | Automated |
+| FR-STA-007 | T-STA-008, T-STA-018 | Process sampling precedes timer evaluation; `AgentDiagnosticView` includes PID, latest CPU delta/provenance, trusted times, operation, conflicts, correlation, outcome uncertainty, and a target-branch/worktree cross-check for runtime disappearance | Automated |
 | FR-STA-008 | T-STA-009 | Monotonic five-minute reminder reducer/outbox behavior | Automated |
 | FR-STA-009 | T-DIS-005, T-STA-010, T-STA-014, T-STA-017 | Source-sensitive stable observation IDs, transactional store, durable event cursor, restart boundary | Automated |
 | FR-KILL-001 | T-KILL-001 | `ChildSessionId`-only safety/termination entry points and main rejection tests | Automated |
