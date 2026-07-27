@@ -331,10 +331,22 @@ are outside v1 scope.
   read `mcp_sessions` in the MCP `get_watchdog_health` response for live
   occupancy, the configured cap, and the eviction count. Sustained eviction
   means the cap is too low for this host: raise `[mcp] max_sessions` in
-  `watchdog.toml`. That setting and `[mcp] idle_ttl_seconds` (48 hours by
-  default, the idle window after which an abandoned transport is reclaimed)
-  apply at **startup only** — `SIGHUP` does not reload them, so restart the
-  service after changing either.
+  `watchdog.toml`. That setting, `[mcp] idle_ttl_seconds` (48 hours by
+  default, the idle window after which an abandoned transport is reclaimed), and
+  `[mcp] request_body_timeout_seconds` apply at **startup only** — `SIGHUP` does
+  not reload them, so restart the service after changing any of them.
+- MCP clients get `408` where a call used to hang: the request body never
+  arrived in full within `[mcp] request_body_timeout_seconds` (30 by default).
+  The client stalled mid-send, or the connection through Traefik went bad after
+  the headers. Grep `mcp.request_body_timeout` for the bound being hit and
+  `mcp.request_body_unreadable` for a body that broke rather than stalled; both
+  record the route and the configured bound. Without this bound the request
+  produces **no server-side trace at all** — rmcp reads the entire body before
+  session lookup or logging, so the proxy logs a request the backend never
+  appears to receive. A `408` is therefore the diagnosis, not the defect: look
+  at the client and the network path. Raise the bound only if legitimate clients
+  genuinely need longer to send one JSON-RPC call. Long-lived server-push (`GET`
+  SSE) streams are deliberately outside this bound and never time out from it.
 - A Codex Companion runtime-gone signal (its job record reports the process
   absent) confirms process absence, not job failure. Before retrying or
   replacing completed work, inspect the exact target branch and worktree for

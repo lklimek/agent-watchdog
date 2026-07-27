@@ -77,6 +77,7 @@ not accepted deferrals.
 | FR-MCP-008 | T-MCP-011, T-MCP-013 | `[mcp]` TOML bounds validated at load; `mcp_idle_expiry_reclaims_capacity_and_transport_scope` and `mcp_session_admission_is_atomic_under_concurrent_create_and_restore` | Automated |
 | FR-MCP-009 | T-MCP-012 | Longest-idle eviction through the shared release path plus the `get_watchdog_health` occupancy gauge; `mcp_session_admission_evicts_the_longest_idle_session_at_capacity`, `mcp_admission_at_capacity_evicts_the_longest_idle_transport`, `mcp_router_publishes_session_occupancy_in_agent_health` | Automated |
 | FR-MCP-010 | T-MCP-014 | Leased alias resolution on main registration; hook and discovery callers bind the returned canonical identity (`hook_children_register_against_the_alias_resolved_canonical_main`, `mcp_main_registration_resolves_discovery_alias_before_child_retry`) | Automated |
+| FR-MCP-011 | T-MCP-015 | Request-body bound layered inside `/mcp` authentication; `mcp_post_with_a_stalled_request_body_is_bounded_and_logged`, `mcp_server_push_stream_outlives_the_request_body_bound`, `mcp_limits_default_to_the_shipped_bounds_and_reject_a_zero_bound` | Automated |
 
 ## UI, notifications, and API
 

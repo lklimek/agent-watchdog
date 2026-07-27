@@ -49,7 +49,7 @@ pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};
 pub use hooks::{ClaudeHookService, CodexHookService, claude_hook_router, codex_hook_router};
 pub use mcp::{
-    McpSessionLimits, McpSessionLimitsError, WatchdogMcpService, WatchdogSessionManager,
+    McpLimits, McpLimitsError, WatchdogMcpService, WatchdogSessionManager,
     WatchdogSessionManagerError, mcp_router,
 };
 pub use notifications::{

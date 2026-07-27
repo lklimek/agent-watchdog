@@ -12,7 +12,7 @@ use watchdog_domain::{
     RuntimeKind,
 };
 
-use crate::{McpSessionLimits, McpSessionLimitsError, PathMappingError, WorktreePathMapping};
+use crate::{McpLimits, McpLimitsError, PathMappingError, WorktreePathMapping};
 
 const MAX_CONFIG_BYTES: u64 = 1_024 * 1_024;
 const MAX_RELOAD_ERROR_BYTES: usize = 1_024;
@@ -56,7 +56,7 @@ pub(crate) struct RuntimeConfig {
     sigkill_enabled: bool,
     warning_grace: DurationMs,
     action_grace: DurationMs,
-    mcp_sessions: McpSessionLimits,
+    mcp: McpLimits,
 }
 
 impl RuntimeConfig {
@@ -121,9 +121,9 @@ impl RuntimeConfig {
         self.action_grace
     }
 
-    /// MCP transport-admission policy, applied at startup only.
-    pub(crate) const fn mcp_sessions(&self) -> McpSessionLimits {
-        self.mcp_sessions
+    /// MCP endpoint bounds, applied at startup only.
+    pub(crate) const fn mcp(&self) -> McpLimits {
+        self.mcp
     }
 }
 
@@ -282,9 +282,10 @@ impl RawConfig {
         let reducer_policy = ReducerPolicy::new(suspect_after, stalled_after, reminder_every)?;
         let deadline_policy =
             DeadlinePolicy::new(stalled_after, terminate_after_stalled, action_grace)?;
-        let mcp_sessions = McpSessionLimits::new(
+        let mcp = McpLimits::new(
             self.mcp.max_sessions,
             std::time::Duration::from_secs(self.mcp.idle_ttl_seconds),
+            std::time::Duration::from_secs(self.mcp.request_body_timeout_seconds),
         )?;
 
         Ok(RuntimeConfig {
@@ -308,7 +309,7 @@ impl RawConfig {
             sigkill_enabled: self.termination.sigkill_enabled,
             warning_grace,
             action_grace,
-            mcp_sessions,
+            mcp,
         })
     }
 }
@@ -411,13 +412,15 @@ impl Default for RawTermination {
 struct RawMcp {
     max_sessions: usize,
     idle_ttl_seconds: u64,
+    request_body_timeout_seconds: u64,
 }
 
 impl Default for RawMcp {
     fn default() -> Self {
         Self {
-            max_sessions: McpSessionLimits::DEFAULT_MAX_SESSIONS,
-            idle_ttl_seconds: McpSessionLimits::DEFAULT_IDLE_TTL.as_secs(),
+            max_sessions: McpLimits::DEFAULT_MAX_SESSIONS,
+            idle_ttl_seconds: McpLimits::DEFAULT_IDLE_TTL.as_secs(),
+            request_body_timeout_seconds: McpLimits::DEFAULT_REQUEST_BODY_TIMEOUT.as_secs(),
         }
     }
 }
@@ -534,7 +537,7 @@ pub(crate) enum ConfigError {
     #[error(transparent)]
     DeadlinePolicy(#[from] PolicyError),
     #[error(transparent)]
-    McpSessionLimits(#[from] McpSessionLimitsError),
+    McpLimits(#[from] McpLimitsError),
 }
 
 #[cfg(test)]
@@ -613,26 +616,34 @@ mod tests {
     }
 
     #[test]
-    fn mcp_session_limits_default_to_the_shipped_bounds_and_reject_an_empty_cap() {
+    fn mcp_limits_default_to_the_shipped_bounds_and_reject_a_zero_bound() {
         let fixture = ConfigFixture::new();
         fixture.write(&fixture.valid_toml());
         let limits = ConfigManager::load(&fixture.config_path)
             .expect("omitted [mcp] should fall back to defaults")
             .current()
-            .mcp_sessions();
+            .mcp();
         assert_eq!(limits.max_sessions(), 64);
         assert_eq!(limits.idle_ttl(), std::time::Duration::from_hours(48));
+        assert_eq!(
+            limits.request_body_timeout(),
+            std::time::Duration::from_secs(30)
+        );
 
         fixture.write(&format!(
-            "{}\n[mcp]\nmax_sessions = 8\nidle_ttl_seconds = 3600\n",
+            "{}\n[mcp]\nmax_sessions = 8\nidle_ttl_seconds = 3600\nrequest_body_timeout_seconds = 45\n",
             fixture.valid_toml()
         ));
         let configured = ConfigManager::load(&fixture.config_path)
             .expect("explicit [mcp] should load")
             .current()
-            .mcp_sessions();
+            .mcp();
         assert_eq!(configured.max_sessions(), 8);
         assert_eq!(configured.idle_ttl(), std::time::Duration::from_hours(1));
+        assert_eq!(
+            configured.request_body_timeout(),
+            std::time::Duration::from_secs(45)
+        );
 
         fixture.write(&format!(
             "{}\n[mcp]\nmax_sessions = 0\n",
@@ -641,6 +652,15 @@ mod tests {
         assert!(
             ConfigManager::load(&fixture.config_path).is_err(),
             "a zero cap would leave eviction with no slot to free"
+        );
+
+        fixture.write(&format!(
+            "{}\n[mcp]\nrequest_body_timeout_seconds = 0\n",
+            fixture.valid_toml()
+        ));
+        assert!(
+            ConfigManager::load(&fixture.config_path).is_err(),
+            "a zero body timeout would refuse every request before its first byte"
         );
     }
 

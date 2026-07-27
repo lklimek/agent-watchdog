@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use watchdog_domain::{NativeSessionKey, RuntimeKind, SessionId, TimePoint, WallTimeMs};
 use watchdog_server::{
-    AgentApi, AgentApiError, BearerAuthenticator, McpSessionLimits, TransportKey,
-    WatchdogMcpService, WatchdogSessionManager, mcp_router,
+    AgentApi, AgentApiError, BearerAuthenticator, McpLimits, TransportKey, WatchdogMcpService,
+    WatchdogSessionManager, mcp_router,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
@@ -432,7 +432,7 @@ async fn http_mcp_route_requires_the_configured_bearer_token() {
     let router = mcp_router(
         test_api().await,
         BearerAuthenticator::new("correct-secret").expect("token should be valid"),
-        McpSessionLimits::default(),
+        McpLimits::default(),
     );
     for authorization in [None, Some("Bearer wrong-secret")] {
         let mut request = Request::post("/mcp")
@@ -530,7 +530,7 @@ async fn mcp_binding_survives_transport_idle_periods() {
     let api = test_api().await;
     let manager = Arc::new(WatchdogSessionManager::new(
         api.clone(),
-        McpSessionLimits::default(),
+        McpLimits::default(),
     ));
     let (session, transport) = manager
         .create_session()
@@ -591,7 +591,7 @@ async fn mcp_idle_expiry_reclaims_capacity_and_transport_scope() {
     let api = test_api().await;
     let manager = Arc::new(WatchdogSessionManager::new(
         api.clone(),
-        McpSessionLimits::default(),
+        McpLimits::default(),
     ));
     let factory_api = api.clone();
     let service = StreamableHttpService::new(
@@ -667,8 +667,12 @@ async fn mcp_admission_at_capacity_evicts_the_longest_idle_transport() {
     const CAPACITY: usize = 3;
 
     let api = test_api().await;
-    let limits = McpSessionLimits::new(CAPACITY, Duration::from_hours(48))
-        .expect("test limits should validate");
+    let limits = McpLimits::new(
+        CAPACITY,
+        Duration::from_hours(48),
+        McpLimits::DEFAULT_REQUEST_BODY_TIMEOUT,
+    )
+    .expect("test limits should validate");
     let manager = Arc::new(WatchdogSessionManager::new(api.clone(), limits));
     let factory_api = api.clone();
     let service = StreamableHttpService::new(
@@ -749,7 +753,7 @@ async fn mcp_router_publishes_session_occupancy_in_agent_health() {
     let router = mcp_router(
         api,
         BearerAuthenticator::new("occupancy-secret").expect("token should be valid"),
-        McpSessionLimits::default(),
+        McpLimits::default(),
     );
     let session = initialize_authenticated_session(&router, "occupancy-secret").await;
     let registered = authenticated_tool_call(
@@ -782,7 +786,7 @@ async fn mcp_router_publishes_session_occupancy_in_agent_health() {
     );
     assert_eq!(
         occupancy["capacity"],
-        McpSessionLimits::DEFAULT_MAX_SESSIONS,
+        McpLimits::DEFAULT_MAX_SESSIONS,
         "{health}"
     );
     assert_eq!(occupancy["evicted"], 0, "{health}");
@@ -793,7 +797,7 @@ async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
     let api = test_api().await;
     let manager = Arc::new(WatchdogSessionManager::new(
         api.clone(),
-        McpSessionLimits::default(),
+        McpLimits::default(),
     ));
     let mut sessions = Vec::new();
     let mut services = Vec::new();
@@ -963,7 +967,7 @@ async fn structured_output_schemas_validate_live_tool_results() {
     let api = test_api().await;
     let manager = Arc::new(WatchdogSessionManager::new(
         api.clone(),
-        McpSessionLimits::default(),
+        McpLimits::default(),
     ));
     let (session, transport) = manager
         .create_session()
@@ -1048,4 +1052,188 @@ async fn structured_output_schemas_validate_live_tool_results() {
         .expect("server task should join")
         .expect("server should initialize");
     running.waiting().await.expect("closed server should stop");
+}
+
+/// Generous bound standing in for "the endpoint never answered at all".
+const STALL_DETECTION_BOUND: Duration = Duration::from_mins(10);
+
+/// Collects one test's `tracing` output so a log contract can be asserted.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A client that announces a body and then never sends it.
+fn stalled_body() -> Body {
+    Body::from_stream(futures::stream::pending::<
+        Result<axum::body::Bytes, std::io::Error>,
+    >())
+}
+
+#[tokio::test]
+async fn mcp_post_with_a_stalled_request_body_is_bounded_and_logged() {
+    let logs = CapturedLogs::default();
+    let _capture = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish(),
+    );
+    let router = mcp_router(
+        test_api().await,
+        BearerAuthenticator::new("stall-secret").expect("token should be valid"),
+        McpLimits::default(),
+    );
+
+    // Virtual time only once the store is open: a clock paused any earlier
+    // trips sqlx's pool-acquisition timeout before it can connect.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let response = tokio::time::timeout(
+        STALL_DETECTION_BOUND,
+        router.oneshot(
+            Request::post("/mcp")
+                .header("host", "localhost")
+                .header("authorization", "Bearer stall-secret")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(stalled_body())
+                .expect("request should build"),
+        ),
+    )
+    .await
+    .expect("a stalled request body must never park the MCP endpoint indefinitely")
+    .expect("router is infallible");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::REQUEST_TIMEOUT,
+        "a stalled body deserves an explicit answer, not a dropped connection"
+    );
+    // Virtual time, so the only slack is the timer wheel's millisecond tick.
+    let bound = McpLimits::default().request_body_timeout();
+    let elapsed = started.elapsed();
+    assert!(
+        (bound..bound + Duration::from_secs(1)).contains(&elapsed),
+        "the answer must arrive on the configured bound of {bound:?}, not merely eventually: {elapsed:?}"
+    );
+    let captured = logs.text();
+    assert!(
+        captured.contains("mcp.request_body_timeout"),
+        "the timeout must leave a greppable server-side trace: {captured}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_stalled_request_body_is_refused_on_credentials_before_it_is_read() {
+    let router = mcp_router(
+        test_api().await,
+        BearerAuthenticator::new("order-secret").expect("token should be valid"),
+        McpLimits::default(),
+    );
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let response = tokio::time::timeout(
+        STALL_DETECTION_BOUND,
+        router.oneshot(
+            Request::post("/mcp")
+                .header("host", "localhost")
+                .header("authorization", "Bearer wrong-secret")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(stalled_body())
+                .expect("request should build"),
+        ),
+    )
+    .await
+    .expect("an unauthenticated stalled body must not be waited on at all")
+    .expect("router is infallible");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Authentication is the outer layer, so a rejected caller never gets to
+    // occupy the endpoint for the length of the body bound.
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "credentials must be checked on headers alone, before any body is read"
+    );
+}
+
+#[tokio::test]
+async fn mcp_server_push_stream_outlives_the_request_body_bound() {
+    let router = mcp_router(
+        test_api().await,
+        BearerAuthenticator::new("push-secret").expect("token should be valid"),
+        McpLimits::default(),
+    );
+    let session = initialize_authenticated_session(&router, "push-secret").await;
+    tokio::time::pause();
+
+    let response = router
+        .oneshot(
+            Request::get("/mcp")
+                .header("host", "localhost")
+                .header("authorization", "Bearer push-secret")
+                .header("mcp-session-id", session.to_string())
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router is infallible");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the standalone server-push stream should open"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "the guarded response must actually be the long-lived SSE stream"
+    );
+
+    let idle = McpLimits::default().request_body_timeout() * 5;
+    let mut frames = response.into_body().into_data_stream();
+    match tokio::time::timeout(idle, frames.next()).await {
+        Err(_) | Ok(Some(Ok(_))) => {}
+        Ok(other) => panic!(
+            "a long-lived server-push stream must not be cut by the request-body bound: {other:?}"
+        ),
+    }
 }

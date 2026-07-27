@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -51,42 +51,51 @@ const MAX_MCP_ERROR_BODY_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TransportScope(McpSessionId);
 
-/// Admission policy bounding concurrent authenticated MCP transports.
+/// Bounds the MCP endpoint applies to transport admission and request reads.
 ///
-/// Both bounds are read once at startup: rmcp bakes the idle timeout into each
-/// session worker when the session is created, so neither is `SIGHUP`-reloadable.
+/// Every bound is read once at startup: rmcp bakes the idle timeout into each
+/// session worker when the session is created, so none is `SIGHUP`-reloadable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct McpSessionLimits {
+pub struct McpLimits {
     max_sessions: usize,
     idle_ttl: Duration,
+    request_body_timeout: Duration,
 }
 
-impl McpSessionLimits {
+impl McpLimits {
     /// Concurrent authenticated transports admitted when unconfigured.
     pub const DEFAULT_MAX_SESSIONS: usize = 64;
     /// Idle period after which an abandoned transport is reclaimed, unconfigured.
     pub const DEFAULT_IDLE_TTL: Duration = Duration::from_hours(48);
+    /// Patience for one stalled request body when unconfigured.
+    pub const DEFAULT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Validate one transport-admission policy.
+    /// Validate one set of MCP endpoint bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`McpSessionLimitsError`] when either bound is zero. A zero cap
-    /// would admit nothing and leave eviction with no slot to free; a zero idle
-    /// TTL would expire every transport immediately.
+    /// Returns [`McpLimitsError`] when any bound is zero. A zero cap would admit
+    /// nothing and leave eviction with no slot to free, a zero idle TTL would
+    /// expire every transport immediately, and a zero body timeout would reject
+    /// every request before its first byte.
     pub const fn new(
         max_sessions: usize,
         idle_ttl: Duration,
-    ) -> Result<Self, McpSessionLimitsError> {
+        request_body_timeout: Duration,
+    ) -> Result<Self, McpLimitsError> {
         if max_sessions == 0 {
-            return Err(McpSessionLimitsError::EmptyCapacity);
+            return Err(McpLimitsError::EmptyCapacity);
         }
         if idle_ttl.is_zero() {
-            return Err(McpSessionLimitsError::ZeroIdleTtl);
+            return Err(McpLimitsError::ZeroIdleTtl);
+        }
+        if request_body_timeout.is_zero() {
+            return Err(McpLimitsError::ZeroRequestBodyTimeout);
         }
         Ok(Self {
             max_sessions,
             idle_ttl,
+            request_body_timeout,
         })
     }
 
@@ -101,26 +110,36 @@ impl McpSessionLimits {
     pub const fn idle_ttl(self) -> Duration {
         self.idle_ttl
     }
+
+    /// Time one request body has to arrive in full before it is refused.
+    #[must_use]
+    pub const fn request_body_timeout(self) -> Duration {
+        self.request_body_timeout
+    }
 }
 
-impl Default for McpSessionLimits {
+impl Default for McpLimits {
     fn default() -> Self {
         Self {
             max_sessions: Self::DEFAULT_MAX_SESSIONS,
             idle_ttl: Self::DEFAULT_IDLE_TTL,
+            request_body_timeout: Self::DEFAULT_REQUEST_BODY_TIMEOUT,
         }
     }
 }
 
-/// Rejected MCP transport-admission policy.
+/// Rejected MCP endpoint bounds.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum McpSessionLimitsError {
+pub enum McpLimitsError {
     /// `max_sessions` was zero.
     #[error("MCP max_sessions must be at least 1")]
     EmptyCapacity,
     /// `idle_ttl_seconds` was zero.
     #[error("MCP idle_ttl_seconds must be at least 1")]
     ZeroIdleTtl,
+    /// `request_body_timeout_seconds` was zero.
+    #[error("MCP request_body_timeout_seconds must be at least 1")]
+    ZeroRequestBodyTimeout,
 }
 
 /// rmcp session manager that injects the opaque transport identity into every
@@ -132,7 +151,7 @@ pub enum McpSessionLimitsError {
 #[derive(Debug)]
 pub struct WatchdogSessionManager {
     inner: LocalSessionManager,
-    limits: McpSessionLimits,
+    limits: McpLimits,
     creation: Mutex<()>,
     activity: std::sync::RwLock<HashMap<McpSessionId, Instant>>,
     occupancy: Arc<McpSessionGauge>,
@@ -155,16 +174,16 @@ impl WatchdogSessionManager {
     /// Construct an rmcp session manager that releases application scope when
     /// a transport closes, expires, or is evicted under admission pressure.
     #[must_use]
-    pub fn new(api: AgentApi, limits: McpSessionLimits) -> Self {
+    pub fn new(api: AgentApi, limits: McpLimits) -> Self {
         Self::build(Some(api), limits)
     }
 
     #[cfg(test)]
-    fn without_application_scope(limits: McpSessionLimits) -> Self {
+    fn without_application_scope(limits: McpLimits) -> Self {
         Self::build(None, limits)
     }
 
-    fn build(api: Option<AgentApi>, limits: McpSessionLimits) -> Self {
+    fn build(api: Option<AgentApi>, limits: McpLimits) -> Self {
         let mut inner = LocalSessionManager::default();
         inner.session_config.keep_alive = Some(limits.idle_ttl);
         Self {
@@ -371,7 +390,7 @@ impl SessionManager for WatchdogSessionManager {
 /// Create the stateful Streamable HTTP MCP service and its occupancy gauge.
 fn mcp_http_service(
     api: AgentApi,
-    limits: McpSessionLimits,
+    limits: McpLimits,
 ) -> StreamableHttpService<WatchdogMcpService, WatchdogSessionManager> {
     let manager = Arc::new(WatchdogSessionManager::new(api.clone(), limits));
     api.configure_mcp_sessions(manager.gauge());
@@ -384,16 +403,19 @@ fn mcp_http_service(
 
 /// Build the `/mcp` Streamable HTTP route behind strict shared-token auth.
 ///
-/// Authentication runs before rmcp parses or allocates protocol state. Failure
-/// responses are deliberately fixed and never reflect credential input.
-pub fn mcp_router(
-    api: AgentApi,
-    authenticator: BearerAuthenticator,
-    limits: McpSessionLimits,
-) -> Router {
+/// Authentication runs before rmcp parses or allocates protocol state, and a
+/// request body that never arrives is refused before rmcp waits on it forever.
+/// Failure responses are deliberately fixed and never reflect credential input.
+pub fn mcp_router(api: AgentApi, authenticator: BearerAuthenticator, limits: McpLimits) -> Router {
     let service = mcp_http_service(api, limits);
+    let request_body_timeout = limits.request_body_timeout();
     Router::new()
         .nest_service("/mcp", service)
+        .layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                bounded_request_body(request, next, request_body_timeout)
+            },
+        ))
         .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {
                 let authenticator = authenticator.clone();
@@ -414,6 +436,45 @@ pub fn mcp_router(
                 }
             },
         ))
+}
+
+/// Bound how long the endpoint waits for one MCP request body.
+///
+/// rmcp collects the whole POST body before any session lookup or logging and
+/// never bounds that read, so a client stalling mid-send parks the handler with
+/// nothing recorded anywhere. Request bodies only: a server-push stream is a
+/// response body and stays long-lived.
+async fn bounded_request_body(request: Request<Body>, next: Next, timeout: Duration) -> Response {
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    match tokio::time::timeout(timeout, axum::body::to_bytes(body, usize::MAX)).await {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                event = "mcp.request_body_unreadable",
+                %error,
+                "MCP request body failed mid-read; the client connection broke before the body completed"
+            );
+            (StatusCode::BAD_REQUEST, "MCP request body was unreadable").into_response()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                event = "mcp.request_body_timeout",
+                timeout_seconds = timeout.as_secs(),
+                "MCP request body did not arrive in full within the configured bound; raise [mcp] request_body_timeout_seconds in watchdog.toml if legitimate clients need longer"
+            );
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                "MCP request body timed out before it was complete",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Re-answer capacity exhaustion as retryable.
@@ -1030,24 +1091,33 @@ mod tests {
 
     use super::{
         AgentApiError, Body, CAPACITY_MARKER, CAPACITY_RETRY_AFTER_SECONDS, DeadlineActionParam,
-        IntoResponse as _, McpSessionLimits, McpSessionLimitsError, RestoreOutcome, StatusCode,
+        IntoResponse as _, McpLimits, McpLimitsError, RestoreOutcome, StatusCode,
         WatchdogSessionManager, WatchdogSessionManagerError, api_error, header,
         retryable_capacity_response,
     };
 
     #[test]
-    fn session_limits_reject_bounds_that_would_admit_or_retain_nothing() {
+    fn limits_reject_bounds_that_would_admit_retain_or_read_nothing() {
         assert_eq!(
-            McpSessionLimits::new(0, Duration::from_hours(1)),
-            Err(McpSessionLimitsError::EmptyCapacity)
+            McpLimits::new(
+                0,
+                Duration::from_hours(1),
+                McpLimits::DEFAULT_REQUEST_BODY_TIMEOUT
+            ),
+            Err(McpLimitsError::EmptyCapacity)
         );
         assert_eq!(
-            McpSessionLimits::new(1, Duration::ZERO),
-            Err(McpSessionLimitsError::ZeroIdleTtl)
+            McpLimits::new(1, Duration::ZERO, McpLimits::DEFAULT_REQUEST_BODY_TIMEOUT),
+            Err(McpLimitsError::ZeroIdleTtl)
         );
-        let defaults = McpSessionLimits::default();
+        assert_eq!(
+            McpLimits::new(1, Duration::from_hours(1), Duration::ZERO),
+            Err(McpLimitsError::ZeroRequestBodyTimeout)
+        );
+        let defaults = McpLimits::default();
         assert_eq!(defaults.max_sessions(), 64);
         assert_eq!(defaults.idle_ttl(), Duration::from_hours(48));
+        assert_eq!(defaults.request_body_timeout(), Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -1130,8 +1200,7 @@ mod tests {
 
     #[test]
     fn mcp_session_idle_ttl_is_long_and_finite() {
-        let manager =
-            WatchdogSessionManager::without_application_scope(McpSessionLimits::default());
+        let manager = WatchdogSessionManager::without_application_scope(McpLimits::default());
 
         assert_eq!(
             manager.inner.session_config.keep_alive,
@@ -1150,7 +1219,7 @@ mod tests {
     fn spawn_concurrent_admissions(
         manager: &Arc<WatchdogSessionManager>,
     ) -> (Arc<Barrier>, Vec<tokio::task::JoinHandle<Admission>>) {
-        let attempts = McpSessionLimits::DEFAULT_MAX_SESSIONS * 2;
+        let attempts = McpLimits::DEFAULT_MAX_SESSIONS * 2;
         let barrier = Arc::new(Barrier::new(attempts + 1));
         let mut tasks = Vec::with_capacity(attempts);
         for index in 0..attempts {
@@ -1216,7 +1285,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mcp_session_admission_is_atomic_under_concurrent_create_and_restore() {
         let manager = Arc::new(WatchdogSessionManager::without_application_scope(
-            McpSessionLimits::default(),
+            McpLimits::default(),
         ));
 
         let creation = manager.creation.lock().await;
@@ -1232,14 +1301,14 @@ mod tests {
         // Serialized admission is what keeps the map at the cap: any interleaving
         // that skipped the mutex would leave more live sessions than capacity.
         let occupancy = manager.occupancy();
-        assert_eq!(occupancy.admitted, McpSessionLimits::DEFAULT_MAX_SESSIONS);
+        assert_eq!(occupancy.admitted, McpLimits::DEFAULT_MAX_SESSIONS);
         assert_eq!(
             manager.inner.sessions.read().await.len(),
-            McpSessionLimits::DEFAULT_MAX_SESSIONS
+            McpLimits::DEFAULT_MAX_SESSIONS
         );
         assert_eq!(
             occupancy.evicted,
-            (admitted.len() - McpSessionLimits::DEFAULT_MAX_SESSIONS) as u64
+            (admitted.len() - McpLimits::DEFAULT_MAX_SESSIONS) as u64
         );
         close_admitted(&manager, admitted).await;
     }
@@ -1248,8 +1317,12 @@ mod tests {
     async fn mcp_session_admission_evicts_the_longest_idle_session_at_capacity() {
         const CAPACITY: usize = 4;
 
-        let limits = McpSessionLimits::new(CAPACITY, McpSessionLimits::DEFAULT_IDLE_TTL)
-            .expect("test limits should validate");
+        let limits = McpLimits::new(
+            CAPACITY,
+            McpLimits::DEFAULT_IDLE_TTL,
+            McpLimits::DEFAULT_REQUEST_BODY_TIMEOUT,
+        )
+        .expect("test limits should validate");
         let manager = WatchdogSessionManager::without_application_scope(limits);
         let mut sessions = Vec::with_capacity(CAPACITY);
         for _ in 0..CAPACITY {

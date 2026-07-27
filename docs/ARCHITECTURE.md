@@ -728,9 +728,23 @@ than being refused: a parked binding must never outrank a live one, and
 reconnect churn must never lock the surface out. Eviction, explicit closure,
 and idle expiry release the application scope through the same path, so
 capacity and scope are always reclaimed together. A new, evicted, or expired
-transport must register its main again. Both bounds are read at startup and are
-not `SIGHUP`-reloadable, because rmcp fixes a session's idle timeout when that
-session is created. rmcp's SSE replay cursor is transport-only. Parent event
+transport must register its main again. All `[mcp]` bounds are read at startup
+and are not `SIGHUP`-reloadable, because rmcp fixes a session's idle timeout
+when that session is created.
+
+The `/mcp` route stacks two middleware layers outside rmcp. Bearer
+authentication is outermost, so an unauthenticated caller is rejected on headers
+alone, before any body is read or protocol state allocated. Inside it, a
+request-body bound answers `408` once a `POST` body has taken longer than
+`[mcp] request_body_timeout_seconds` (30 by default) to arrive in full. That
+bound exists because rmcp collects the entire request body before session
+lookup or any logging: a client stalling mid-send would otherwise park the
+handler indefinitely and leave no trace anywhere on the server, the exact
+failure this layer converts into a logged, diagnosable answer. It bounds the
+total read rather than the gap between chunks, so a client dribbling bytes is
+refused too. Only request bodies are bounded — `GET` server-push streams are
+response bodies and remain long-lived by design. rmcp's SSE replay cursor is
+transport-only. Parent event
 delivery and acknowledgement use a separate durable SQLite inbox cursor, so
 transport loss or resume failure cannot discard agent-visible events. The
 integration tests in `crates/watchdog-server/tests/mcp_transport.rs` execute

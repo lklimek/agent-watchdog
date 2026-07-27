@@ -161,6 +161,11 @@ re-registration above:
 Only durable events are affected by none of these: the inbox cursor is stored
 server-side, so a lost transport never discards unread events.
 
+An HTTP `408` is **not** one of these. It means the request body never reached
+the server in full within `[mcp] request_body_timeout_seconds` (30 by default),
+so the call never ran. The binding survives: retry the same call, reusing its
+`event_key` because the mutation did not happen. Do not re-register the tree.
+
 Registering a main session may resolve a runtime-native ID through the
 discovery **alias** table onto an already-discovered canonical session. Always
 use the `session_id` from the registration response as the parent for later
