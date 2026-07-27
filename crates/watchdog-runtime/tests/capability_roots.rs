@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Capability-root path containment acceptance tests.
+#![cfg(target_os = "linux")]
 
 use std::{
     ffi::OsString,

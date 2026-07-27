@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Durable child-only termination saga acceptance tests.
+#![cfg(target_os = "linux")]
 
 use std::{
     collections::VecDeque,

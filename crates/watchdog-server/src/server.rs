@@ -19,12 +19,18 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
-use watchdog_domain::{AdapterIdentity, BoundedText, Clock as _, RuntimeKind, SecretText};
+#[cfg(target_os = "linux")]
+use watchdog_domain::{AdapterIdentity, BoundedText, Clock as _};
+use watchdog_domain::{RuntimeKind, SecretText};
+#[cfg(target_os = "linux")]
 use watchdog_runtime::{
-    CapabilityRoot, ComponentId, ComponentStatus, DirectoryScanner, ScanBudget, ScanUncertainty,
-    WatchService, WatchSignal, WatchTargetId,
+    CapabilityRoot, DirectoryScanner, ScanBudget, ScanUncertainty, WatchService, WatchSignal,
+    WatchTargetId,
 };
-use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus, WatchdogStore};
+use watchdog_runtime::{ComponentId, ComponentStatus};
+use watchdog_store::WatchdogStore;
+#[cfg(target_os = "linux")]
+use watchdog_store::{AdapterHealthRecord, AdapterHealthStatus};
 
 use crate::config::{ConfigManager, RuntimeConfig};
 #[cfg(target_os = "linux")]
@@ -33,25 +39,35 @@ use crate::process_monitor::ProcessMonitor;
 use crate::termination::TerminationMonitor;
 use crate::watch_paths::WatchPathRegistry;
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeDiscovery, ClaudeHookService,
-    CodexDiscovery, CodexHookService, CompanionDiscovery, DashboardOutboxDispatcher,
-    DashboardService, DiscoveryAliasRegistry, FilesystemActivityReconciler, GitHubEnricher,
+    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeHookService, CodexHookService,
+    DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler, GitHubEnricher,
     HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints, RepositoryMetadata,
-    RuntimeDiscoveryReport, SystemClock, TerminationConfig, WebhookEndpoint, claude_hook_router,
-    codex_hook_router, dashboard_router, health_router, mcp_router,
+    SystemClock, WebhookEndpoint, claude_hook_router, codex_hook_router, dashboard_router,
+    health_router, mcp_router,
+};
+#[cfg(target_os = "linux")]
+use crate::{
+    ClaudeDiscovery, CodexDiscovery, CompanionDiscovery, DiscoveryAliasRegistry,
+    RuntimeDiscoveryReport, TerminationConfig,
 };
 
 const MAX_ENV_PATH_BYTES: usize = 4_096;
+#[cfg(target_os = "linux")]
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
+#[cfg(target_os = "linux")]
 const WATCH_TARGET_LIMIT: usize = 4_096;
+#[cfg(target_os = "linux")]
 const WATCH_SCAN_DEPTH: usize = 8;
+#[cfg(target_os = "linux")]
 const WATCH_SCAN_ENTRY_LIMIT: usize = 65_536;
 const FILESYSTEM_ACTIVITY_QUEUE_CAPACITY: usize = 64;
 const MAX_GITHUB_SESSIONS: u32 = 1_000;
 const GITHUB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 const DASHBOARD_DELIVERY_LIMIT: u32 = 256;
 const NOTIFICATION_DELIVERY_LIMIT: u32 = 128;
+#[cfg(target_os = "linux")]
 const PERIODIC_RECONCILIATION: Duration = Duration::from_mins(5);
+#[cfg(target_os = "linux")]
 const DISCOVERY_EVENT_COALESCE: Duration = Duration::from_secs(1);
 const TIMER_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const CLAUDE_DISCOVERY_BIT: u8 = 1 << 0;
@@ -728,6 +744,7 @@ struct DiscoveryWorkerContext {
     watch_paths: WatchPathRegistry,
 }
 
+#[cfg(target_os = "linux")]
 fn start_discovery(api: AgentApi, context: DiscoveryWorkerContext) -> JoinHandle<()> {
     let aliases = DiscoveryAliasRegistry::default();
     let discoveries = RuntimeDiscoveries {
@@ -748,12 +765,20 @@ fn start_discovery(api: AgentApi, context: DiscoveryWorkerContext) -> JoinHandle
     spawn_discovery_worker(discoveries, context)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn start_discovery(api: AgentApi, context: DiscoveryWorkerContext) -> JoinHandle<()> {
+    let _ = (api, context);
+    tokio::spawn(std::future::pending())
+}
+
+#[cfg(target_os = "linux")]
 struct RuntimeDiscoveries {
     claude: ClaudeDiscovery,
     codex: CodexDiscovery,
     companion: CompanionDiscovery,
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_discovery_worker(
     discoveries: RuntimeDiscoveries,
     context: DiscoveryWorkerContext,
@@ -860,6 +885,7 @@ fn spawn_discovery_worker(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn mark_filesystem_reconciliation_complete(
     health: &HealthService,
     uncertainty_generation: &AtomicU64,
@@ -874,6 +900,7 @@ fn mark_filesystem_reconciliation_complete(
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn record_discovery_health(
     store: &WatchdogStore,
     clock: &SystemClock,
@@ -1013,6 +1040,33 @@ fn spawn_reload_worker(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn spawn_watcher_supervisor(
+    config: ConfigManager,
+    health: HealthService,
+    stop: Arc<AtomicBool>,
+    discovery: DiscoveryScheduler,
+    filesystem_activity: mpsc::Sender<Vec<PathBuf>>,
+    filesystem_uncertainty_generation: Arc<AtomicU64>,
+    watch_paths: WatchPathRegistry,
+) -> JoinHandle<()> {
+    let _ = (
+        config,
+        stop,
+        discovery,
+        filesystem_activity,
+        filesystem_uncertainty_generation,
+        watch_paths,
+    );
+    health.record(
+        ComponentId::Watcher,
+        ComponentStatus::Degraded,
+        Some("Filesystem watching is unsupported on this platform"),
+    );
+    tokio::spawn(async {})
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_watcher_supervisor(
     config: ConfigManager,
     health: HealthService,
@@ -1078,6 +1132,7 @@ fn spawn_watcher_supervisor(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn reconcile_watch_targets(
     watcher: Option<&WatchRegistry>,
     targets: &[WatchTargetId],
@@ -1154,12 +1209,14 @@ fn spawn_filesystem_activity_worker(
     })
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct WatchTargetRoutes {
     runtimes: BTreeMap<WatchTargetId, RuntimeKind>,
     worktree_paths: BTreeMap<WatchTargetId, PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 impl WatchTargetRoutes {
     fn actions(&self, targets: &[WatchTargetId]) -> WatchTargetActions {
         let mut discovery = DiscoveryRequest::none();
@@ -1179,17 +1236,20 @@ impl WatchTargetRoutes {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct WatchTargetActions {
     discovery: DiscoveryRequest,
     worktree_paths: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 struct WatchRegistry {
     service: WatchService,
     routes: WatchTargetRoutes,
 }
 
+#[cfg(target_os = "linux")]
 fn build_watcher(
     config: &RuntimeConfig,
     health: &HealthService,
@@ -1198,6 +1258,7 @@ fn build_watcher(
     build_watcher_with_limit(config, health, registered, WATCH_TARGET_LIMIT)
 }
 
+#[cfg(target_os = "linux")]
 fn build_watcher_with_limit(
     config: &RuntimeConfig,
     health: &HealthService,
@@ -1287,6 +1348,7 @@ fn build_watcher_with_limit(
     })
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn add_runtime_watch_paths(
     watcher: &mut WatchService,
@@ -1356,6 +1418,7 @@ fn add_runtime_watch_paths(
     }
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn add_exact_worktree_watch_paths(
     watcher: &mut WatchService,
@@ -1454,10 +1517,12 @@ fn add_exact_worktree_watch_paths(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn target_budget_exhausted(next_target: u64, target_limit: usize) -> bool {
     usize::try_from(next_target).map_or(true, |target| target > target_limit)
 }
 
+#[cfg(target_os = "linux")]
 fn log_runtime_watch_issue(runtime: RuntimeKind, reason: &'static str) {
     tracing::warn!(
         event = "watcher.coverage_incomplete",
@@ -1468,6 +1533,7 @@ fn log_runtime_watch_issue(runtime: RuntimeKind, reason: &'static str) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn log_worktree_watch_issue(reason: &'static str) {
     tracing::warn!(
         event = "watcher.coverage_incomplete",
@@ -1477,6 +1543,7 @@ fn log_worktree_watch_issue(reason: &'static str) {
     );
 }
 
+#[cfg(target_os = "linux")]
 const fn watch_uncertainty_code(uncertainty: ScanUncertainty) -> &'static str {
     match uncertainty {
         ScanUncertainty::DepthBudget => "depth_budget",
@@ -1487,6 +1554,7 @@ const fn watch_uncertainty_code(uncertainty: ScanUncertainty) -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn native_worktree_path(
     mounted_path: &Path,
     mappings: &[crate::WorktreePathMapping],
@@ -1714,9 +1782,10 @@ mod tests {
     use watchdog_runtime::{ComponentId, ComponentStatus};
     use watchdog_testkit::FakeClock;
 
+    use super::{BootstrapConfig, ConfigManager, DiscoveryRequest, check_liveness};
+    #[cfg(target_os = "linux")]
     use super::{
-        BootstrapConfig, ConfigManager, DiscoveryRequest, WatchTargetRoutes,
-        build_watcher_with_limit, check_liveness, mark_filesystem_reconciliation_complete,
+        WatchTargetRoutes, build_watcher_with_limit, mark_filesystem_reconciliation_complete,
         native_worktree_path,
     };
     use crate::{HealthService, watch_paths::WatchPathRegistry};
@@ -1788,6 +1857,7 @@ mod tests {
         assert!(!error.contains(secret));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn watched_container_directory_projects_back_to_native_worktree_path() {
         let mounted = tempfile::tempdir().expect("mounted root should exist");
@@ -1802,6 +1872,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn newer_filesystem_uncertainty_cannot_be_cleared_by_an_older_reconciliation() {
         let health = HealthService::new(Arc::new(FakeClock::new(TimePoint::new(
@@ -1829,6 +1900,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn watch_targets_route_only_to_the_affected_runtime_or_worktree() {
         let codex = watchdog_runtime::WatchTargetId::new(1).expect("valid Codex target");
@@ -1869,6 +1941,7 @@ mod tests {
         assert_eq!(scheduler.take(), DiscoveryRequest::none());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn broad_worktree_allowlist_cannot_starve_runtime_watch_roots() {
         let fixture = tempfile::tempdir().expect("fixture root should exist");

@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Directory budget and shared-worktree attribution acceptance tests.
+#![cfg(target_os = "linux")]
 
 use std::{fs, path::Path};
 

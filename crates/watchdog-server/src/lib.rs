@@ -5,6 +5,7 @@ mod auth;
 mod clock;
 mod config;
 mod dashboard;
+#[cfg(target_os = "linux")]
 mod discovery;
 mod filesystem_activity;
 mod github;
@@ -12,6 +13,7 @@ mod health;
 mod hooks;
 mod mcp;
 mod notifications;
+mod path_mapping;
 #[cfg(target_os = "linux")]
 mod process_monitor;
 mod server;
@@ -35,10 +37,10 @@ pub use dashboard::{
     DashboardScope, DashboardService, DashboardSnapshot, DashboardSort, DashboardWarning,
     dashboard_router,
 };
+#[cfg(target_os = "linux")]
 pub use discovery::{
     ClaudeDiscovery, ClaudeDiscoveryReport, CodexDiscovery, CodexDiscoveryReport,
-    CompanionDiscovery, CompanionDiscoveryReport, DiscoveryAliasRegistry, PathMappingError,
-    RuntimeDiscoveryReport, WorktreePathMapping,
+    CompanionDiscovery, CompanionDiscoveryReport, DiscoveryAliasRegistry, RuntimeDiscoveryReport,
 };
 pub use filesystem_activity::{
     FilesystemActivityError, FilesystemActivityReconciler, FilesystemActivityReport,
@@ -53,6 +55,7 @@ pub use notifications::{
     HumanNotification, HumanNotifier, HumanOutboxDispatcher, NotificationConfigError,
     NotificationDelivery, NotificationDeliveryError, NotificationEndpoints, WebhookEndpoint,
 };
+pub use path_mapping::{PathMappingError, WorktreePathMapping};
 pub use server::{ServerError, healthcheck_from_environment, init_tracing, run_from_environment};
 #[cfg(target_os = "linux")]
 pub use termination::{
