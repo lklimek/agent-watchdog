@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Per-session admission and transactional coordination contracts.
+#![cfg(target_os = "linux")]
 
 use std::sync::Arc;
 
