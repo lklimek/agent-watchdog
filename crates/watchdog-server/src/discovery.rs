@@ -262,21 +262,27 @@ async fn ensure_native_parent(
         }
         return Ok(parent_id);
     }
-    api.discover_session(DiscoveredSession {
-        runtime: discovery.runtime,
-        native_id: parent.native_id().to_owned(),
-        kind: SessionKind::Main,
-        parent: None,
-        event_key: discovery_key(discovery.event_key_prefix, parent_id),
-        adapter_version: discovery.adapter_version.to_owned(),
-        evidence_source: discovery.evidence_source.to_owned(),
-        title: None,
-        startup_directory: None,
-    })
-    .await?;
-    mains.insert(parent_id);
-    report.main_sessions = report.main_sessions.saturating_add(1);
-    Ok(parent_id)
+    // Alias resolution can redirect this registration onto a canonical main, so
+    // the parent is the identity discovery returns, not the asserted native key.
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: discovery.runtime,
+            native_id: parent.native_id().to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: discovery_key(discovery.event_key_prefix, parent_id),
+            adapter_version: discovery.adapter_version.to_owned(),
+            evidence_source: discovery.evidence_source.to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await?
+        .session
+        .session_id();
+    if mains.insert(canonical) {
+        report.main_sessions = report.main_sessions.saturating_add(1);
+    }
+    Ok(canonical)
 }
 
 /// Claude team reconciliation report.
@@ -772,23 +778,20 @@ impl ClaudeDiscovery {
     }
 
     async fn hydrate_native_aliases(&self) -> Result<(), StoreError> {
-        let aliases = self
+        // The batched query resolves every alias with the same exact-session
+        // candidates a single lease would; re-leasing per alias would take the
+        // process-wide alias mutex once per row for an identical answer.
+        for (alias, canonical) in self
             .store
             .discovery_aliases(
                 RuntimeKind::ClaudeCode,
                 u32::try_from(MAX_DISCOVERY_ALIAS_CACHE).unwrap_or(u32::MAX),
             )
-            .await?;
-        for (alias, _) in aliases {
-            let lease = self.store.lease_discovery_alias(&alias).await?;
-            match lease.resolution() {
-                DiscoveryAliasResolution::Unique(canonical) => {
-                    self.native_aliases.bind(alias, canonical);
-                }
-                DiscoveryAliasResolution::Ambiguous => {
-                    self.native_aliases.mark_ambiguous(alias);
-                }
-                DiscoveryAliasResolution::Absent => {}
+            .await?
+        {
+            match canonical {
+                Some(canonical) => self.native_aliases.bind(alias, canonical),
+                None => self.native_aliases.mark_ambiguous(alias),
             }
         }
         Ok(())
@@ -1091,16 +1094,18 @@ impl ClaudeDiscovery {
         mains: &mut BTreeSet<SessionId>,
         children: &mut BTreeSet<SessionId>,
     ) {
-        let main_id = SessionId::from_native(team.lead());
+        let asserted_main = SessionId::from_native(team.lead());
         let main_directory = validated_directory(team.lead_cwd(), worktree_mappings, report);
-        if let Err(error) = self
+        // Alias resolution can redirect the lead onto a canonical main, so every
+        // member registers against the identity discovery returns.
+        let main_id = match self
             .api
             .discover_session(DiscoveredSession {
                 runtime: RuntimeKind::ClaudeCode,
                 native_id: team.lead().native_id().to_owned(),
                 kind: SessionKind::Main,
                 parent: None,
-                event_key: discovery_key("claude-team", main_id),
+                event_key: discovery_key("claude-team", asserted_main),
                 adapter_version: watchdog_claude::TESTED_CLAUDE_VERSION.to_owned(),
                 evidence_source: "claude:team-config".to_owned(),
                 title: None,
@@ -1108,10 +1113,13 @@ impl ClaudeDiscovery {
             })
             .await
         {
-            log_reconcile_failure(RuntimeKind::ClaudeCode, "main", &error);
-            report.warn();
-            return;
-        }
+            Ok(view) => view.session.session_id(),
+            Err(error) => {
+                log_reconcile_failure(RuntimeKind::ClaudeCode, "main", &error);
+                report.warn();
+                return;
+            }
+        };
         if self
             .api
             .mark_native_reconciled(
@@ -1980,11 +1988,59 @@ impl ClaudeDiscovery {
             ),
         )
         .map_err(|_| ())?;
-        self.api
+        let view = self
+            .api
             .ingest_native_observation(observation)
             .await
             .map_err(|_| ())?;
+        if view.snapshot.source_conflict() {
+            self.emit_claude_source_conflict_resolution(candidate, event_key)
+                .await;
+        }
         Ok((Some(observation_id), false))
+    }
+
+    /// Clear the source-conflict latch once this transcript agrees with its
+    /// native identity again.
+    ///
+    /// Without a reset path the latch is a one-way ratchet, so every session
+    /// that ever conflicted would report an uncertain outcome forever. The
+    /// returned snapshot already carries the flag, so this costs no extra read
+    /// and fires at most once per conflict.
+    async fn emit_claude_source_conflict_resolution(
+        &self,
+        candidate: &ClaudeTranscriptCandidate,
+        event_key: &str,
+    ) {
+        let resolved = ObservationId::from_native(
+            RuntimeKind::ClaudeCode,
+            "transcript-conflict-resolved",
+            event_key,
+        )
+        .ok()
+        .zip(claude_transcript_source("transcript:identity-agreed").ok())
+        .and_then(|(observation_id, source)| {
+            ObservationEnvelope::new(
+                observation_id,
+                candidate.subject.clone(),
+                self.clock.now(),
+                source,
+                ObservationPayload::SourceConflictResolved,
+            )
+            .ok()
+        });
+        if let Some(observation) = resolved
+            && self
+                .api
+                .ingest_native_observation(observation)
+                .await
+                .is_err()
+        {
+            tracing::debug!(
+                event = "discovery.conflict_resolution_dropped",
+                "Claude transcript identity agreed again but the resolution did not persist"
+            );
+        }
     }
 
     async fn persist_claude_cursor(

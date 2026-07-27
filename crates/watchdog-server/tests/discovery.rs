@@ -251,6 +251,92 @@ async fn claude_project_discovery_tails_main_and_subagent_transcripts_incrementa
     .await;
 }
 
+#[tokio::test]
+async fn claude_transcript_identity_conflict_clears_once_the_identity_agrees_again() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let (projects_root, mounted_worktrees, child_transcript) =
+        create_claude_transcript_fixtures(fixture.path());
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let discovery = ClaudeDiscovery::new(api, store.clone(), clock.clone());
+    let runtime_mapping =
+        WorktreePathMapping::new("/home/test/.claude/projects", projects_root.clone())
+            .expect("runtime path mapping should be valid");
+    let worktree_mapping = WorktreePathMapping::new("/host/repositories", mounted_worktrees)
+        .expect("worktree mapping should be valid");
+    reconcile_claude_fixture(
+        &discovery,
+        &projects_root,
+        &runtime_mapping,
+        &worktree_mapping,
+    )
+    .await;
+    let child = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query")[0]
+        .session;
+
+    let mut transcript = fs::OpenOptions::new()
+        .append(true)
+        .open(&child_transcript)
+        .expect("child transcript should reopen");
+    transcript
+        .write_all(
+            b"{\"type\":\"assistant\",\"sessionId\":\"main-session\",\"agentId\":\"impostor\",\"cwd\":\"/host/repositories/child\",\"message\":{\"content\":\"x\"}}\n",
+        )
+        .expect("conflicting record should append");
+    clock.advance(DurationMs::new(1_000));
+    reconcile_claude_fixture(
+        &discovery,
+        &projects_root,
+        &runtime_mapping,
+        &worktree_mapping,
+    )
+    .await;
+    let conflicted = load_snapshot(&store, child).await;
+    let conflicted = conflicted
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist");
+    assert!(
+        conflicted.source_conflict(),
+        "a mismatched transcript identity should raise the conflict latch"
+    );
+    assert_eq!(conflicted.state(), DetailedState::Unknown);
+
+    transcript
+        .write_all(
+            b"{\"type\":\"assistant\",\"sessionId\":\"main-session\",\"agentId\":\"child-1\",\"cwd\":\"/host/repositories/child\",\"message\":{\"content\":\"y\"}}\n",
+        )
+        .expect("agreeing record should append");
+    clock.advance(DurationMs::new(1_000));
+    reconcile_claude_fixture(
+        &discovery,
+        &projects_root,
+        &runtime_mapping,
+        &worktree_mapping,
+    )
+    .await;
+    let resolved = load_snapshot(&store, child).await;
+    let resolved = resolved
+        .reducer_snapshot()
+        .expect("reducer snapshot should exist");
+    assert!(
+        !resolved.source_conflict(),
+        "the latch must clear once the transcript identity agrees again, or every \
+         conflicted session stays uncertain forever"
+    );
+    assert_ne!(resolved.state(), DetailedState::Unknown);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn claude_live_registry_excludes_absent_retained_main_without_directory_deduplication() {

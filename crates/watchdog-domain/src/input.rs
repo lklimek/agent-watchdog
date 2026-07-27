@@ -25,8 +25,12 @@ pub enum DomainInputError {
 }
 
 /// UTF-8 text whose allocation is capped at compile time.
+///
+/// JSON Schema `maxLength` counts characters, so for non-ASCII text the
+/// advertised bound is looser than the UTF-8 byte budget enforced here; it is
+/// never tighter, so a schema-valid value is never rejected by the schema alone.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, schemars::JsonSchema)]
-pub struct BoundedText<const MAX_BYTES: usize>(Box<str>);
+pub struct BoundedText<const MAX_BYTES: usize>(#[schemars(length(max = MAX_BYTES))] Box<str>);
 
 impl<const MAX_BYTES: usize> BoundedText<MAX_BYTES> {
     /// Validate and store a bounded UTF-8 value.

@@ -10,8 +10,12 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use tower::ServiceExt as _;
-use watchdog_domain::{Clock, DetailedState, SessionKind, TimePoint, WallTimeMs};
-use watchdog_server::{AgentApi, BearerAuthenticator, ClaudeHookService, claude_hook_router};
+use watchdog_domain::{
+    Clock, DetailedState, NativeSessionKey, RuntimeKind, SessionKind, TimePoint, WallTimeMs,
+};
+use watchdog_server::{
+    AgentApi, BearerAuthenticator, ClaudeHookService, DiscoveredSession, claude_hook_router,
+};
 use watchdog_store::WatchdogStore;
 
 #[tokio::test]
@@ -94,6 +98,70 @@ async fn bearer_hook_ingestion_creates_exact_hierarchy_without_retaining_body_co
             .observations
             > after_main.observations
     );
+}
+
+#[tokio::test]
+async fn hook_children_register_against_the_alias_resolved_canonical_main() {
+    let fixture = tempfile::tempdir().expect("fixture should exist");
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(AdvancingClock::default());
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "canonical-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-canonical-main".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:canonical-main".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("canonical main should be discovered");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper-main")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            canonical.session.session_id(),
+            clock.now().wall_time(),
+        )
+        .await
+        .expect("wrapper alias should persist");
+
+    let router = claude_hook_router(
+        ClaudeHookService::new(api, clock),
+        BearerAuthenticator::new("hook-secret").expect("token should be valid"),
+    );
+    let child = br#"{"session_id":"wrapper-main","agent_id":"aliased-child","agent_type":"reviewer","cwd":"/private/repository","hook_event_name":"SubagentStart"}"#;
+    assert_eq!(
+        send_hook(&router, Some("Bearer hook-secret"), child).await,
+        StatusCode::NO_CONTENT,
+        "an aliased parent must not drop the child's runtime evidence"
+    );
+
+    let mains = store
+        .sessions_by_kind(SessionKind::Main, 10)
+        .await
+        .expect("mains should query");
+    let children = store
+        .sessions_by_kind(SessionKind::Child, 10)
+        .await
+        .expect("children should query");
+    assert_eq!(
+        mains.len(),
+        1,
+        "the alias must enrich the canonical main rather than fork a parallel tree"
+    );
+    assert_eq!(mains[0].native.native_id(), "canonical-main");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].root, canonical.root);
 }
 
 #[derive(Debug, Default)]

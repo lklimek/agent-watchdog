@@ -12,7 +12,7 @@ use watchdog_domain::{
     RuntimeKind,
 };
 
-use crate::{PathMappingError, WorktreePathMapping};
+use crate::{McpSessionLimits, McpSessionLimitsError, PathMappingError, WorktreePathMapping};
 
 const MAX_CONFIG_BYTES: u64 = 1_024 * 1_024;
 const MAX_RELOAD_ERROR_BYTES: usize = 1_024;
@@ -56,6 +56,7 @@ pub(crate) struct RuntimeConfig {
     sigkill_enabled: bool,
     warning_grace: DurationMs,
     action_grace: DurationMs,
+    mcp_sessions: McpSessionLimits,
 }
 
 impl RuntimeConfig {
@@ -118,6 +119,11 @@ impl RuntimeConfig {
 
     pub(crate) const fn action_grace(&self) -> DurationMs {
         self.action_grace
+    }
+
+    /// MCP transport-admission policy, applied at startup only.
+    pub(crate) const fn mcp_sessions(&self) -> McpSessionLimits {
+        self.mcp_sessions
     }
 }
 
@@ -220,6 +226,8 @@ struct RawConfig {
     github: RawGitHub,
     #[serde(default)]
     termination: RawTermination,
+    #[serde(default)]
+    mcp: RawMcp,
 }
 
 impl RawConfig {
@@ -274,6 +282,10 @@ impl RawConfig {
         let reducer_policy = ReducerPolicy::new(suspect_after, stalled_after, reminder_every)?;
         let deadline_policy =
             DeadlinePolicy::new(stalled_after, terminate_after_stalled, action_grace)?;
+        let mcp_sessions = McpSessionLimits::new(
+            self.mcp.max_sessions,
+            std::time::Duration::from_secs(self.mcp.idle_ttl_seconds),
+        )?;
 
         Ok(RuntimeConfig {
             worktree_mappings,
@@ -296,6 +308,7 @@ impl RawConfig {
             sigkill_enabled: self.termination.sigkill_enabled,
             warning_grace,
             action_grace,
+            mcp_sessions,
         })
     }
 }
@@ -389,6 +402,22 @@ impl Default for RawTermination {
         Self {
             automation_enabled: true,
             sigkill_enabled: true,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawMcp {
+    max_sessions: usize,
+    idle_ttl_seconds: u64,
+}
+
+impl Default for RawMcp {
+    fn default() -> Self {
+        Self {
+            max_sessions: McpSessionLimits::DEFAULT_MAX_SESSIONS,
+            idle_ttl_seconds: McpSessionLimits::DEFAULT_IDLE_TTL.as_secs(),
         }
     }
 }
@@ -504,6 +533,8 @@ pub(crate) enum ConfigError {
     ReducerPolicy(#[from] ReducerPolicyError),
     #[error(transparent)]
     DeadlinePolicy(#[from] PolicyError),
+    #[error(transparent)]
+    McpSessionLimits(#[from] McpSessionLimitsError),
 }
 
 #[cfg(test)]
@@ -578,6 +609,38 @@ mod tests {
         assert_eq!(
             mappings[1].native_root(),
             std::path::Path::new("/srv/codex-state")
+        );
+    }
+
+    #[test]
+    fn mcp_session_limits_default_to_the_shipped_bounds_and_reject_an_empty_cap() {
+        let fixture = ConfigFixture::new();
+        fixture.write(&fixture.valid_toml());
+        let limits = ConfigManager::load(&fixture.config_path)
+            .expect("omitted [mcp] should fall back to defaults")
+            .current()
+            .mcp_sessions();
+        assert_eq!(limits.max_sessions(), 64);
+        assert_eq!(limits.idle_ttl(), std::time::Duration::from_hours(48));
+
+        fixture.write(&format!(
+            "{}\n[mcp]\nmax_sessions = 8\nidle_ttl_seconds = 3600\n",
+            fixture.valid_toml()
+        ));
+        let configured = ConfigManager::load(&fixture.config_path)
+            .expect("explicit [mcp] should load")
+            .current()
+            .mcp_sessions();
+        assert_eq!(configured.max_sessions(), 8);
+        assert_eq!(configured.idle_ttl(), std::time::Duration::from_hours(1));
+
+        fixture.write(&format!(
+            "{}\n[mcp]\nmax_sessions = 0\n",
+            fixture.valid_toml()
+        ));
+        assert!(
+            ConfigManager::load(&fixture.config_path).is_err(),
+            "a zero cap would leave eviction with no slot to free"
         );
     }
 

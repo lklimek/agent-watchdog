@@ -41,9 +41,9 @@ use crate::watch_paths::WatchPathRegistry;
 use crate::{
     AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeHookService, CodexHookService,
     DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler, GitHubEnricher,
-    HealthService, HumanNotifier, HumanOutboxDispatcher, NotificationEndpoints, RepositoryMetadata,
-    SystemClock, WebhookEndpoint, claude_hook_router, codex_hook_router, dashboard_router,
-    health_router, mcp_router,
+    HealthService, HumanNotifier, HumanOutboxDispatcher, McpSessionLimits, NotificationEndpoints,
+    RepositoryMetadata, SystemClock, WebhookEndpoint, claude_hook_router, codex_hook_router,
+    dashboard_router, health_router, mcp_router,
 };
 #[cfg(target_os = "linux")]
 use crate::{
@@ -252,6 +252,7 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         Arc::clone(&clock),
         bootstrap.basic_auth.clone(),
         bootstrap.bearer_auth.clone(),
+        current.mcp_sessions(),
     );
 
     let discovery = DiscoveryScheduler::default();
@@ -347,6 +348,7 @@ fn application_router(
     clock: Arc<SystemClock>,
     basic_auth: BasicAuthenticator,
     bearer_auth: BearerAuthenticator,
+    mcp_sessions: McpSessionLimits,
 ) -> Router {
     Router::new()
         .merge(health_router(health, basic_auth.clone()))
@@ -359,7 +361,7 @@ fn application_router(
             CodexHookService::new(api.clone(), clock),
             bearer_auth.clone(),
         ))
-        .merge(mcp_router(api, bearer_auth))
+        .merge(mcp_router(api, bearer_auth, mcp_sessions))
 }
 
 fn initialize_github(

@@ -39,6 +39,16 @@ terminate_after_stalled_seconds = 3600
 warning_grace_seconds = 600
 action_grace_seconds = 600
 
+[mcp]
+# Concurrent authenticated MCP transports. At the cap, admission evicts the
+# longest-idle transport rather than refusing the new one; the evicted client
+# must register its main session again.
+max_sessions = 64
+# Idle period after which an abandoned transport is reclaimed. Long enough to
+# survive realistic coordinator idle periods, finite so nothing leaks.
+# Both values apply at startup only; SIGHUP does not reload them.
+idle_ttl_seconds = 172800
+
 [adapters]
 claude = true
 codex = true

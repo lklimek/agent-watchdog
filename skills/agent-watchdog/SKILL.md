@@ -10,15 +10,19 @@ and task ledger as independent sources of truth.
 
 ## Invariants
 
+The server states the first three in its own MCP `instructions`, delivered on
+connect; they are repeated here only as the entry points this skill builds on.
+Where the two ever differ, the server's instructions are current.
+
 1. Call `register_session` for the coordinating main session before every other
    Watchdog call on a new MCP transport.
 2. Generate a fresh, globally unique `event_key` for every logical mutating
    call. Reuse a key only to retry that exact mutation with byte-for-byte
    equivalent meaning. Never reuse it for a later progress update or changed
    payload.
-3. Use only IDs returned or verified by the relevant runtime and Watchdog. Do
+3. Process an entire `list_events` page before acknowledging its `next_cursor`.
+4. Use only IDs returned or verified by the relevant runtime and Watchdog. Do
    not infer, truncate, or fabricate IDs.
-4. Process an entire `list_events` page before acknowledging its `next_cursor`.
 5. Corroborate lifecycle conclusions against direct evidence before acting on
    them.
 
@@ -138,6 +142,30 @@ If child registration fails after reconnect, first confirm the main binding
 and the child's runtime/native identity. Do not churn IDs or blindly alternate
 keys around an identity conflict.
 
+### Why a binding disappears
+
+A transport binding ends in one of three ways, all recoverable by the same
+re-registration above:
+
+- **Idle expiry.** A transport with no traffic for the configured idle window
+  (`[mcp] idle_ttl_seconds`, 48 hours by default) is closed and its scope
+  released.
+- **Capacity eviction.** The server admits a bounded number of concurrent
+  transports (`[mcp] max_sessions`, 64 by default). A new connection arriving
+  at that cap evicts the single longest-idle transport rather than being
+  refused, so reconnect churn never locks anyone out. The `mcp_sessions` field
+  of `get_watchdog_health` reports current occupancy, the cap, and how many
+  transports have been evicted.
+- **Explicit close** when a client disconnects cleanly.
+
+Only durable events are affected by none of these: the inbox cursor is stored
+server-side, so a lost transport never discards unread events.
+
+Registering a main session may resolve a runtime-native ID through the
+discovery **alias** table onto an already-discovered canonical session. Always
+use the `session_id` from the registration response as the parent for later
+child registrations; never re-derive it from the native ID you supplied.
+
 ## Corroborate, don't trust alone
 
 Independently verify consequential lifecycle state while the known reliability
@@ -151,6 +179,14 @@ gaps below remain open:
   record and the artifact/result itself.
 - For alerts, compare Watchdog events, session provenance, signal timestamps,
   source conflicts, and adapter health with those direct sources.
+
+Event and session diagnostics carry `outcome_uncertain`. It is `true` when the
+runtime vanished, when the state is unknown, or when sources still disagree —
+that is, whenever Watchdog holds no evidence that establishes what actually
+happened. It is not a synonym for "not finished": an ordinary running or
+waiting child reports `false`. When it is `true`, run the checks listed in the
+accompanying `suggested_checks` entry before retrying, replacing, or
+discarding that job's work.
 
 This guidance is required by the following Agent Watchdog Prior Knowledge:
 

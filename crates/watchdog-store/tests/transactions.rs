@@ -550,7 +550,8 @@ async fn bulk_alias_hydration_matches_exact_identity_conflicts() {
             .await
             .expect("bulk aliases should load"),
         vec![(alias, None)],
-        "restart hydration must preserve the exact-session conflict"
+        "restart hydration reads this batched column directly, so an absent \
+         canonical is the only signal that marks the alias ambiguous"
     );
 }
 

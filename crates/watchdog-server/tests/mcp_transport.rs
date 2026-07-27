@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use watchdog_domain::{NativeSessionKey, RuntimeKind, SessionId, TimePoint, WallTimeMs};
 use watchdog_server::{
-    AgentApi, AgentApiError, BearerAuthenticator, TransportKey, WatchdogMcpService,
-    WatchdogSessionManager, WatchdogSessionManagerError, mcp_router,
+    AgentApi, AgentApiError, BearerAuthenticator, McpSessionLimits, TransportKey,
+    WatchdogMcpService, WatchdogSessionManager, mcp_router,
 };
 use watchdog_store::WatchdogStore;
 use watchdog_testkit::FakeClock;
@@ -153,6 +153,148 @@ async fn register_http_main(router: &Router, session: &McpSessionId) {
         "{}",
         String::from_utf8_lossy(&body)
     );
+}
+
+async fn register_structured_child(
+    manager: &WatchdogSessionManager,
+    session: &McpSessionId,
+    parent: SessionId,
+) -> SessionId {
+    let registered = response(
+        manager,
+        session,
+        message(json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                "name":"register_session","arguments":{
+                    "runtime":"codex_cli","native_id":"structured-child","kind":"child",
+                    "parent_session_id": parent.to_string(),
+                    "event_key":"register-structured-child"
+                }
+            }
+        })),
+    )
+    .await;
+    assert!(registered.get("error").is_none(), "{registered}");
+    SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::CodexCli, "structured-child")
+            .expect("native ID should be valid"),
+    )
+}
+
+async fn register_main_named(router: &Router, session: &McpSessionId, native_id: &str) {
+    let response = post_mcp(
+        router,
+        None,
+        Some(session),
+        &message(json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"register_session","arguments":{
+                    "runtime":"claude_code","native_id":native_id,"kind":"main",
+                    "event_key":format!("register-{native_id}")
+                }
+            }
+        })),
+    )
+    .await;
+    assert!(response.get("error").is_none(), "{response}");
+}
+
+async fn read_session_tree(router: &Router, session: &McpSessionId) {
+    let response = post_mcp(
+        router,
+        None,
+        Some(session),
+        &message(json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"get_session_tree","arguments":{}
+            }
+        })),
+    )
+    .await;
+    assert!(response.get("error").is_none(), "{response}");
+}
+
+async fn initialize_authenticated_session(router: &Router, token: &str) -> McpSessionId {
+    let response = mcp_request(router, Some(token), None, &initialize_request())
+        .await
+        .expect("router is infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize response should carry a session ID")
+        .to_str()
+        .expect("session header should be text")
+        .to_owned()
+        .into();
+    axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("initialize response should be bounded");
+    session
+}
+
+async fn authenticated_tool_call(
+    router: &Router,
+    token: &str,
+    session: &McpSessionId,
+    id: u32,
+    tool: &str,
+    arguments: Value,
+) -> Value {
+    post_mcp(
+        router,
+        Some(token),
+        Some(session),
+        &message(json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name":tool,"arguments":arguments
+            }
+        })),
+    )
+    .await
+}
+
+async fn post_mcp(
+    router: &Router,
+    token: Option<&str>,
+    session: Option<&McpSessionId>,
+    request: &ClientJsonRpcMessage,
+) -> Value {
+    let response = mcp_request(router, token, session, request)
+        .await
+        .expect("router is infallible");
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .expect("MCP response should be bounded");
+    http_json_rpc_body(&body)
+}
+
+async fn mcp_request(
+    router: &Router,
+    token: Option<&str>,
+    session: Option<&McpSessionId>,
+    request: &ClientJsonRpcMessage,
+) -> Result<axum::response::Response, std::convert::Infallible> {
+    let mut builder = Request::post("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(session) = session {
+        builder = builder.header("mcp-session-id", session.to_string());
+    }
+    router
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from(
+                    serde_json::to_vec(request).expect("MCP request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
 }
 
 fn listed_tool<'a>(listed: &'a Value, name: &str) -> &'a Value {
@@ -290,6 +432,7 @@ async fn http_mcp_route_requires_the_configured_bearer_token() {
     let router = mcp_router(
         test_api().await,
         BearerAuthenticator::new("correct-secret").expect("token should be valid"),
+        McpSessionLimits::default(),
     );
     for authorization in [None, Some("Bearer wrong-secret")] {
         let mut request = Request::post("/mcp")
@@ -385,7 +528,10 @@ async fn http_mcp_route_requires_the_configured_bearer_token() {
 #[tokio::test]
 async fn mcp_binding_survives_transport_idle_periods() {
     let api = test_api().await;
-    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let manager = Arc::new(WatchdogSessionManager::new(
+        api.clone(),
+        McpSessionLimits::default(),
+    ));
     let (session, transport) = manager
         .create_session()
         .await
@@ -443,7 +589,10 @@ async fn mcp_binding_survives_transport_idle_periods() {
 #[tokio::test]
 async fn mcp_idle_expiry_reclaims_capacity_and_transport_scope() {
     let api = test_api().await;
-    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let manager = Arc::new(WatchdogSessionManager::new(
+        api.clone(),
+        McpSessionLimits::default(),
+    ));
     let factory_api = api.clone();
     let service = StreamableHttpService::new(
         move || Ok(WatchdogMcpService::new(factory_api.clone())),
@@ -467,10 +616,15 @@ async fn mcp_idle_expiry_reclaims_capacity_and_transport_scope() {
                 .expect("filler session should fit within capacity"),
         );
     }
-    assert!(matches!(
-        manager.create_session().await,
-        Err(WatchdogSessionManagerError::Capacity)
-    ));
+    let full = manager.occupancy();
+    assert_eq!(
+        full.admitted, full.capacity,
+        "the pool should be full before idle expiry"
+    );
+    assert_eq!(
+        full.evicted, 0,
+        "a full pool nobody pushed on must not evict anything"
+    );
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_hours(48) + Duration::from_secs(1)).await;
@@ -509,9 +663,138 @@ async fn mcp_idle_expiry_reclaims_capacity_and_transport_scope() {
 }
 
 #[tokio::test]
+async fn mcp_admission_at_capacity_evicts_the_longest_idle_transport() {
+    const CAPACITY: usize = 3;
+
+    let api = test_api().await;
+    let limits = McpSessionLimits::new(CAPACITY, Duration::from_hours(48))
+        .expect("test limits should validate");
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone(), limits));
+    let factory_api = api.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(WatchdogMcpService::new(factory_api.clone())),
+        Arc::clone(&manager),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = Router::new().nest_service("/mcp", service);
+
+    // Fill capacity with bound main sessions, oldest first, then re-touch every
+    // session except the first so the first is unambiguously longest-idle.
+    let mut sessions = Vec::with_capacity(CAPACITY);
+    for index in 0..CAPACITY {
+        let session = initialize_http_session(&router).await;
+        register_main_named(&router, &session, &format!("evictable-main-{index}")).await;
+        sessions.push(session);
+    }
+    tokio::time::pause();
+    for session in sessions.iter().skip(1) {
+        tokio::time::advance(Duration::from_mins(1)).await;
+        read_session_tree(&router, session).await;
+    }
+    tokio::time::resume();
+
+    let transports = sessions
+        .iter()
+        .map(|session| TransportKey::new(session.to_string()).expect("transport should validate"))
+        .collect::<Vec<_>>();
+    for transport in &transports {
+        api.session_tree(transport)
+            .await
+            .expect("every admitted transport should be bound before eviction");
+    }
+
+    let admitted = initialize_http_session(&router).await;
+
+    let occupancy = manager.occupancy();
+    assert_eq!(occupancy.capacity, CAPACITY);
+    assert_eq!(
+        occupancy.admitted, CAPACITY,
+        "eviction must free exactly one slot, not grow the pool"
+    );
+    assert_eq!(
+        occupancy.evicted, 1,
+        "exactly one transport should be evicted"
+    );
+    assert!(
+        !manager
+            .has_session(&sessions[0])
+            .await
+            .expect("session lookup should succeed"),
+        "the longest-idle transport should be the evicted one"
+    );
+    assert!(
+        matches!(
+            api.session_tree(&transports[0]).await,
+            Err(AgentApiError::TransportNotBound)
+        ),
+        "eviction must release the application scope, matching idle expiry"
+    );
+    for transport in &transports[1..] {
+        api.session_tree(transport)
+            .await
+            .expect("more recently active transports must keep their scope");
+    }
+    assert!(
+        manager
+            .has_session(&admitted)
+            .await
+            .expect("session lookup should succeed"),
+        "the new transport should have been admitted, not refused"
+    );
+}
+
+#[tokio::test]
+async fn mcp_router_publishes_session_occupancy_in_agent_health() {
+    let api = test_api().await;
+    let router = mcp_router(
+        api,
+        BearerAuthenticator::new("occupancy-secret").expect("token should be valid"),
+        McpSessionLimits::default(),
+    );
+    let session = initialize_authenticated_session(&router, "occupancy-secret").await;
+    let registered = authenticated_tool_call(
+        &router,
+        "occupancy-secret",
+        &session,
+        2,
+        "register_session",
+        json!({
+            "runtime":"claude_code","native_id":"occupancy-main","kind":"main",
+            "event_key":"register-occupancy-main"
+        }),
+    )
+    .await;
+    assert!(registered.get("error").is_none(), "{registered}");
+
+    let health = authenticated_tool_call(
+        &router,
+        "occupancy-secret",
+        &session,
+        3,
+        "get_watchdog_health",
+        json!({}),
+    )
+    .await;
+    let occupancy = &health["result"]["structuredContent"]["mcp_sessions"];
+    assert_eq!(
+        occupancy["admitted"], 1,
+        "production wiring should publish live occupancy: {health}"
+    );
+    assert_eq!(
+        occupancy["capacity"],
+        McpSessionLimits::DEFAULT_MAX_SESSIONS,
+        "{health}"
+    );
+    assert_eq!(occupancy["evicted"], 0, "{health}");
+}
+
+#[tokio::test]
 async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
     let api = test_api().await;
-    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let manager = Arc::new(WatchdogSessionManager::new(
+        api.clone(),
+        McpSessionLimits::default(),
+    ));
     let mut sessions = Vec::new();
     let mut services = Vec::new();
     for _ in 0..2 {
@@ -614,10 +897,74 @@ async fn real_rmcp_transport_exposes_all_tools_and_rejects_cross_tree_target() {
     }
 }
 
+/// Object-shaped mutating tools, ordered so each call is legal for the child's
+/// current state.
+///
+/// `register_watch_path` is absent because it needs configured worktree roots
+/// this transport fixture deliberately lacks; its response conformance is
+/// asserted in `watch_paths.rs`, where that capability wiring exists.
+fn structured_tool_calls(main: SessionId, child: SessionId) -> Vec<(u32, &'static str, Value)> {
+    vec![
+        (
+            5,
+            "register_delegation",
+            json!({
+                "parent_session_id": main.to_string(),
+                "child_session_id": child.to_string(),
+                "event_key": "structured-delegation"
+            }),
+        ),
+        (
+            7,
+            "report_progress",
+            json!({
+                "session_id": child.to_string(),
+                "event_key": "structured-progress",
+                "summary": "structured output check"
+            }),
+        ),
+        (
+            8,
+            "report_waiting",
+            json!({
+                "session_id": child.to_string(),
+                "event_key": "structured-waiting",
+                "waiting_for": "tool"
+            }),
+        ),
+        (
+            9,
+            "update_deadline",
+            json!({
+                "session_id": child.to_string(),
+                "event_key": "structured-deadline",
+                "action": "set",
+                "deadline_ms": 20_000
+            }),
+        ),
+        (
+            10,
+            "complete_session",
+            json!({
+                "session_id": child.to_string(),
+                "event_key": "structured-completion",
+                "outcome": "completed"
+            }),
+        ),
+        (11, "get_session", json!({"session_id": main.to_string()})),
+        (12, "get_session_tree", json!({})),
+        (13, "list_events", json!({"limit": 10})),
+        (14, "get_watchdog_health", json!({})),
+    ]
+}
+
 #[tokio::test]
 async fn structured_output_schemas_validate_live_tool_results() {
     let api = test_api().await;
-    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let manager = Arc::new(WatchdogSessionManager::new(
+        api.clone(),
+        McpSessionLimits::default(),
+    ));
     let (session, transport) = manager
         .create_session()
         .await
@@ -635,10 +982,18 @@ async fn structured_output_schemas_validate_live_tool_results() {
         message(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})),
     )
     .await;
+    // Every tool returning an object-shaped payload advertises a schema, so an
+    // MCP client sees the identical SessionView treated identically everywhere.
     for tool_name in [
+        "register_session",
+        "register_delegation",
+        "register_watch_path",
+        "report_progress",
+        "report_waiting",
+        "complete_session",
+        "update_deadline",
         "get_session",
         "get_session_tree",
-        "register_watch_path",
         "list_events",
         "get_watchdog_health",
     ] {
@@ -662,17 +1017,14 @@ async fn structured_output_schemas_validate_live_tool_results() {
     )
     .await;
     assert!(registered.get("error").is_none(), "{registered}");
+    assert_structured_result_matches_schema(&listed, "register_session", &registered);
     let main = SessionId::from_native(
         &NativeSessionKey::new(RuntimeKind::ClaudeCode, "structured-main")
             .expect("native ID should be valid"),
     );
+    let child = register_structured_child(&manager, &session, main).await;
 
-    for (request_id, tool_name, arguments) in [
-        (4, "get_session", json!({"session_id": main.to_string()})),
-        (5, "get_session_tree", json!({})),
-        (6, "list_events", json!({"limit": 10})),
-        (7, "get_watchdog_health", json!({})),
-    ] {
+    for (request_id, tool_name, arguments) in structured_tool_calls(main, child) {
         let called = response(
             &manager,
             &session,

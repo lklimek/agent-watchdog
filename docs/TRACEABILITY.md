@@ -74,6 +74,9 @@ not accepted deferrals.
 | FR-MCP-005 | T-MCP-006 | Durable `AgentEventView` includes the explicit bounded FR-STA-007 diagnostic bundle without transcript retrieval | Automated |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |
 | FR-MCP-007 | T-MCP-008 | Major/minor-gated actionable `UPGRADE` warning in snapshots, MCP, API, and UI | Automated |
+| FR-MCP-008 | T-MCP-011, T-MCP-013 | `[mcp]` TOML bounds validated at load; `mcp_idle_expiry_reclaims_capacity_and_transport_scope` and `mcp_session_admission_is_atomic_under_concurrent_create_and_restore` | Automated |
+| FR-MCP-009 | T-MCP-012 | Longest-idle eviction through the shared release path plus the `get_watchdog_health` occupancy gauge; `mcp_session_admission_evicts_the_longest_idle_session_at_capacity`, `mcp_admission_at_capacity_evicts_the_longest_idle_transport`, `mcp_router_publishes_session_occupancy_in_agent_health` | Automated |
+| FR-MCP-010 | T-MCP-014 | Leased alias resolution on main registration; hook and discovery callers bind the returned canonical identity (`hook_children_register_against_the_alias_resolved_canonical_main`, `mcp_main_registration_resolves_discovery_alias_before_child_retry`) | Automated |
 
 ## UI, notifications, and API
 

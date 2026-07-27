@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use serde::Serialize;
@@ -191,7 +194,9 @@ pub struct AgentDiagnosticView {
     pub active_operation: Option<String>,
     /// Actionable material source-conflict summaries.
     pub source_conflicts: Vec<String>,
-    /// Whether liveness evidence cannot establish the job's terminal outcome.
+    /// Whether the retained evidence has gone silent or contradicts itself:
+    /// the runtime disappeared, the state is unknown, or sources still
+    /// disagree. An ordinary in-flight session is not uncertain.
     pub outcome_uncertain: bool,
     /// Selected parent relation and its retained evidence.
     pub correlation: Option<AgentCorrelationView>,
@@ -267,6 +272,55 @@ pub struct AgentHealthView {
     pub schema_version: i64,
     /// Per-runtime persisted health, including actionable warning messages.
     pub adapters: Vec<AdapterHealthRecord>,
+    /// Live MCP transport-admission occupancy, absent outside an MCP deployment.
+    pub mcp_sessions: Option<McpSessionOccupancy>,
+}
+
+/// Live MCP transport-admission occupancy against its configured cap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct McpSessionOccupancy {
+    /// Authenticated transports currently admitted.
+    pub admitted: usize,
+    /// Concurrent-transport cap from `[mcp] max_sessions`.
+    pub capacity: usize,
+    /// Transports evicted so far to admit newer ones under admission pressure.
+    pub evicted: u64,
+}
+
+/// Shared counters the MCP session manager publishes for agent-facing health.
+#[derive(Debug)]
+pub(crate) struct McpSessionGauge {
+    capacity: usize,
+    admitted: AtomicUsize,
+    evicted: AtomicU64,
+}
+
+impl McpSessionGauge {
+    pub(crate) const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            admitted: AtomicUsize::new(0),
+            evicted: AtomicU64::new(0),
+        }
+    }
+
+    /// Publish the authoritative live count rather than a delta, so no close,
+    /// eviction, or idle expiry can drift the gauge away from rmcp's own map.
+    pub(crate) fn set_admitted(&self, admitted: usize) {
+        self.admitted.store(admitted, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eviction(&self) {
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn view(&self) -> McpSessionOccupancy {
+        McpSessionOccupancy {
+            admitted: self.admitted.load(Ordering::Relaxed),
+            capacity: self.capacity,
+            evicted: self.evicted.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Bounded result of one timer-reconciliation pass.
@@ -378,6 +432,59 @@ impl ScopeRegistry {
     }
 }
 
+/// A transport binding that must be undone unless the registration commits.
+///
+/// `ScopeRegistry` has no rollback and is otherwise released only on transport
+/// close, so a bind left behind by a failed registration would pin the scope to
+/// a session that was never persisted for the whole idle TTL.
+struct ScopeGuard<'a> {
+    scopes: &'a ScopeRegistry,
+    transport: &'a TransportKey,
+    release_on_drop: bool,
+}
+
+impl<'a> ScopeGuard<'a> {
+    fn bind(
+        scopes: &'a ScopeRegistry,
+        transport: &'a TransportKey,
+        root: MainSessionId,
+    ) -> Result<Self, AgentApiError> {
+        // A transport already bound to this root was bound by an earlier
+        // registration that did commit; releasing it on our failure would
+        // revoke a scope this call never established.
+        let rebind = scopes.root(transport).is_ok_and(|bound| bound == root);
+        scopes.bind_once(transport.clone(), root)?;
+        Ok(Self {
+            scopes,
+            transport,
+            release_on_drop: !rebind,
+        })
+    }
+
+    fn commit(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.scopes.release(self.transport);
+        }
+    }
+}
+
+/// An alias pointing at a missing or non-main session is a corrupt mapping, not
+/// a caller error about the identity the caller actually asserted.
+fn alias_target_conflict(error: AgentApiError) -> AgentApiError {
+    match error {
+        AgentApiError::SessionNotFound | AgentApiError::MainSessionRequired => {
+            AgentApiError::SessionIdentityConflict
+        }
+        other => other,
+    }
+}
+
 struct AgentApiInner {
     store: WatchdogStore,
     clock: Arc<dyn Clock>,
@@ -389,6 +496,7 @@ struct AgentApiInner {
     queue_uncertain: RwLock<BTreeSet<SessionIdentity>>,
     queue_health_transition: Mutex<()>,
     watch_paths: RwLock<Option<crate::watch_paths::WatchPathRegistry>>,
+    mcp_sessions: RwLock<Option<Arc<McpSessionGauge>>>,
 }
 
 /// Scoped application service underlying all MCP tools.
@@ -463,8 +571,17 @@ impl AgentApi {
                 queue_uncertain: RwLock::new(queue_uncertain),
                 queue_health_transition: Mutex::new(()),
                 watch_paths: RwLock::new(None),
+                mcp_sessions: RwLock::new(None),
             }),
         })
+    }
+
+    pub(crate) fn configure_mcp_sessions(&self, gauge: Arc<McpSessionGauge>) {
+        *self
+            .inner
+            .mcp_sessions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gauge);
     }
 
     pub(crate) fn configure_watch_paths(&self, registry: crate::watch_paths::WatchPathRegistry) {
@@ -840,6 +957,15 @@ impl AgentApi {
             .await
     }
 
+    /// Register or enrich one session, binding a main registration's transport.
+    ///
+    /// # Trust invariant
+    ///
+    /// The transport scope follows the **resolved canonical** identity, not the
+    /// identity the caller asserted: a known discovery alias redirects a main
+    /// registration onto the already-persisted canonical session. Callers must
+    /// therefore use the returned [`SessionView`]'s identity rather than one
+    /// re-derived from the native key they supplied.
     async fn register_session_with_provenance(
         &self,
         transport: &TransportKey,
@@ -850,101 +976,108 @@ impl AgentApi {
         let native = NativeSessionKey::new(request.runtime, request.native_id)?;
         let session_id = SessionId::from_native(&native);
         let now = self.inner.clock.now();
-        // Native identity and restorable transport IDs are caller-asserted. Alias
-        // leasing therefore relies on the documented single-tenant bearer boundary.
-        let alias_lease = self.inner.store.lease_discovery_alias(&native).await?;
-        if request.kind == SessionKind::Main
-            && let Some(record) = self
-                .resolve_aliased_main(transport, alias_lease.resolution())
-                .await?
-        {
-            drop(alias_lease);
-            let observation =
-                registration_observation(&record, &request.event_key, now, &provenance)?;
-            self.apply_observation(&record, observation).await?;
-            return self.view_for_record(&record).await;
-        }
-        let (session, root, parent) = match request.kind {
+        let record = match request.kind {
+            // Only main registration consults alias resolution, so only it takes
+            // the process-wide lease. Native identity and restorable transport
+            // IDs are caller-asserted, so leasing relies on the documented
+            // single-tenant bearer boundary.
             SessionKind::Main => {
+                let alias_lease = self.inner.store.lease_discovery_alias(&native).await?;
+                let canonical = match alias_lease.resolution() {
+                    DiscoveryAliasResolution::Absent => None,
+                    DiscoveryAliasResolution::Unique(canonical) => Some(canonical),
+                    DiscoveryAliasResolution::Ambiguous => {
+                        return Err(AgentApiError::SessionIdentityConflict);
+                    }
+                };
+                if let Some(canonical) = canonical {
+                    let record = self
+                        .bind_main_record(transport, canonical)
+                        .await
+                        .map_err(alias_target_conflict)?;
+                    drop(alias_lease);
+                    let observation =
+                        registration_observation(&record, &request.event_key, now, &provenance)?;
+                    self.apply_observation(&record, observation).await?;
+                    return self.view_for_record(&record).await;
+                }
                 let root = MainSessionId::from(session_id);
-                (SessionIdentity::Main(root), root, None)
+                let record = StoredSessionRecord {
+                    session: SessionIdentity::Main(root),
+                    root,
+                    native,
+                };
+                self.reject_conflicting_identity(session_id, &record)
+                    .await?;
+                // Binding commits inside the lease window so alias resolution
+                // and binding are atomic against concurrent discovery writers.
+                let bound = ScopeGuard::bind(&self.inner.scopes, transport, root)?;
+                drop(alias_lease);
+                self.commit_registration(&record, &request.event_key, now, &provenance, None)
+                    .await?;
+                bound.commit();
+                return self.view_for_record(&record).await;
             }
             SessionKind::Child => {
                 let parent_id = request.parent.ok_or(AgentApiError::MissingParent)?;
                 let parent = self.resolve_scoped(transport, parent_id).await?;
-                (
-                    SessionIdentity::Child(ChildSessionId::from(session_id)),
-                    parent.root,
-                    Some(parent),
+                let record = StoredSessionRecord {
+                    session: SessionIdentity::Child(ChildSessionId::from(session_id)),
+                    root: parent.root,
+                    native,
+                };
+                self.reject_conflicting_identity(session_id, &record)
+                    .await?;
+                self.commit_registration(
+                    &record,
+                    &request.event_key,
+                    now,
+                    &provenance,
+                    Some(&parent),
                 )
+                .await?;
+                record
             }
         };
-        let record = StoredSessionRecord {
-            session,
-            root,
-            native,
-        };
-        if let Some(existing) = self.inner.store.session_by_id(session_id).await?
-            && existing != record
-        {
-            return Err(AgentApiError::SessionIdentityConflict);
-        }
-        if request.kind == SessionKind::Main {
-            self.inner.scopes.bind_once(transport.clone(), root)?;
-        }
-        drop(alias_lease);
-        let observation = registration_observation(&record, &request.event_key, now, &provenance)?;
-        let result = self.apply_observation(&record, observation).await?;
-        if let Some(parent) = parent
-            && result == ApplyResult::Applied
-        {
-            self.save_relation(&record, &parent, &request.event_key, now, &provenance)
-                .await?;
-        }
         self.view_for_record(&record).await
     }
 
-    async fn resolve_aliased_main(
+    async fn reject_conflicting_identity(
         &self,
-        transport: &TransportKey,
-        resolution: DiscoveryAliasResolution,
-    ) -> Result<Option<StoredSessionRecord>, AgentApiError> {
-        let canonical = match resolution {
-            DiscoveryAliasResolution::Absent => return Ok(None),
-            DiscoveryAliasResolution::Unique(canonical) => canonical,
-            DiscoveryAliasResolution::Ambiguous => {
-                return Err(AgentApiError::SessionIdentityConflict);
-            }
-        };
-        let record = self
-            .inner
-            .store
-            .session_by_id(canonical)
-            .await?
-            .ok_or(AgentApiError::SessionIdentityConflict)?;
-        let SessionIdentity::Main(main) = record.session else {
-            return Err(AgentApiError::SessionIdentityConflict);
-        };
-        if main != record.root {
-            return Err(AgentApiError::SessionIdentityConflict);
+        session_id: SessionId,
+        record: &StoredSessionRecord,
+    ) -> Result<(), AgentApiError> {
+        match self.inner.store.session_by_id(session_id).await? {
+            Some(existing) if existing != *record => Err(AgentApiError::SessionIdentityConflict),
+            _ => Ok(()),
         }
-        self.inner
-            .scopes
-            .bind_once(transport.clone(), record.root)?;
-        Ok(Some(record))
     }
 
-    /// Bind a transport to an already auto-discovered main session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentApiError`] if the target is absent/not-main or the
-    /// transport was previously bound to another tree.
-    pub async fn bind_discovered_main(
+    async fn commit_registration(
+        &self,
+        record: &StoredSessionRecord,
+        event_key: &str,
+        now: TimePoint,
+        provenance: &RegistrationProvenance,
+        parent: Option<&StoredSessionRecord>,
+    ) -> Result<(), AgentApiError> {
+        let observation = registration_observation(record, event_key, now, provenance)?;
+        let result = self.apply_observation(record, observation).await?;
+        if let Some(parent) = parent
+            && result == ApplyResult::Applied
+        {
+            self.save_relation(record, parent, event_key, now, provenance)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Load an already-persisted main session and bind the transport to it.
+    async fn bind_main_record(
         &self,
         transport: &TransportKey,
         session_id: SessionId,
-    ) -> Result<SessionView, AgentApiError> {
+    ) -> Result<StoredSessionRecord, AgentApiError> {
         let record = self
             .inner
             .store
@@ -960,6 +1093,21 @@ impl AgentApi {
         self.inner
             .scopes
             .bind_once(transport.clone(), record.root)?;
+        Ok(record)
+    }
+
+    /// Bind a transport to an already auto-discovered main session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentApiError`] if the target is absent/not-main or the
+    /// transport was previously bound to another tree.
+    pub async fn bind_discovered_main(
+        &self,
+        transport: &TransportKey,
+        session_id: SessionId,
+    ) -> Result<SessionView, AgentApiError> {
+        let record = self.bind_main_record(transport, session_id).await?;
         self.view_for_record(&record).await
     }
 
@@ -1160,13 +1308,25 @@ impl AgentApi {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentApiError`] for unbound transports, missing snapshots, or
-    /// persistence failure.
+    /// Returns [`AgentApiError`] for unbound transports, a bound root with no
+    /// persisted session, missing snapshots, or persistence failure.
     pub async fn session_tree(
         &self,
         transport: &TransportKey,
     ) -> Result<SessionTreeView, AgentApiError> {
         let root = self.inner.scopes.root(transport)?;
+        // A bound root that was never persisted must not read as an empty tree:
+        // a coordinator following the reconnect procedure would misread it as
+        // "no children yet" instead of "this transport is not registered".
+        if self
+            .inner
+            .store
+            .session_by_id(root.session_id())
+            .await?
+            .is_none()
+        {
+            return Err(AgentApiError::SessionNotFound);
+        }
         let sessions = self.list_sessions(transport).await?;
         let relations = self
             .inner
@@ -1204,6 +1364,13 @@ impl AgentApi {
             store_foreign_keys: store.foreign_keys,
             schema_version: store.schema_version,
             adapters,
+            mcp_sessions: self
+                .inner
+                .mcp_sessions
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|gauge| gauge.view()),
         })
     }
 
@@ -1656,10 +1823,14 @@ impl AgentApi {
         let source_conflicts = snapshot
             .source_conflict()
             .then(|| "Authoritative runtime and agent sources currently disagree".to_owned());
-        let outcome_uncertain = !matches!(
+        // Uncertainty is derived from evidence, not from the state enum alone:
+        // a terminal state reached while the sources still disagree establishes
+        // nothing, and every non-terminal state other than these two is simply
+        // work in progress.
+        let outcome_uncertain = matches!(
             snapshot.state(),
-            DetailedState::Completed | DetailedState::Failed | DetailedState::Cancelled
-        );
+            DetailedState::Disappeared | DetailedState::Unknown
+        ) || snapshot.source_conflict();
         let suggested_checks = suggested_checks(snapshot, &process_activity);
         Ok(AgentDiagnosticView {
             process_identity: snapshot.process_identity().cloned(),

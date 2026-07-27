@@ -1,9 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Router,
     body::Body,
-    http::Request,
+    http::{Request, StatusCode, header},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -29,7 +29,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use watchdog_domain::{
     DeadlineCommand, DetailedState, RuntimeKind, SessionId, SessionKind, WallTimeMs,
 };
@@ -37,23 +37,105 @@ use watchdog_domain::{
 use crate::{
     AgentApi, AgentApiError, AgentHealthView, BearerAuthenticator, CompletionOutcome, EventPage,
     RegisterSession, RegisteredWatchPathView, SessionTreeView, SessionView, TransportKey,
-    WaitingKind, agent_api::MAX_TREE_SESSIONS,
+    WaitingKind,
+    agent_api::{MAX_TREE_SESSIONS, McpSessionGauge},
 };
 
 const DEFAULT_EVENT_PAGE_SIZE: u32 = 100;
-const MAX_MCP_SESSIONS: usize = 64;
-const MCP_SESSION_IDLE_TTL: Duration = Duration::from_hours(48);
+/// `Display` text of [`WatchdogSessionManagerError::Capacity`], matched to turn
+/// rmcp's fixed HTTP 500 into a retryable answer. Locked to the variant by test.
+const CAPACITY_MARKER: &str = "MCP session capacity is exhausted";
+const CAPACITY_RETRY_AFTER_SECONDS: &str = "5";
+const MAX_MCP_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TransportScope(McpSessionId);
 
+/// Admission policy bounding concurrent authenticated MCP transports.
+///
+/// Both bounds are read once at startup: rmcp bakes the idle timeout into each
+/// session worker when the session is created, so neither is `SIGHUP`-reloadable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McpSessionLimits {
+    max_sessions: usize,
+    idle_ttl: Duration,
+}
+
+impl McpSessionLimits {
+    /// Concurrent authenticated transports admitted when unconfigured.
+    pub const DEFAULT_MAX_SESSIONS: usize = 64;
+    /// Idle period after which an abandoned transport is reclaimed, unconfigured.
+    pub const DEFAULT_IDLE_TTL: Duration = Duration::from_hours(48);
+
+    /// Validate one transport-admission policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpSessionLimitsError`] when either bound is zero. A zero cap
+    /// would admit nothing and leave eviction with no slot to free; a zero idle
+    /// TTL would expire every transport immediately.
+    pub const fn new(
+        max_sessions: usize,
+        idle_ttl: Duration,
+    ) -> Result<Self, McpSessionLimitsError> {
+        if max_sessions == 0 {
+            return Err(McpSessionLimitsError::EmptyCapacity);
+        }
+        if idle_ttl.is_zero() {
+            return Err(McpSessionLimitsError::ZeroIdleTtl);
+        }
+        Ok(Self {
+            max_sessions,
+            idle_ttl,
+        })
+    }
+
+    /// Concurrent authenticated transports this policy admits.
+    #[must_use]
+    pub const fn max_sessions(self) -> usize {
+        self.max_sessions
+    }
+
+    /// Idle period after which rmcp reclaims an abandoned transport.
+    #[must_use]
+    pub const fn idle_ttl(self) -> Duration {
+        self.idle_ttl
+    }
+}
+
+impl Default for McpSessionLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: Self::DEFAULT_MAX_SESSIONS,
+            idle_ttl: Self::DEFAULT_IDLE_TTL,
+        }
+    }
+}
+
+/// Rejected MCP transport-admission policy.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum McpSessionLimitsError {
+    /// `max_sessions` was zero.
+    #[error("MCP max_sessions must be at least 1")]
+    EmptyCapacity,
+    /// `idle_ttl_seconds` was zero.
+    #[error("MCP idle_ttl_seconds must be at least 1")]
+    ZeroIdleTtl,
+}
+
 /// rmcp session manager that injects the opaque transport identity into every
-/// request context for application-level main-session scoping. Sessions survive
-/// normal long idle periods, while abandoned transports expire after 48 hours.
+/// request context for application-level main-session scoping.
+///
+/// Sessions survive normal long idle periods and abandoned transports expire on
+/// the configured idle TTL. At capacity, admission evicts the longest-idle
+/// transport instead of refusing, so a stale binding never outranks a live one.
 #[derive(Debug)]
 pub struct WatchdogSessionManager {
     inner: LocalSessionManager,
+    limits: McpSessionLimits,
     creation: Mutex<()>,
+    activity: std::sync::RwLock<HashMap<McpSessionId, Instant>>,
+    occupancy: Arc<McpSessionGauge>,
     api: Option<AgentApi>,
 }
 
@@ -63,39 +145,119 @@ pub enum WatchdogSessionManagerError {
     /// rmcp rejected the requested session operation.
     #[error(transparent)]
     Local(#[from] LocalSessionManagerError),
-    /// The bounded authenticated session pool is full.
+    /// The bounded authenticated session pool is full and offered no evictable
+    /// transport. Unreachable while `max_sessions` is at least 1.
     #[error("MCP session capacity is exhausted")]
     Capacity,
 }
 
 impl WatchdogSessionManager {
     /// Construct an rmcp session manager that releases application scope when
-    /// a transport closes or expires.
+    /// a transport closes, expires, or is evicted under admission pressure.
     #[must_use]
-    pub fn new(api: AgentApi) -> Self {
-        let mut inner = LocalSessionManager::default();
-        inner.session_config.keep_alive = Some(MCP_SESSION_IDLE_TTL);
-        Self {
-            inner,
-            creation: Mutex::new(()),
-            api: Some(api),
-        }
+    pub fn new(api: AgentApi, limits: McpSessionLimits) -> Self {
+        Self::build(Some(api), limits)
     }
 
     #[cfg(test)]
-    fn without_application_scope() -> Self {
+    fn without_application_scope(limits: McpSessionLimits) -> Self {
+        Self::build(None, limits)
+    }
+
+    fn build(api: Option<AgentApi>, limits: McpSessionLimits) -> Self {
         let mut inner = LocalSessionManager::default();
-        inner.session_config.keep_alive = Some(MCP_SESSION_IDLE_TTL);
+        inner.session_config.keep_alive = Some(limits.idle_ttl);
         Self {
             inner,
+            limits,
             creation: Mutex::new(()),
-            api: None,
+            activity: std::sync::RwLock::new(HashMap::new()),
+            occupancy: Arc::new(McpSessionGauge::new(limits.max_sessions)),
+            api,
         }
+    }
+
+    /// Current admission occupancy against this manager's configured cap.
+    #[must_use]
+    pub fn occupancy(&self) -> crate::McpSessionOccupancy {
+        self.occupancy.view()
+    }
+
+    /// Shared counters published to `get_watchdog_health`.
+    fn gauge(&self) -> Arc<McpSessionGauge> {
+        Arc::clone(&self.occupancy)
     }
 
     fn scoped(id: &McpSessionId, mut message: ClientJsonRpcMessage) -> ClientJsonRpcMessage {
         message.insert_extension(TransportScope(id.clone()));
         message
+    }
+
+    fn touch(&self, id: &McpSessionId) {
+        self.activity
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), Instant::now());
+    }
+
+    fn forget(&self, id: &McpSessionId) {
+        self.activity
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    async fn publish_occupancy(&self) {
+        self.occupancy
+            .set_admitted(self.inner.sessions.read().await.len());
+    }
+
+    /// Longest-idle live transport, preferring one with no recorded activity.
+    async fn longest_idle(&self) -> Option<McpSessionId> {
+        let live = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let activity = self
+            .activity
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.into_iter().min_by_key(|id| activity.get(id).copied())
+    }
+
+    /// Ensure one free admission slot, evicting the longest-idle transport when
+    /// already at capacity. Callers must hold the creation mutex.
+    async fn reserve_slot(
+        &self,
+        restoring: Option<&McpSessionId>,
+    ) -> Result<(), WatchdogSessionManagerError> {
+        let occupancy = {
+            let sessions = self.inner.sessions.read().await;
+            if restoring.is_some_and(|id| sessions.contains_key(id)) {
+                return Ok(());
+            }
+            sessions.len()
+        };
+        if occupancy < self.limits.max_sessions {
+            return Ok(());
+        }
+        let Some(evicted) = self.longest_idle().await else {
+            return Err(WatchdogSessionManagerError::Capacity);
+        };
+        tracing::warn!(
+            event = "mcp.session_evicted",
+            session = %evicted,
+            occupancy,
+            capacity = self.limits.max_sessions,
+            "Evicted the longest-idle MCP transport to admit a new one; raise [mcp] max_sessions in watchdog.toml if this recurs"
+        );
+        self.close_session(&evicted).await?;
+        self.occupancy.record_eviction();
+        Ok(())
     }
 }
 
@@ -105,10 +267,11 @@ impl SessionManager for WatchdogSessionManager {
 
     async fn create_session(&self) -> Result<(McpSessionId, Self::Transport), Self::Error> {
         let _creation = self.creation.lock().await;
-        if self.inner.sessions.read().await.len() >= MAX_MCP_SESSIONS {
-            return Err(WatchdogSessionManagerError::Capacity);
-        }
-        Ok(self.inner.create_session().await?)
+        self.reserve_slot(None).await?;
+        let (id, transport) = self.inner.create_session().await?;
+        self.touch(&id);
+        self.publish_occupancy().await;
+        Ok((id, transport))
     }
 
     async fn initialize_session(
@@ -116,10 +279,12 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<ServerJsonRpcMessage, Self::Error> {
-        Ok(self
+        let response = self
             .inner
             .initialize_session(id, Self::scoped(id, message))
-            .await?)
+            .await?;
+        self.touch(id);
+        Ok(response)
     }
 
     async fn has_session(&self, id: &McpSessionId) -> Result<bool, Self::Error> {
@@ -127,13 +292,21 @@ impl SessionManager for WatchdogSessionManager {
     }
 
     async fn close_session(&self, id: &McpSessionId) -> Result<(), Self::Error> {
-        self.inner.close_session(id).await?;
-        if let Some(api) = &self.api
-            && let Ok(transport) = TransportKey::new(id.to_string())
-        {
-            api.release_transport_scope(&transport);
+        // rmcp treats an unknown ID as a silent success, so release the
+        // application scope only for a transport that actually existed, and on
+        // the inner error path too — nothing else ever releases it.
+        let existed = self.inner.has_session(id).await?;
+        let outcome = self.inner.close_session(id).await;
+        if existed {
+            self.forget(id);
+            if let Some(api) = &self.api
+                && let Ok(transport) = TransportKey::new(id.to_string())
+            {
+                api.release_transport_scope(&transport);
+            }
         }
-        Ok(())
+        self.publish_occupancy().await;
+        Ok(outcome?)
     }
 
     async fn create_stream(
@@ -141,10 +314,12 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        Ok(self
+        let stream = self
             .inner
             .create_stream(id, Self::scoped(id, message))
-            .await?)
+            .await?;
+        self.touch(id);
+        Ok(stream)
     }
 
     async fn accept_message(
@@ -152,17 +327,20 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<(), Self::Error> {
-        Ok(self
-            .inner
+        self.inner
             .accept_message(id, Self::scoped(id, message))
-            .await?)
+            .await?;
+        self.touch(id);
+        Ok(())
     }
 
     async fn create_standalone_stream(
         &self,
         id: &McpSessionId,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        Ok(self.inner.create_standalone_stream(id).await?)
+        let stream = self.inner.create_standalone_stream(id).await?;
+        self.touch(id);
+        Ok(stream)
     }
 
     async fn resume(
@@ -170,7 +348,9 @@ impl SessionManager for WatchdogSessionManager {
         id: &McpSessionId,
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        Ok(self.inner.resume(id, last_event_id).await?)
+        let stream = self.inner.resume(id, last_event_id).await?;
+        self.touch(id);
+        Ok(stream)
     }
 
     async fn restore_session(
@@ -178,21 +358,23 @@ impl SessionManager for WatchdogSessionManager {
         id: McpSessionId,
     ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
         let _creation = self.creation.lock().await;
-        let sessions = self.inner.sessions.read().await;
-        if !sessions.contains_key(&id) && sessions.len() >= MAX_MCP_SESSIONS {
-            return Err(WatchdogSessionManagerError::Capacity);
+        self.reserve_slot(Some(&id)).await?;
+        let outcome = self.inner.restore_session(id.clone()).await?;
+        if !matches!(outcome, RestoreOutcome::NotSupported) {
+            self.touch(&id);
+            self.publish_occupancy().await;
         }
-        drop(sessions);
-        Ok(self.inner.restore_session(id).await?)
+        Ok(outcome)
     }
 }
 
-/// Create the stateful Streamable HTTP MCP service.
-#[must_use]
+/// Create the stateful Streamable HTTP MCP service and its occupancy gauge.
 fn mcp_http_service(
     api: AgentApi,
+    limits: McpSessionLimits,
 ) -> StreamableHttpService<WatchdogMcpService, WatchdogSessionManager> {
-    let manager = Arc::new(WatchdogSessionManager::new(api.clone()));
+    let manager = Arc::new(WatchdogSessionManager::new(api.clone(), limits));
+    api.configure_mcp_sessions(manager.gauge());
     StreamableHttpService::new(
         move || Ok(WatchdogMcpService::new(api.clone())),
         manager,
@@ -204,8 +386,12 @@ fn mcp_http_service(
 ///
 /// Authentication runs before rmcp parses or allocates protocol state. Failure
 /// responses are deliberately fixed and never reflect credential input.
-pub fn mcp_router(api: AgentApi, authenticator: BearerAuthenticator) -> Router {
-    let service = mcp_http_service(api);
+pub fn mcp_router(
+    api: AgentApi,
+    authenticator: BearerAuthenticator,
+    limits: McpSessionLimits,
+) -> Router {
+    let service = mcp_http_service(api, limits);
     Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn(
@@ -214,7 +400,7 @@ pub fn mcp_router(api: AgentApi, authenticator: BearerAuthenticator) -> Router {
                 async move {
                     let authorized = request
                         .headers()
-                        .get(axum::http::header::AUTHORIZATION)
+                        .get(header::AUTHORIZATION)
                         .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
                     if !authorized {
                         tracing::warn!(
@@ -222,19 +408,61 @@ pub fn mcp_router(api: AgentApi, authenticator: BearerAuthenticator) -> Router {
                             route = "/mcp",
                             "MCP bearer credential rejected"
                         );
-                        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                        return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    let response: Response = next.run(request).await;
-                    response
+                    retryable_capacity_response(next.run(request).await).await
                 }
             },
         ))
+}
+
+/// Re-answer capacity exhaustion as retryable.
+///
+/// rmcp maps every `SessionManager` error to a fixed HTTP 500 with no hook, so
+/// the only place to distinguish a bounded-resource refusal from a server defect
+/// is on the way out.
+async fn retryable_capacity_response(response: Response) -> Response {
+    if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_MCP_ERROR_BODY_BYTES).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !String::from_utf8_lossy(&bytes).contains(CAPACITY_MARKER) {
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+    tracing::warn!(
+        event = "mcp.capacity_exhausted",
+        "MCP admission found no evictable transport; answering 503"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, CAPACITY_RETRY_AFTER_SECONDS)],
+        Body::from(bytes),
+    )
+        .into_response()
 }
 
 /// MCP protocol façade over the scoped durable agent API.
 #[derive(Clone, Debug)]
 pub struct WatchdogMcpService {
     api: AgentApi,
+}
+
+impl WatchdogMcpService {
+    /// Names of every tool this service registers with the MCP router.
+    ///
+    /// Exposed so contract tests can check documentation against the actual
+    /// tool surface instead of a second hand-maintained list.
+    #[must_use]
+    pub fn registered_tool_names() -> Vec<String> {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
 }
 
 #[tool_router]
@@ -252,7 +480,7 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<RegisterSessionParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
         let kind = params.kind.into();
         let parent = params
@@ -260,7 +488,7 @@ impl WatchdogMcpService {
             .as_deref()
             .map(parse_session_id)
             .transpose()?;
-        json_result(
+        structured_json_result(
             self.api
                 .register_session(
                     &transport,
@@ -283,12 +511,12 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<RegisterDelegationParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
         let deadline = params
             .deadline_ms
             .map(|value| DeadlineCommand::Set(WallTimeMs::new(value)));
-        json_result(
+        structured_json_result(
             self.api
                 .register_delegation(
                     &transport,
@@ -327,9 +555,9 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<ProgressParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(
+        structured_json_result(
             self.api
                 .report_progress(
                     &transport,
@@ -349,9 +577,9 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<WaitingParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(
+        structured_json_result(
             self.api
                 .report_waiting(
                     &transport,
@@ -368,9 +596,9 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<CompleteParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
-        json_result(
+        structured_json_result(
             self.api
                 .complete_session(
                     &transport,
@@ -389,10 +617,10 @@ impl WatchdogMcpService {
         &self,
         Parameters(params): Parameters<DeadlineParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<Json<SessionView>, rmcp::ErrorData> {
         let transport = transport_key(&context)?;
         let command = params.action.command(params.deadline_ms)?;
-        json_result(
+        structured_json_result(
             self.api
                 .update_deadline(
                     &transport,
@@ -758,12 +986,6 @@ fn parse_session_id(value: &str) -> Result<SessionId, rmcp::ErrorData> {
         .map_err(|_| invalid_params("session_id must be a UUID"))
 }
 
-fn json_result<T: Serialize>(
-    result: Result<T, AgentApiError>,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    success(&result.map_err(api_error)?)
-}
-
 fn structured_json_result<T>(result: Result<T, AgentApiError>) -> Result<Json<T>, rmcp::ErrorData> {
     result.map(Json).map_err(api_error)
 }
@@ -807,9 +1029,73 @@ mod tests {
     use watchdog_domain::{DeadlineCommand, WallTimeMs};
 
     use super::{
-        AgentApiError, DeadlineActionParam, MAX_MCP_SESSIONS, RestoreOutcome,
-        WatchdogSessionManager, WatchdogSessionManagerError, api_error,
+        AgentApiError, Body, CAPACITY_MARKER, CAPACITY_RETRY_AFTER_SECONDS, DeadlineActionParam,
+        IntoResponse as _, McpSessionLimits, McpSessionLimitsError, RestoreOutcome, StatusCode,
+        WatchdogSessionManager, WatchdogSessionManagerError, api_error, header,
+        retryable_capacity_response,
     };
+
+    #[test]
+    fn session_limits_reject_bounds_that_would_admit_or_retain_nothing() {
+        assert_eq!(
+            McpSessionLimits::new(0, Duration::from_hours(1)),
+            Err(McpSessionLimitsError::EmptyCapacity)
+        );
+        assert_eq!(
+            McpSessionLimits::new(1, Duration::ZERO),
+            Err(McpSessionLimitsError::ZeroIdleTtl)
+        );
+        let defaults = McpSessionLimits::default();
+        assert_eq!(defaults.max_sessions(), 64);
+        assert_eq!(defaults.idle_ttl(), Duration::from_hours(48));
+    }
+
+    #[tokio::test]
+    async fn capacity_exhaustion_is_answered_as_retryable_and_other_failures_are_untouched() {
+        // The rewrite keys off the error's own Display text, so a rename that
+        // did not update the marker would silently stop mapping to 503.
+        assert!(
+            WatchdogSessionManagerError::Capacity
+                .to_string()
+                .contains(CAPACITY_MARKER)
+        );
+
+        let exhausted = retryable_capacity_response(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Body::from(format!(
+                    "Encounter an error when create session: {CAPACITY_MARKER}"
+                )),
+            )
+                .into_response(),
+        )
+        .await;
+        assert_eq!(exhausted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            exhausted
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(CAPACITY_RETRY_AFTER_SECONDS)
+        );
+
+        let defect = retryable_capacity_response(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Body::from("Encounter an error when create session: disk failure"),
+            )
+                .into_response(),
+        )
+        .await;
+        assert_eq!(
+            defect.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a genuine server defect must stay a 500"
+        );
+
+        let success = retryable_capacity_response(StatusCode::OK.into_response()).await;
+        assert_eq!(success.status(), StatusCode::OK);
+    }
 
     #[test]
     fn unavailable_server_state_is_not_reported_as_invalid_caller_input() {
@@ -844,7 +1130,8 @@ mod tests {
 
     #[test]
     fn mcp_session_idle_ttl_is_long_and_finite() {
-        let manager = WatchdogSessionManager::without_application_scope();
+        let manager =
+            WatchdogSessionManager::without_application_scope(McpSessionLimits::default());
 
         assert_eq!(
             manager.inner.session_config.keep_alive,
@@ -863,7 +1150,7 @@ mod tests {
     fn spawn_concurrent_admissions(
         manager: &Arc<WatchdogSessionManager>,
     ) -> (Arc<Barrier>, Vec<tokio::task::JoinHandle<Admission>>) {
-        let attempts = MAX_MCP_SESSIONS * 2;
+        let attempts = McpSessionLimits::DEFAULT_MAX_SESSIONS * 2;
         let barrier = Arc::new(Barrier::new(attempts + 1));
         let mut tasks = Vec::with_capacity(attempts);
         for index in 0..attempts {
@@ -896,17 +1183,18 @@ mod tests {
         <WatchdogSessionManager as SessionManager>::Transport,
     )> {
         let attempts = tasks.len();
-        let mut admitted = Vec::with_capacity(MAX_MCP_SESSIONS);
-        let mut rejected = 0;
+        let mut admitted = Vec::with_capacity(attempts);
         for task in tasks {
             match task.await.expect("admission task should not panic") {
                 Ok(session) => admitted.push(session),
-                Err(WatchdogSessionManagerError::Capacity) => rejected += 1,
-                Err(error) => panic!("unexpected admission error: {error}"),
+                Err(error) => panic!("eviction should admit every caller, got: {error}"),
             }
         }
-        assert_eq!(admitted.len(), MAX_MCP_SESSIONS);
-        assert_eq!(rejected, attempts - MAX_MCP_SESSIONS);
+        assert_eq!(
+            admitted.len(),
+            attempts,
+            "eviction admits every caller instead of refusing at the cap"
+        );
         admitted
     }
 
@@ -927,7 +1215,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mcp_session_admission_is_atomic_under_concurrent_create_and_restore() {
-        let manager = Arc::new(WatchdogSessionManager::without_application_scope());
+        let manager = Arc::new(WatchdogSessionManager::without_application_scope(
+            McpSessionLimits::default(),
+        ));
 
         let creation = manager.creation.lock().await;
         let (barrier, tasks) = spawn_concurrent_admissions(&manager);
@@ -939,33 +1229,78 @@ mod tests {
         );
         drop(creation);
         let admitted = collect_admissions(tasks).await;
+        // Serialized admission is what keeps the map at the cap: any interleaving
+        // that skipped the mutex would leave more live sessions than capacity.
+        let occupancy = manager.occupancy();
+        assert_eq!(occupancy.admitted, McpSessionLimits::DEFAULT_MAX_SESSIONS);
+        assert_eq!(
+            manager.inner.sessions.read().await.len(),
+            McpSessionLimits::DEFAULT_MAX_SESSIONS
+        );
+        assert_eq!(
+            occupancy.evicted,
+            (admitted.len() - McpSessionLimits::DEFAULT_MAX_SESSIONS) as u64
+        );
         close_admitted(&manager, admitted).await;
     }
 
-    #[tokio::test]
-    async fn mcp_session_admission_is_bounded_and_close_releases_capacity() {
-        let manager = WatchdogSessionManager::without_application_scope();
-        let mut sessions = Vec::with_capacity(MAX_MCP_SESSIONS);
-        for _ in 0..MAX_MCP_SESSIONS {
+    #[tokio::test(start_paused = true)]
+    async fn mcp_session_admission_evicts_the_longest_idle_session_at_capacity() {
+        const CAPACITY: usize = 4;
+
+        let limits = McpSessionLimits::new(CAPACITY, McpSessionLimits::DEFAULT_IDLE_TTL)
+            .expect("test limits should validate");
+        let manager = WatchdogSessionManager::without_application_scope(limits);
+        let mut sessions = Vec::with_capacity(CAPACITY);
+        for _ in 0..CAPACITY {
             sessions.push(
                 manager
                     .create_session()
                     .await
                     .expect("session within capacity should be admitted"),
             );
+            // Separate each admission so "longest idle" is unambiguous.
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(manager.occupancy().admitted, CAPACITY);
+
+        let (replacement, _transport) = manager
+            .create_session()
+            .await
+            .expect("admission at capacity should evict rather than refuse");
+        let occupancy = manager.occupancy();
+        assert_eq!(occupancy.admitted, CAPACITY, "the cap still holds");
+        assert_eq!(occupancy.capacity, CAPACITY);
+        assert_eq!(occupancy.evicted, 1);
+        assert!(
+            !manager
+                .has_session(&sessions[0].0)
+                .await
+                .expect("session lookup should succeed"),
+            "the longest-idle session is the one evicted"
+        );
+        for (session, _transport) in &sessions[1..] {
+            assert!(
+                manager
+                    .has_session(session)
+                    .await
+                    .expect("session lookup should succeed"),
+                "more recently active sessions must survive"
+            );
         }
         assert!(matches!(
-            manager.create_session().await,
-            Err(WatchdogSessionManagerError::Capacity)
-        ));
-        assert!(matches!(
-            manager.restore_session("overflow-session".into()).await,
-            Err(WatchdogSessionManagerError::Capacity)
-        ));
-        assert!(matches!(
-            manager.restore_session(sessions[0].0.clone()).await,
+            manager.restore_session(sessions[1].0.clone()).await,
             Ok(RestoreOutcome::AlreadyPresent)
         ));
+        assert_eq!(
+            manager.occupancy().evicted,
+            1,
+            "restoring a session already present must not evict"
+        );
+        manager
+            .close_session(&replacement)
+            .await
+            .expect("replacement should close");
 
         for (session, _transport) in sessions {
             manager

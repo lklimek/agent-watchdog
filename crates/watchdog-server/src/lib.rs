@@ -24,8 +24,8 @@ mod watch_paths;
 pub use agent_api::{
     AgentApi, AgentApiError, AgentCorrelationView, AgentDiagnosticView, AgentEventView,
     AgentHealthView, AgentSignalTimes, CompletionOutcome, DiscoveredSession, EventPage,
-    RegisterSession, RegisteredWatchPathView, RepositoryMetadata, SessionTreeView, SessionView,
-    TimerReconciliationReport, TransportKey, WaitingKind,
+    McpSessionOccupancy, RegisterSession, RegisteredWatchPathView, RepositoryMetadata,
+    SessionTreeView, SessionView, TimerReconciliationReport, TransportKey, WaitingKind,
 };
 pub use auth::{
     BasicAuthError, BasicAuthenticator, BearerAuthError, BearerAuthenticator,
@@ -49,7 +49,8 @@ pub use github::{GitHubConfigError, GitHubEnricher, GitHubEnrichment};
 pub use health::{HealthComponentView, HealthLevel, HealthService, HealthSnapshot, health_router};
 pub use hooks::{ClaudeHookService, CodexHookService, claude_hook_router, codex_hook_router};
 pub use mcp::{
-    WatchdogMcpService, WatchdogSessionManager, WatchdogSessionManagerError, mcp_router,
+    McpSessionLimits, McpSessionLimitsError, WatchdogMcpService, WatchdogSessionManager,
+    WatchdogSessionManagerError, mcp_router,
 };
 pub use notifications::{
     HumanNotification, HumanNotifier, HumanOutboxDispatcher, NotificationConfigError,

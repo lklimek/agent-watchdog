@@ -7,6 +7,7 @@ use std::{
 };
 
 use serde_json::Value;
+use watchdog_server::WatchdogMcpService;
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -104,22 +105,43 @@ fn mcp_config_uses_streamable_http_and_environment_only_bearer_auth() {
 }
 
 #[test]
+fn shipped_mcp_endpoint_default_never_sends_the_bearer_token_in_cleartext() {
+    // The template carries a Bearer credential, so its built-in default must be
+    // loopback; any other shipped default has to be https. TLS terminates at the
+    // reverse proxy, so this cannot be checked at runtime — it is pinned here.
+    let config = read_json(repository_root().join(".claude-plugin/.mcp.json"));
+    let url = config["mcpServers"]["agent-watchdog"]["url"]
+        .as_str()
+        .expect("MCP endpoint should be a string");
+    let default = url
+        .split_once(":-")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(default, _)| default)
+        .expect("endpoint should carry an inline default");
+    assert!(
+        default.starts_with("https://")
+            || default.starts_with("http://localhost")
+            || default.starts_with("http://127.0.0.1")
+            || default.starts_with("http://[::1]"),
+        "cleartext default endpoint must stay loopback-only: {default}"
+    );
+}
+
+#[test]
 fn coordinator_skill_covers_the_safe_lifecycle_contract() {
     let root = repository_root();
     let skill = read(root.join("skills/agent-watchdog/SKILL.md"));
+    // Derived from the router itself, so adding a tool without documenting it
+    // fails here instead of silently diverging from a second hand-kept list.
+    for tool in WatchdogMcpService::registered_tool_names() {
+        assert!(
+            skill.contains(&tool),
+            "coordinator skill should document the `{tool}` tool"
+        );
+    }
     let required_terms = [
-        "register_session",
-        "register_delegation",
-        "register_watch_path",
-        "report_progress",
-        "report_waiting",
-        "complete_session",
-        "update_deadline",
-        "list_events",
         "next_cursor",
         "event_key",
-        "get_session_tree",
-        "get_watchdog_health",
         "runtime-native",
         "provenance",
         "transport reconnect",
@@ -127,6 +149,10 @@ fn coordinator_skill_covers_the_safe_lifecycle_contract() {
         "Corroborate, don't trust alone",
         "all adapters",
         "identity conflict",
+        "idle",
+        "outcome_uncertain",
+        "suggested_checks",
+        "alias",
     ];
     for term in required_terms {
         assert!(

@@ -1098,6 +1098,124 @@ async fn runtime_absence_with_a_later_commit_reports_an_uncertain_outcome() {
     }));
 }
 
+/// Latest child diagnostics assembled from the durable parent inbox.
+async fn child_diagnostics(
+    api: &AgentApi,
+    transport: &TransportKey,
+    child: SessionId,
+) -> watchdog_server::AgentDiagnosticView {
+    api.list_events(transport, Some(0), 100)
+        .await
+        .expect("parent events should list")
+        .events
+        .iter()
+        .rev()
+        .find(|view| view.event.subject().session_id() == child)
+        .expect("the child should have durable events")
+        .diagnostics
+        .clone()
+}
+
+#[tokio::test]
+async fn established_child_outcomes_are_not_reported_uncertain() {
+    let (api, _store, clock) = api_fixture().await;
+    let transport = TransportKey::new("established-outcome").expect("transport should be valid");
+    let main = register_main(&api, &transport, "established-main", "register-main").await;
+    let child = register_child(
+        &api,
+        &transport,
+        main,
+        "established-child",
+        "register-child",
+    )
+    .await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "established-child")
+        .expect("native identity should be valid");
+
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "running")
+            .expect("observation ID should be valid"),
+        clock.now(),
+        DetailedState::Running,
+    ))
+    .await
+    .expect("authoritative running state should apply");
+    let running = child_diagnostics(&api, &transport, child).await;
+    assert!(
+        !running.outcome_uncertain,
+        "a plainly running child has no unresolved outcome to flag"
+    );
+
+    api.complete_session(
+        &transport,
+        child,
+        "complete-established-child",
+        CompletionOutcome::Completed,
+    )
+    .await
+    .expect("child should complete");
+    let completed = child_diagnostics(&api, &transport, child).await;
+    assert!(
+        !completed.outcome_uncertain,
+        "a normally completed child has an established outcome"
+    );
+}
+
+#[tokio::test]
+async fn terminal_state_after_an_unresolved_source_conflict_stays_uncertain() {
+    let (api, _store, clock) = api_fixture().await;
+    let transport = TransportKey::new("conflicted-outcome").expect("transport should be valid");
+    let main = register_main(&api, &transport, "conflicted-main", "register-main").await;
+    let child = register_child(&api, &transport, main, "conflicted-child", "register-child").await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "conflicted-child")
+        .expect("native identity should be valid");
+
+    api.ingest_native_observation(
+        ObservationEnvelope::new(
+            ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "conflict")
+                .expect("observation ID should be valid"),
+            native.clone(),
+            clock.now(),
+            ObservationSource::new(
+                AdapterIdentity::new(RuntimeKind::CodexCompanion, "1.0.6")
+                    .expect("adapter should be valid"),
+                "state:identity-conflict",
+                EvidenceTrust::Authoritative,
+                None,
+            )
+            .expect("source should be valid"),
+            ObservationPayload::SourceConflict(
+                BoundedText::new("source_conflict", "runtime and agent sources disagree")
+                    .expect("conflict text should be valid"),
+            ),
+        )
+        .expect("conflict observation should be valid"),
+    )
+    .await
+    .expect("source conflict should apply");
+
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "failed")
+            .expect("observation ID should be valid"),
+        clock.now(),
+        DetailedState::Failed,
+    ))
+    .await
+    .expect("terminal state should apply over an unresolved conflict");
+
+    let diagnostics = child_diagnostics(&api, &transport, child).await;
+    assert!(
+        !diagnostics.source_conflicts.is_empty(),
+        "the unresolved conflict must remain visible"
+    );
+    assert!(
+        diagnostics.outcome_uncertain,
+        "a terminal state reached while sources still disagree is not an established outcome"
+    );
+}
+
 async fn prepare_diagnostic_child(
     api: &AgentApi,
     store: &WatchdogStore,

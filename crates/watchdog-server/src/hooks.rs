@@ -215,21 +215,25 @@ async fn ingest_evidence(
     evidence: HookIngestion,
 ) -> Result<(), HookHttpError> {
     let parent = if let Some(parent) = &evidence.parent {
-        let parent_id = SessionId::from_native(parent);
-        api.discover_session(DiscoveredSession {
-            runtime: evidence.runtime,
-            native_id: parent.native_id().to_owned(),
-            kind: SessionKind::Main,
-            parent: None,
-            event_key: format!("{}-parent:{parent_id}", evidence.event_prefix),
-            adapter_version: evidence.adapter_version.to_owned(),
-            evidence_source: format!("{}-parent", evidence.source_name),
-            title: None,
-            startup_directory: None,
-        })
-        .await
-        .map_err(|_| HookHttpError::Unavailable)?;
-        Some(parent_id)
+        let asserted = SessionId::from_native(parent);
+        // Discovery may redirect the asserted native ID onto a canonical main
+        // through the alias table, so the child's parent is the identity the
+        // API returns, never one re-derived from the asserted key.
+        let view = api
+            .discover_session(DiscoveredSession {
+                runtime: evidence.runtime,
+                native_id: parent.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: format!("{}-parent:{asserted}", evidence.event_prefix),
+                adapter_version: evidence.adapter_version.to_owned(),
+                evidence_source: format!("{}-parent", evidence.source_name),
+                title: None,
+                startup_directory: None,
+            })
+            .await
+            .map_err(|_| HookHttpError::Unavailable)?;
+        Some(view.session.session_id())
     } else {
         None
     };
