@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Bounded transcript cursor and partial-record acceptance tests.
+#![cfg(target_os = "linux")]
 
 use std::{
     fs::{self, OpenOptions},

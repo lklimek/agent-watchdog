@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Non-recursive bounded inotify service acceptance tests.
+#![cfg(target_os = "linux")]
 
 use std::{
     fs,
