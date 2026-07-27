@@ -1,4 +1,5 @@
 //! Automatic runtime discovery and best-effort reconciliation acceptance tests.
+#![cfg(target_os = "linux")]
 
 use std::{
     fs,
