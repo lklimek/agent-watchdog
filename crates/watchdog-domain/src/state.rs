@@ -1,7 +1,19 @@
 use serde::{Deserialize, Serialize};
 
 /// Runtime-neutral detailed state exposed through MCP and JSON APIs.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DetailedState {
     /// Session was discovered but has not begun useful work.
@@ -24,7 +36,7 @@ pub enum DetailedState {
     Failed,
     /// Session was intentionally cancelled.
     Cancelled,
-    /// Session vanished without a trusted terminal record.
+    /// Session runtime vanished without establishing the job's terminal outcome.
     Disappeared,
     /// Material sources conflict or cannot establish a trustworthy state.
     Unknown,
@@ -44,7 +56,7 @@ pub enum CompactState {
     Stalled,
     /// Successful or intentional terminal state.
     Finished,
-    /// Failed or disappeared terminal state.
+    /// Failed or disappeared presentation state; disappearance remains outcome-uncertain.
     Failed,
     /// Trustworthy projection is unavailable.
     Unknown,

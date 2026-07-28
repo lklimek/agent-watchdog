@@ -35,7 +35,7 @@ impl TerminationCandidate {
 }
 
 /// Persisted stage in the conservative child-termination saga.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminationStage {
     /// Parent warning and grace period.
@@ -53,7 +53,7 @@ pub enum TerminationStage {
 }
 
 /// Bounded audit result for the most recent termination-saga action.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminationActionOutcome {
     /// Parent warning and its grace deadline were scheduled.

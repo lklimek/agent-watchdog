@@ -471,6 +471,56 @@ fn source_conflict_becomes_unknown_then_restores_only_on_explicit_resolution() {
 }
 
 #[test]
+fn source_conflict_resolution_never_reverts_a_newer_authoritative_state() {
+    let mut snapshot = initial();
+    for (sequence, payload) in [
+        (1, ObservationPayload::NativeState(DetailedState::Running)),
+        (
+            2,
+            ObservationPayload::SourceConflict(
+                BoundedText::new(
+                    "conflict",
+                    "native state disagrees with filesystem evidence",
+                )
+                .expect("conflict should be valid"),
+            ),
+        ),
+        (3, ObservationPayload::NativeState(DetailedState::Failed)),
+    ] {
+        snapshot = reduce(
+            snapshot,
+            ReducerInput::Observation(observation(sequence, time(sequence), payload)),
+            ReducerPolicy::default(),
+        )
+        .into_snapshot();
+    }
+    assert_eq!(snapshot.state(), DetailedState::Failed);
+    assert!(snapshot.source_conflict());
+
+    let resolved = reduce(
+        snapshot,
+        ReducerInput::Observation(observation(
+            4,
+            time(4),
+            ObservationPayload::SourceConflictResolved,
+        )),
+        ReducerPolicy::default(),
+    );
+    assert!(!resolved.snapshot().source_conflict());
+    assert_eq!(
+        resolved.snapshot().state(),
+        DetailedState::Failed,
+        "clearing the conflict latch must not resurrect the pre-conflict state over newer \
+         authoritative evidence"
+    );
+    assert!(
+        resolved
+            .events()
+            .contains(&DomainEventKind::ConflictChanged { active: false })
+    );
+}
+
+#[test]
 fn causally_independent_compatibility_and_progress_inputs_converge() {
     let progress = observation(
         1,

@@ -6,7 +6,19 @@ use thiserror::Error;
 use crate::{BoundedText, Confidence, DomainInputError, EvidenceTrust, SessionIdentity};
 
 /// Strongest evidence class supporting a parent candidate.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CorrelationBasis {
     /// Compatible path or timestamp without a stronger runtime link.

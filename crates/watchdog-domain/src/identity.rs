@@ -9,7 +9,19 @@ const MAX_NATIVE_ID_BYTES: usize = 512;
 const MAX_OBSERVATION_PART_BYTES: usize = 512;
 
 /// Runtime namespace for native identifiers and adapter behavior.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
     /// Anthropic Claude Code.
@@ -92,7 +104,18 @@ impl NativeSessionKey {
 macro_rules! uuid_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(
+            Clone,
+            Copy,
+            Deserialize,
+            Eq,
+            Hash,
+            Ord,
+            PartialEq,
+            PartialOrd,
+            Serialize,
+            schemars::JsonSchema,
+        )]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -186,7 +209,19 @@ impl ObservationId {
 }
 
 /// Type-safe identity for a main session.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct MainSessionId(SessionId);
 
@@ -205,7 +240,19 @@ impl MainSessionId {
 }
 
 /// Type-safe identity for a child session.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ChildSessionId(SessionId);
 

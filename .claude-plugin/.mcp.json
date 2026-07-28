@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agent-watchdog": {
+      "type": "http",
+      "url": "${AGENT_WATCHDOG_URL:-http://localhost:8080}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${WATCHDOG_BEARER_TOKEN}"
+      }
+    }
+  }
+}

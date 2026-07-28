@@ -57,7 +57,7 @@ not accepted deferrals.
 | FR-STA-004 | T-STA-002 | Adapter provenance plus global reducer fallback policy | Automated |
 | FR-STA-005 | T-STA-002 | Five-minute suspect and fifteen-minute stall defaults and fake-time tests | Automated |
 | FR-STA-006 | T-STA-007 | Authoritative failure and verified process disappearance reduce immediately | Automated |
-| FR-STA-007 | T-STA-008 | Process sampling precedes timer evaluation; `AgentDiagnosticView` includes PID, latest CPU delta/provenance, trusted times, operation, conflicts, correlation, and suggested checks | Automated |
+| FR-STA-007 | T-STA-008, T-STA-018 | Process sampling precedes timer evaluation; `AgentDiagnosticView` includes PID, latest CPU delta/provenance, trusted times, operation, conflicts, correlation, outcome uncertainty, and a target-branch/worktree cross-check for runtime disappearance | Automated |
 | FR-STA-008 | T-STA-009 | Monotonic five-minute reminder reducer/outbox behavior | Automated |
 | FR-STA-009 | T-DIS-005, T-STA-010, T-STA-014, T-STA-017 | Source-sensitive stable observation IDs, transactional store, durable event cursor, restart boundary | Automated |
 | FR-KILL-001 | T-KILL-001 | `ChildSessionId`-only safety/termination entry points and main rejection tests | Automated |
@@ -69,11 +69,15 @@ not accepted deferrals.
 | FR-KILL-007 | T-KILL-013 | Adapter boundary is read-only; cancellation interface and OS signals are the only mutation capabilities | Automated contract and final security inspection passed |
 | FR-MCP-001 | T-MCP-001 | Bearer middleware before rmcp parsing/allocation; auth and transport tests | Automated |
 | FR-MCP-002 | T-MCP-002, T-MCP-003 | One immutable main-tree scope per transport and cross-tree rejection | Automated |
-| FR-MCP-003 | T-MCP-004 | Twelve bounded runtime-neutral MCP tools and real rmcp schema/behavior tests | Automated |
+| FR-MCP-003 | T-MCP-004, T-MCP-010 | Twelve bounded runtime-neutral MCP tools plus live rmcp input/output-schema, structured-content, and legacy-text compatibility tests | Automated |
 | FR-MCP-004 | T-DATA-003, T-MCP-005, T-MCP-009 | Transactional parent inbox with separate delivered/acknowledged ceilings across roots and restart | Automated |
 | FR-MCP-005 | T-MCP-006 | Durable `AgentEventView` includes the explicit bounded FR-STA-007 diagnostic bundle without transcript retrieval | Automated |
 | FR-MCP-006 | T-MCP-007 | Durable inbox is authoritative and capability model permits optional push | Automated fallback; no supported push transport in v1 |
 | FR-MCP-007 | T-MCP-008 | Major/minor-gated actionable `UPGRADE` warning in snapshots, MCP, API, and UI | Automated |
+| FR-MCP-008 | T-MCP-011, T-MCP-013 | `[mcp]` TOML bounds validated at load; `mcp_idle_expiry_reclaims_capacity_and_transport_scope` and `mcp_session_admission_is_atomic_under_concurrent_create_and_restore` | Automated |
+| FR-MCP-009 | T-MCP-012 | Longest-idle eviction through the shared release path plus the `get_watchdog_health` occupancy gauge; `mcp_session_admission_evicts_the_longest_idle_session_at_capacity`, `mcp_admission_at_capacity_evicts_the_longest_idle_transport`, `mcp_router_publishes_session_occupancy_in_agent_health` | Automated |
+| FR-MCP-010 | T-MCP-014 | Leased alias resolution on main registration; hook and discovery callers bind the returned canonical identity (`hook_children_register_against_the_alias_resolved_canonical_main`, `mcp_main_registration_resolves_discovery_alias_before_child_retry`) | Automated |
+| FR-MCP-011 | T-MCP-015 | Request-body bound layered inside `/mcp` authentication; `mcp_post_with_a_stalled_request_body_is_bounded_and_logged`, `mcp_server_push_stream_outlives_the_request_body_bound`, `mcp_limits_default_to_the_shipped_bounds_and_reject_a_zero_bound` | Automated |
 
 ## UI, notifications, and API
 

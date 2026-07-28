@@ -279,7 +279,22 @@ mod tests {
     use watchdog_testkit::FakeClock;
 
     use super::*;
-    use crate::{AgentApi, DiscoveredSession, RegisterSession, TransportKey};
+    use crate::{
+        AgentApi, DiscoveredSession, RegisterSession, RegisteredWatchPathView, TransportKey,
+    };
+
+    /// `register_watch_path` advertises its `outputSchema` from this same type,
+    /// so a serialized response that fails it would ship an unsatisfiable
+    /// contract. The rmcp plumbing itself is covered in `tests/mcp_transport.rs`;
+    /// only this tool needs configured worktree roots to produce a live success.
+    fn assert_matches_advertised_output_schema(view: &RegisteredWatchPathView) {
+        let schema = serde_json::to_value(schemars::schema_for!(RegisteredWatchPathView))
+            .expect("advertised schema should serialize");
+        let value = serde_json::to_value(view).expect("watch-path response should serialize");
+        if let Err(error) = jsonschema::draft202012::validate(&schema, &value) {
+            panic!("register_watch_path response should match its output schema: {error}");
+        }
+    }
 
     #[tokio::test]
     async fn scoped_registration_accepts_only_capability_projected_directories_and_restores() {
@@ -339,6 +354,7 @@ mod tests {
             accepted.registration.native_path(),
             "/host/repositories/inside"
         );
+        assert_matches_advertised_output_schema(&accepted);
         assert_eq!(
             api.register_watch_path(
                 &transport,

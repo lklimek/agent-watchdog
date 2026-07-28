@@ -8,7 +8,19 @@ pub const MAX_ADAPTER_VERSION_BYTES: usize = 128;
 const MAX_SOURCE_FINGERPRINT_BYTES: usize = 512;
 
 /// Trust assigned to one evidence source before deterministic reduction.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceTrust {
     /// Runtime contract or explicit agent report owns this fact.
@@ -22,7 +34,9 @@ pub enum EvidenceTrust {
 }
 
 /// Confidence in basis points from zero through ten thousand.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Confidence(u16);
 
@@ -64,7 +78,7 @@ pub struct ConfidenceError {
 }
 
 /// Runtime adapter name and best available native version evidence.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AdapterIdentity {
     runtime: RuntimeKind,
     version: BoundedText<MAX_ADAPTER_VERSION_BYTES>,
@@ -116,7 +130,7 @@ impl AdapterIdentity {
 }
 
 /// Provenance attached to every observation envelope.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct ObservationSource {
     adapter: AdapterIdentity,
     fingerprint: BoundedText<MAX_SOURCE_FINGERPRINT_BYTES>,

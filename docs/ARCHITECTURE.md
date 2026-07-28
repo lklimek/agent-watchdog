@@ -585,7 +585,18 @@ being treated as negative evidence. The timer does not perform an expensive
 transcript rescan. Each parent event carries an explicit bounded diagnostic
 bundle: PID identity, latest process deltas and provenance, trusted signal
 times, active-operation summary, source conflicts, selected correlation
-basis/evidence, and deterministic suggested checks.
+basis/evidence, an explicit outcome-uncertainty flag, and deterministic
+suggested checks. That flag is derived from evidence rather than from the state
+enum: it is set when the runtime disappeared, when the state is unknown, or
+when a source conflict remains unresolved — a terminal state reached while
+sources still disagree establishes nothing, so it stays uncertain until the
+conflict clears. An ordinary in-flight session is not uncertain. Process
+disappearance proves that the sampled runtime is absent, not whether its work
+succeeded. Before treating disappearance as
+failure, callers inspect the exact registered target branch and worktree for
+commits or changes newer than the last trusted activity. Git evidence can
+corroborate delivered work, but cannot synthesize `completed` without a trusted
+target branch, baseline commit, and exclusive job ownership.
 
 ## 12. Termination safety architecture
 
@@ -706,12 +717,57 @@ Every query/mutation resolves the supplied session ID within that root tree.
 
 The rmcp transport ID is surfaced by a Watchdog `SessionManager` wrapper as a
 typed request extension. The application binds that opaque ID exactly once;
-rebinding and cross-tree targets fail server-side. rmcp's SSE replay cursor is
-transport-only. Parent event delivery and acknowledgement use a separate
-durable SQLite inbox cursor, so transport loss or resume failure cannot discard
-agent-visible events. This boundary is executable in the Phase 0 scoping test.
+rebinding and cross-tree targets fail server-side. Because that ID is also the
+application authorization scope, Watchdog raises rmcp's local idle-session
+expiry to `[mcp] idle_ttl_seconds` (48 hours by default): a binding remains
+valid across realistic coordinator idle periods, while genuinely abandoned
+transports are eventually closed and reclaimed. Admission is capped at
+`[mcp] max_sessions` (64 by default) so process state stays bounded, and at
+that cap a new connection evicts the least-recently-active transport rather
+than being refused: a parked binding must never outrank a live one, and
+reconnect churn must never lock the surface out. Eviction, explicit closure,
+and idle expiry release the application scope through the same path, so
+capacity and scope are always reclaimed together. A new, evicted, or expired
+transport must register its main again. All `[mcp]` bounds are read at startup
+and are not `SIGHUP`-reloadable, because rmcp fixes a session's idle timeout
+when that session is created.
 
-Proposed tools:
+The `/mcp` route stacks two middleware layers outside rmcp. Bearer
+authentication is outermost, so an unauthenticated caller is rejected on headers
+alone, before any body is read or protocol state allocated. Inside it, a
+request-body bound answers `408` once a `POST` body has taken longer than
+`[mcp] request_body_timeout_seconds` (30 by default) to arrive in full. That
+bound exists because rmcp collects the entire request body before session
+lookup or any logging: a client stalling mid-send would otherwise park the
+handler indefinitely and leave no trace anywhere on the server, the exact
+failure this layer converts into a logged, diagnosable answer. It bounds the
+total read rather than the gap between chunks, so a client dribbling bytes is
+refused too. Only request bodies are bounded — `GET` server-push streams are
+response bodies and remain long-lived by design. rmcp's SSE replay cursor is
+transport-only. Parent event
+delivery and acknowledgement use a separate durable SQLite inbox cursor, so
+transport loss or resume failure cannot discard agent-visible events. The
+integration tests in `crates/watchdog-server/tests/mcp_transport.rs` execute
+this boundary against a real rmcp transport.
+
+Main registration resolves a uniquely persisted runtime-native discovery alias
+before persisting a new session. This lets wrapper or transcript identities
+bind the already discovered canonical main without creating a parallel tree.
+Single and bulk alias resolution use the same exact-session candidates, and
+resolution is leased against concurrent in-process discovery updates until
+the alias resolves and its transport binding commits. The native ID is
+self-asserted, and rmcp permits a client-chosen ID during session restoration;
+alias-binding safety therefore assumes the documented single-tenant deployment
+with one shared Bearer credential. A multi-tenant deployment must authenticate
+and partition both identities before reusing this design. Ambiguous aliases and
+rejected transport rebindings fail before applying observations; child history
+is never reparented to accommodate a conflicting registration. Because a main
+registration can therefore resolve onto a different canonical session, the
+authorization scope follows the **resolved** identity rather than the asserted
+one: callers must use the returned session identity for later operations and
+must not re-derive it from the native ID they supplied.
+
+Implemented tools:
 
 | Tool | Purpose |
 |---|---|
@@ -733,6 +789,16 @@ health, and watch-path responses expose server time. Session views also include
 snapshot revision, normalized state, warnings, and evidence provenance; health
 and watch-path responses carry their domain-specific diagnostics or registration
 provenance. Tool text is bounded and treated as untrusted.
+
+Every tool returning an object-shaped response derives `outputSchema` from the
+same Rust type it serializes at runtime, so the identical `SessionView` payload
+is described identically no matter which tool produced it. `list_sessions` is
+the sole exception: its response is an array, which MCP structured content
+cannot carry, so it keeps the JSON text block alone. Successful calls
+place that JSON in `structuredContent` and retain the equivalent compact JSON
+text block for clients that do not consume structured output. Validation and
+infrastructure failures remain JSON-RPC errors, so every successful result from
+an advertised tool satisfies its output schema.
 
 MCP resource subscription or server notification may hint that events are
 available, but it is never the delivery authority. Durable `list_events` remains

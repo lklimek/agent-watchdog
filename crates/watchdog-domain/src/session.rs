@@ -15,7 +15,19 @@ pub enum SessionKind {
 }
 
 /// Role-preserving session identity for generic observations and events.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "id")]
 pub enum SessionIdentity {
     /// Main-session identity.

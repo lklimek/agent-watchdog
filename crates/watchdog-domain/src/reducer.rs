@@ -80,7 +80,7 @@ pub enum ReducerPolicyError {
 }
 
 /// Durable reducer state for one normalized session.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct SessionSnapshot {
     session: SessionIdentity,
     root: MainSessionId,
@@ -403,7 +403,11 @@ fn apply_observation(
                     .state_before_conflict
                     .take()
                     .unwrap_or(DetailedState::Unknown);
-                transition(snapshot, restored, observation.observed_at(), events);
+                // Only the conflict-forced Unknown may be rewound; any other
+                // current state came from later evidence that outranks the memo.
+                if snapshot.state == DetailedState::Unknown {
+                    transition(snapshot, restored, observation.observed_at(), events);
+                }
             }
         }
         ObservationPayload::SchedulerTick => {}

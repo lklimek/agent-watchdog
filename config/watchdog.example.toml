@@ -39,6 +39,21 @@ terminate_after_stalled_seconds = 3600
 warning_grace_seconds = 600
 action_grace_seconds = 600
 
+[mcp]
+# Concurrent authenticated MCP transports. At the cap, admission evicts the
+# longest-idle transport rather than refusing the new one; the evicted client
+# must register its main session again.
+max_sessions = 64
+# Idle period after which an abandoned transport is reclaimed. Long enough to
+# survive realistic coordinator idle periods, finite so nothing leaks.
+idle_ttl_seconds = 172800
+# Time one MCP request body has to arrive in full. rmcp reads the whole body
+# before it can log anything, so without this bound a client that stalls
+# mid-send parks the request forever and leaves no server-side trace. Bounds
+# request reads only; long-lived server-push streams are untouched.
+# All three values apply at startup only; SIGHUP does not reload them.
+request_body_timeout_seconds = 30
+
 [adapters]
 claude = true
 codex = true

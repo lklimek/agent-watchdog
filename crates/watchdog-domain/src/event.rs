@@ -6,7 +6,19 @@ use crate::{
 };
 
 /// Durable monotonically ordered event identifier.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct EventId(u64);
 
@@ -25,7 +37,7 @@ impl EventId {
 }
 
 /// Agent- and human-visible domain transition.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DomainEventKind {
     /// Normalized session state changed.
@@ -64,7 +76,7 @@ pub enum DomainEventKind {
 }
 
 /// Durable event scoped to one main-session tree.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct DomainEvent {
     id: EventId,
     root: MainSessionId,

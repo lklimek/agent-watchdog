@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use sqlx::Row;
 use watchdog_domain::{
     BoundedText, ChildSessionId, DomainEvent, EventId, MainSessionId, NativeSessionKey,
@@ -5,10 +7,10 @@ use watchdog_domain::{
 };
 
 use crate::{
-    ActivitySampleRecord, AdapterHealthRecord, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
-    NotificationAttemptRecord, RegisteredWatchPathRecord, RelationRecord, SessionMetadataRecord,
-    SnapshotUpdate, StoreError, StoredSessionRecord, TerminationSagaRecord, WatchdogStore,
-    bounded_json, sqlite_integer,
+    ActivitySampleRecord, AdapterHealthRecord, DeadlineRecord, DiscoveryAliasResolution,
+    FileCursorRecord, InboxOffsetRecord, NotificationAttemptRecord, RegisteredWatchPathRecord,
+    RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreError, StoredSessionRecord,
+    TerminationSagaRecord, WatchdogStore, bounded_json, sqlite_integer,
 };
 
 impl WatchdogStore {
@@ -361,6 +363,7 @@ impl WatchdogStore {
         canonical: SessionId,
         observed_at: watchdog_domain::WallTimeMs,
     ) -> Result<(), StoreError> {
+        let _guard = self.discovery_alias_lock.lock().await;
         let result = sqlx::query(
             "INSERT INTO discovery_aliases \
              (alias_runtime, alias_native_id, canonical_session_id, observed_at_ms) \
@@ -394,13 +397,25 @@ impl WatchdogStore {
         limit: u32,
     ) -> Result<Vec<(NativeSessionKey, Option<SessionId>)>, StoreError> {
         validate_limit(limit)?;
+        let _guard = self.discovery_alias_lock.lock().await;
         let rows = sqlx::query(
-            "SELECT alias_native_id, \
+            "WITH alias_keys(alias_native_id) AS (\
+                 SELECT DISTINCT alias_native_id FROM discovery_aliases WHERE alias_runtime = ?\
+             ), candidates(alias_native_id, canonical_session_id) AS (\
+                 SELECT alias_native_id, canonical_session_id FROM discovery_aliases \
+                 WHERE alias_runtime = ? \
+                 UNION \
+                 SELECT alias_keys.alias_native_id, sessions.session_id \
+                 FROM alias_keys JOIN sessions \
+                 ON sessions.runtime = ? AND sessions.native_id = alias_keys.alias_native_id\
+             ) \
+             SELECT alias_native_id, \
              CASE WHEN COUNT(*) = 1 THEN MIN(canonical_session_id) ELSE NULL END \
-             AS canonical_session_id FROM discovery_aliases \
-             WHERE alias_runtime = ? GROUP BY alias_native_id \
+             AS canonical_session_id FROM candidates GROUP BY alias_native_id \
              ORDER BY alias_native_id LIMIT ?",
         )
+        .bind(runtime.as_str())
+        .bind(runtime.as_str())
         .bind(runtime.as_str())
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -417,6 +432,69 @@ impl WatchdogStore {
                 Ok((alias, canonical))
             })
             .collect()
+    }
+
+    /// Resolve one durable runtime-native alias without choosing among conflicts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt stored identities or `SQLite` failure.
+    pub async fn discovery_alias(
+        &self,
+        alias: &NativeSessionKey,
+    ) -> Result<DiscoveryAliasResolution, StoreError> {
+        let _guard = self.discovery_alias_lock.lock().await;
+        self.discovery_alias_unlocked(alias).await
+    }
+
+    /// Resolve one alias and keep the result stable against in-process
+    /// discovery writers until the returned lease is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt stored identities or `SQLite` failure.
+    pub async fn lease_discovery_alias(
+        &self,
+        alias: &NativeSessionKey,
+    ) -> Result<crate::DiscoveryAliasLease, StoreError> {
+        let guard = Arc::clone(&self.discovery_alias_lock).lock_owned().await;
+        let resolution = self.discovery_alias_unlocked(alias).await?;
+        Ok(crate::DiscoveryAliasLease {
+            resolution,
+            _guard: guard,
+        })
+    }
+
+    async fn discovery_alias_unlocked(
+        &self,
+        alias: &NativeSessionKey,
+    ) -> Result<DiscoveryAliasResolution, StoreError> {
+        let row = sqlx::query(
+            "WITH candidates(canonical_session_id) AS (\
+                 SELECT canonical_session_id FROM discovery_aliases \
+                 WHERE alias_runtime = ? AND alias_native_id = ? \
+                 UNION \
+                 SELECT session_id FROM sessions WHERE runtime = ? AND native_id = ?\
+             ) \
+             SELECT COUNT(*) AS target_count, MIN(canonical_session_id) AS canonical_session_id \
+             FROM candidates",
+        )
+        .bind(alias.runtime().as_str())
+        .bind(alias.native_id())
+        .bind(alias.runtime().as_str())
+        .bind(alias.native_id())
+        .fetch_one(&self.pool)
+        .await?;
+        match row.try_get::<i64, _>("target_count")? {
+            0 => Ok(DiscoveryAliasResolution::Absent),
+            1 => {
+                let canonical: SessionId = serde_json::from_value(serde_json::Value::String(
+                    row.try_get("canonical_session_id")?,
+                ))?;
+                Ok(DiscoveryAliasResolution::Unique(canonical))
+            }
+            _ => Ok(DiscoveryAliasResolution::Ambiguous),
+        }
     }
 
     /// Load the currently selected parent record for one child.

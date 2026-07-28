@@ -321,3 +321,45 @@ are outside v1 scope.
   an exclusion outside every capability root, then send `SIGHUP` again.
 - UI says reconnecting: the last snapshot remains visible while SSE retries;
   there is intentionally no polling fallback.
+- MCP clients get `503` with `Retry-After` instead of a session: every admission
+  slot was occupied and none could be reclaimed. This is normally unreachable —
+  at the `[mcp] max_sessions` cap (64 by default) a new connection evicts the
+  longest-idle transport instead of being refused, so the surface is
+  self-managing and neither waiting nor restarting is required. An evicted
+  client recovers by re-running `register_session`. Grep `mcp.session_evicted`
+  for eviction pressure and `mcp.capacity_exhausted` for the refusal itself, and
+  read `mcp_sessions` in the MCP `get_watchdog_health` response for live
+  occupancy, the configured cap, and the eviction count. Sustained eviction
+  means the cap is too low for this host: raise `[mcp] max_sessions` in
+  `watchdog.toml`. That setting, `[mcp] idle_ttl_seconds` (48 hours by
+  default, the idle window after which an abandoned transport is reclaimed), and
+  `[mcp] request_body_timeout_seconds` apply at **startup only** — `SIGHUP` does
+  not reload them, so restart the service after changing any of them.
+- MCP clients get `408` where a call used to hang: the request body never
+  arrived in full within `[mcp] request_body_timeout_seconds` (30 by default).
+  The client stalled mid-send, or the connection through Traefik went bad after
+  the headers. Grep `mcp.request_body_timeout` for the bound being hit and
+  `mcp.request_body_unreadable` for a body that broke rather than stalled; both
+  record the route and the configured bound. Without this bound the request
+  produces **no server-side trace at all** — rmcp reads the entire body before
+  session lookup or logging, so the proxy logs a request the backend never
+  appears to receive. A `408` is therefore the diagnosis, not the defect: look
+  at the client and the network path. Raise the bound only if legitimate clients
+  genuinely need longer to send one JSON-RPC call. Long-lived server-push (`GET`
+  SSE) streams are deliberately outside this bound and never time out from it.
+- A Codex Companion runtime-gone signal (its job record reports the process
+  absent) confirms process absence, not job failure. Before retrying or
+  replacing completed work, inspect the exact target branch and worktree for
+  commits or changes newer than the last trusted activity. Agent Watchdog marks
+  the same doubt as `outcome_uncertain=true`, which is set when the runtime
+  disappeared, when the state is unknown, or when a source conflict is still
+  unresolved — including on a session that has since reported a terminal state.
+  It does not mean merely "not finished": an ordinary running or waiting session
+  reports `false`. The field is agent-facing only: it appears in the MCP
+  `list_events` and `get_session` responses, and is absent from the dashboard
+  and the read-only HTTP API that the rest of this document covers.
+
+  The Codex Companion runtime owns its job JSON/log finalization. If it commits
+  work and exits before durably publishing terminal status, Agent Watchdog
+  cannot repair that stale upstream record or safely infer `completed` without
+  the expected branch, baseline commit, and exclusive job ownership.

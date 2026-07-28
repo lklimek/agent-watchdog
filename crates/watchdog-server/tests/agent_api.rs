@@ -1,8 +1,9 @@
 //! Scoped durable parent-agent API acceptance tests.
 
-use std::sync::Arc;
+use std::{fs, path::Path, process::Command, sync::Arc};
 
 use sqlx::sqlite::SqliteConnectOptions;
+use watchdog_companion::CompanionParser;
 use watchdog_domain::{
     AdapterIdentity, BoundedText, Clock, CorrelationBasis, DeadlineCommand, DetailedState,
     DomainEventKind, DurationMs, EvidenceTrust, MainSessionId, NativeSessionKey,
@@ -268,6 +269,180 @@ async fn transport_binds_once_and_cross_tree_access_fails() {
     let cross_tree = api.get_session(&transport_a, main_b).await;
     assert!(matches!(cross_tree, Err(AgentApiError::CrossTreeAccess)));
     assert!(api.get_session(&transport_a, main_a).await.is_ok());
+}
+
+#[tokio::test]
+async fn rejected_main_rebinds_do_not_mutate_other_trees() {
+    let (api, store, clock) = api_fixture().await;
+    let transport = TransportKey::new("bound-transport").expect("transport should validate");
+    register_main(&api, &transport, "bound-main", "register-bound-main").await;
+
+    let direct_native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "rejected-direct-main")
+        .expect("direct identity should validate");
+    let direct = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: direct_native.runtime(),
+                native_id: direct_native.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "reject-direct-main".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(direct, Err(AgentApiError::TransportAlreadyBound)));
+    assert!(
+        store
+            .session_by_id(SessionId::from_native(&direct_native))
+            .await
+            .expect("direct target lookup should succeed")
+            .is_none(),
+        "rejected direct registration must not create another tree"
+    );
+
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "other-canonical-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-other-canonical".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:other-canonical".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("other canonical main should be discovered");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "other-wrapper-main")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            canonical.session.session_id(),
+            clock.now().wall_time(),
+        )
+        .await
+        .expect("wrapper alias should persist");
+    let before = store
+        .snapshot(canonical.session)
+        .await
+        .expect("canonical snapshot should load")
+        .expect("canonical snapshot should exist");
+
+    let aliased = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: alias.runtime(),
+                native_id: alias.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "reject-aliased-main".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(aliased, Err(AgentApiError::TransportAlreadyBound)));
+    assert_eq!(
+        store
+            .snapshot(canonical.session)
+            .await
+            .expect("canonical snapshot should reload")
+            .expect("canonical snapshot should remain"),
+        before,
+        "rejected aliased registration must not mutate another tree"
+    );
+}
+
+#[tokio::test]
+async fn mcp_main_registration_resolves_discovery_alias_before_child_retry() {
+    let (api, store, clock) = api_fixture().await;
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "canonical-main".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-canonical-main".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:canonical-main".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("canonical main should be discovered");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper-main")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            canonical.session.session_id(),
+            clock.now().wall_time(),
+        )
+        .await
+        .expect("wrapper alias should persist");
+    let discovered_alias_main = api
+        .discover_session(DiscoveredSession {
+            runtime: alias.runtime(),
+            native_id: alias.native_id().to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-wrapper-main".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:wrapper-main".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("known wrapper alias should enrich the canonical main");
+    assert_eq!(discovered_alias_main.session, canonical.session);
+    let discovered_child = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::CodexCompanion,
+            native_id: "companion-job".to_owned(),
+            kind: SessionKind::Child,
+            parent: Some(canonical.session.session_id()),
+            event_key: "discover-companion-job".to_owned(),
+            adapter_version: "1.0.6".to_owned(),
+            evidence_source: "companion:state-summary".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("Companion child should be discovered under the canonical main");
+
+    let transport = TransportKey::new("wrapper-transport").expect("transport should validate");
+    let registered_main = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: alias.runtime(),
+                native_id: alias.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "register-wrapper-main".to_owned(),
+            },
+        )
+        .await
+        .expect("known wrapper alias should bind the canonical main");
+    assert_eq!(registered_main.session, canonical.session);
+
+    let registered_child = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "companion-job".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(registered_main.session.session_id()),
+                event_key: "register-companion-job".to_owned(),
+            },
+        )
+        .await
+        .expect("discovered Companion child should accept exact MCP registration");
+    assert_eq!(registered_child.session, discovered_child.session);
+    assert_eq!(registered_child.root, canonical.root);
 }
 
 #[tokio::test]
@@ -832,6 +1007,215 @@ async fn parent_alert_event_contains_complete_bounded_diagnostics() {
     assert_complete_diagnostics(alert);
 }
 
+#[tokio::test]
+async fn runtime_absence_with_a_later_commit_reports_an_uncertain_outcome() {
+    const STALE_STATUS_EPOCH: u64 = 1_784_715_604;
+    const COMMIT_EPOCH: u64 = 1_784_718_759;
+
+    let repository = tempfile::tempdir().expect("repository fixture should exist");
+    initialize_repository(repository.path());
+    let (api, _store, clock) = api_fixture().await;
+    let transport =
+        TransportKey::new("companion-runtime-absence").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &transport,
+        "companion-runtime-absence-main",
+        "register-main",
+    )
+    .await;
+    let child = register_child(
+        &api,
+        &transport,
+        main,
+        "task-mrvxk4m5-heu75i",
+        "register-child",
+    )
+    .await;
+    let parser = CompanionParser::new("1.0.6").expect("version should be valid");
+    let detail = parser
+        .parse_detail(
+            &serde_json::to_vec(&serde_json::json!({
+                "id": "task-mrvxk4m5-heu75i",
+                "sessionId": "companion-runtime-absence-main",
+                "workspaceRoot": repository.path(),
+                "status": "running",
+                "phase": "investigating",
+                "pid": 871_478,
+                "updatedAt": "2026-07-22T10:20:04Z",
+                "completedAt": null
+            }))
+            .expect("job fixture should serialize"),
+        )
+        .expect("stale running detail should parse");
+    let reconciled = parser
+        .reconcile(None, Some(&detail))
+        .expect("detail-only job should reconcile");
+    api.ingest_native_observation(
+        parser
+            .observation(&reconciled, "stale-running-status", clock.now())
+            .expect("stale status observation should be valid"),
+    )
+    .await
+    .expect("stale running status should apply");
+
+    create_deliverable_commit(repository.path());
+    let commit_epoch = latest_commit_epoch(repository.path());
+    assert_eq!(commit_epoch, COMMIT_EPOCH);
+    assert!(commit_epoch > STALE_STATUS_EPOCH);
+    clock.advance(DurationMs::new((COMMIT_EPOCH - STALE_STATUS_EPOCH) * 1_000));
+
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "task-mrvxk4m5-heu75i")
+        .expect("native identity should be valid");
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "runtime-absent")
+            .expect("observation ID should be valid"),
+        clock.now(),
+        DetailedState::Disappeared,
+    ))
+    .await
+    .expect("verified runtime absence should apply");
+
+    let page = api
+        .list_events(&transport, Some(0), 100)
+        .await
+        .expect("parent events should list");
+    let alert = page
+        .events
+        .iter()
+        .find(|view| {
+            view.event.subject().session_id() == child
+                && matches!(view.event.kind(), DomainEventKind::AlertDue)
+        })
+        .expect("runtime absence must still alert");
+    assert_eq!(alert.session.snapshot.state(), DetailedState::Disappeared);
+    assert!(alert.diagnostics.outcome_uncertain);
+    assert!(alert.diagnostics.suggested_checks.iter().any(|check| {
+        check
+            == "Inspect the exact target branch and worktree for commits or changes newer than \
+                the last trusted activity before treating runtime absence as failure"
+    }));
+}
+
+/// Latest child diagnostics assembled from the durable parent inbox.
+async fn child_diagnostics(
+    api: &AgentApi,
+    transport: &TransportKey,
+    child: SessionId,
+) -> watchdog_server::AgentDiagnosticView {
+    api.list_events(transport, Some(0), 100)
+        .await
+        .expect("parent events should list")
+        .events
+        .iter()
+        .rev()
+        .find(|view| view.event.subject().session_id() == child)
+        .expect("the child should have durable events")
+        .diagnostics
+        .clone()
+}
+
+#[tokio::test]
+async fn established_child_outcomes_are_not_reported_uncertain() {
+    let (api, _store, clock) = api_fixture().await;
+    let transport = TransportKey::new("established-outcome").expect("transport should be valid");
+    let main = register_main(&api, &transport, "established-main", "register-main").await;
+    let child = register_child(
+        &api,
+        &transport,
+        main,
+        "established-child",
+        "register-child",
+    )
+    .await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "established-child")
+        .expect("native identity should be valid");
+
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "running")
+            .expect("observation ID should be valid"),
+        clock.now(),
+        DetailedState::Running,
+    ))
+    .await
+    .expect("authoritative running state should apply");
+    let running = child_diagnostics(&api, &transport, child).await;
+    assert!(
+        !running.outcome_uncertain,
+        "a plainly running child has no unresolved outcome to flag"
+    );
+
+    api.complete_session(
+        &transport,
+        child,
+        "complete-established-child",
+        CompletionOutcome::Completed,
+    )
+    .await
+    .expect("child should complete");
+    let completed = child_diagnostics(&api, &transport, child).await;
+    assert!(
+        !completed.outcome_uncertain,
+        "a normally completed child has an established outcome"
+    );
+}
+
+#[tokio::test]
+async fn terminal_state_after_an_unresolved_source_conflict_stays_uncertain() {
+    let (api, _store, clock) = api_fixture().await;
+    let transport = TransportKey::new("conflicted-outcome").expect("transport should be valid");
+    let main = register_main(&api, &transport, "conflicted-main", "register-main").await;
+    let child = register_child(&api, &transport, main, "conflicted-child", "register-child").await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "conflicted-child")
+        .expect("native identity should be valid");
+
+    api.ingest_native_observation(
+        ObservationEnvelope::new(
+            ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "conflict")
+                .expect("observation ID should be valid"),
+            native.clone(),
+            clock.now(),
+            ObservationSource::new(
+                AdapterIdentity::new(RuntimeKind::CodexCompanion, "1.0.6")
+                    .expect("adapter should be valid"),
+                "state:identity-conflict",
+                EvidenceTrust::Authoritative,
+                None,
+            )
+            .expect("source should be valid"),
+            ObservationPayload::SourceConflict(
+                BoundedText::new("source_conflict", "runtime and agent sources disagree")
+                    .expect("conflict text should be valid"),
+            ),
+        )
+        .expect("conflict observation should be valid"),
+    )
+    .await
+    .expect("source conflict should apply");
+
+    api.ingest_native_observation(native_state_observation(
+        &native,
+        ObservationId::from_native(RuntimeKind::CodexCompanion, "runtime", "failed")
+            .expect("observation ID should be valid"),
+        clock.now(),
+        DetailedState::Failed,
+    ))
+    .await
+    .expect("terminal state should apply over an unresolved conflict");
+
+    let diagnostics = child_diagnostics(&api, &transport, child).await;
+    assert!(
+        !diagnostics.source_conflicts.is_empty(),
+        "the unresolved conflict must remain visible"
+    );
+    assert!(
+        diagnostics.outcome_uncertain,
+        "a terminal state reached while sources still disagree is not an established outcome"
+    );
+}
+
 async fn prepare_diagnostic_child(
     api: &AgentApi,
     store: &WatchdogStore,
@@ -951,6 +1335,64 @@ fn assert_complete_diagnostics(alert: &AgentEventView) {
     assert_eq!(correlation.basis, CorrelationBasis::McpRegistration);
     assert!(correlation.evidence.starts_with("mcp:register_delegation:"));
     assert!(!alert.diagnostics.suggested_checks.is_empty());
+}
+
+fn initialize_repository(repository: &Path) {
+    run_git(
+        repository,
+        &["init", "-b", "chore/bump-platform-pin-pr3968"],
+    );
+    run_git(repository, &["config", "user.name", "Codex"]);
+    run_git(
+        repository,
+        &["config", "user.email", "codex@example.invalid"],
+    );
+}
+
+fn create_deliverable_commit(repository: &Path) {
+    fs::write(repository.join("deliverable.txt"), "completed work\n")
+        .expect("deliverable fixture should write");
+    run_git(repository, &["add", "deliverable.txt"]);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args([
+            "commit",
+            "-m",
+            "fix(wallet-backend): reap persisted FVK row on wallet removal",
+        ])
+        .env("GIT_AUTHOR_DATE", "2026-07-22T11:12:39Z")
+        .env("GIT_COMMITTER_DATE", "2026-07-22T11:12:39Z")
+        .output()
+        .expect("git commit should run");
+    assert!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn latest_commit_epoch(repository: &Path) -> u64 {
+    String::from_utf8(run_git(repository, &["log", "-1", "--format=%ct"]).stdout)
+        .expect("commit timestamp should be UTF-8")
+        .trim()
+        .parse()
+        .expect("commit timestamp should be numeric")
+}
+
+fn run_git(repository: &Path, arguments: &[&str]) -> std::process::Output {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn native_state_observation(

@@ -4,7 +4,9 @@ use thiserror::Error;
 use crate::BoundedText;
 
 /// Positive host process identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ProcessId(u32);
 
@@ -44,7 +46,7 @@ impl<'de> Deserialize<'de> for ProcessId {
 pub struct ProcessIdError;
 
 /// Fresh facts required to prevent PID-reuse mistakes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct ProcessIdentity {
     pid: ProcessId,
     start_time_ticks: u64,

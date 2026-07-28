@@ -15,11 +15,11 @@ use watchdog_domain::{
 };
 use watchdog_store::{
     ActivityEvidence, ActivitySampleRecord, AdapterHealthRecord, AdapterHealthStatus,
-    ApplyObservation, ApplyResult, DeadlineRecord, FileCursorRecord, InboxOffsetRecord,
-    NotificationAttemptRecord, NotificationChannel, NotificationOutcome, OutboxDestination,
-    RegisteredWatchPathRecord, RelationRecord, SessionMetadataRecord, SnapshotUpdate, StoreCounts,
-    StoreError, TerminationGate, TerminationSafetyRecord, TerminationSagaRecord, TerminationStage,
-    WatchdogStore,
+    ApplyObservation, ApplyResult, DeadlineRecord, DiscoveryAliasResolution, FileCursorRecord,
+    InboxOffsetRecord, NotificationAttemptRecord, NotificationChannel, NotificationOutcome,
+    OutboxDestination, RegisteredWatchPathRecord, RelationRecord, SessionMetadataRecord,
+    SnapshotUpdate, StoreCounts, StoreError, TerminationGate, TerminationSafetyRecord,
+    TerminationSagaRecord, TerminationStage, WatchdogStore,
 };
 
 fn fixture(observation_key: &str, event_id: u64, revision: u64) -> ApplyObservation {
@@ -402,6 +402,16 @@ async fn initialization_enables_required_sqlite_pragmas_and_schema() {
     assert_eq!(health.application_table_count, 17);
 }
 
+async fn alias_resolution(
+    store: &WatchdogStore,
+    alias: &NativeSessionKey,
+) -> DiscoveryAliasResolution {
+    store
+        .discovery_alias(alias)
+        .await
+        .expect("alias resolution should load")
+}
+
 #[tokio::test]
 async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
     let database = TestDatabase::new("discovery-aliases");
@@ -442,17 +452,106 @@ async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
             .expect("aliases should load"),
         vec![(alias.clone(), Some(canonical_1))]
     );
+    assert_eq!(
+        alias_resolution(&reopened, &alias).await,
+        DiscoveryAliasResolution::Unique(canonical_1)
+    );
 
-    reopened
-        .save_discovery_alias(&alias, canonical_2, WallTimeMs::new(3_000))
+    let lease = reopened
+        .lease_discovery_alias(&alias)
         .await
-        .expect("conflicting evidence should persist");
+        .expect("alias resolution lease should be acquired");
+    assert_eq!(
+        lease.resolution(),
+        DiscoveryAliasResolution::Unique(canonical_1)
+    );
+    let writer_store = reopened.clone();
+    let writer_alias = alias.clone();
+    let conflicting_writer = tokio::spawn(async move {
+        writer_store
+            .save_discovery_alias(&writer_alias, canonical_2, WallTimeMs::new(3_000))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !conflicting_writer.is_finished(),
+        "alias writer must wait while a resolution lease is held"
+    );
+    drop(lease);
+    conflicting_writer
+        .await
+        .expect("conflicting writer should join")
+        .expect("conflicting evidence should persist after lease release");
     assert_eq!(
         reopened
             .discovery_aliases(RuntimeKind::ClaudeCode, 10)
             .await
             .expect("ambiguous aliases should load"),
         vec![(alias, None)]
+    );
+    assert_eq!(
+        alias_resolution(
+            &reopened,
+            &NativeSessionKey::new(RuntimeKind::ClaudeCode, "wrapper-session")
+                .expect("alias should validate"),
+        )
+        .await,
+        DiscoveryAliasResolution::Ambiguous
+    );
+    assert_eq!(
+        alias_resolution(
+            &reopened,
+            &NativeSessionKey::new(RuntimeKind::ClaudeCode, "missing-wrapper")
+                .expect("missing alias should validate"),
+        )
+        .await,
+        DiscoveryAliasResolution::Absent
+    );
+    let exact = NativeSessionKey::new(RuntimeKind::ClaudeCode, "canonical-1")
+        .expect("exact should validate");
+    assert_eq!(
+        alias_resolution(&reopened, &exact).await,
+        DiscoveryAliasResolution::Unique(canonical_1)
+    );
+}
+
+#[tokio::test]
+async fn bulk_alias_hydration_matches_exact_identity_conflicts() {
+    let database = TestDatabase::new("discovery-alias-exact-conflict");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("database should open");
+    store
+        .apply_observation(&fixture_for("exact-wrapper", "exact-wrapper", 1, 1))
+        .await
+        .expect("exact wrapper session should persist");
+    store
+        .apply_observation(&fixture_for("other-canonical", "other-canonical", 2, 1))
+        .await
+        .expect("other canonical session should persist");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "exact-wrapper")
+        .expect("alias should validate");
+    let canonical = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "other-canonical")
+            .expect("canonical should validate"),
+    );
+    store
+        .save_discovery_alias(&alias, canonical, WallTimeMs::new(3_000))
+        .await
+        .expect("conflicting alias evidence should persist");
+
+    assert_eq!(
+        alias_resolution(&store, &alias).await,
+        DiscoveryAliasResolution::Ambiguous
+    );
+    assert_eq!(
+        store
+            .discovery_aliases(RuntimeKind::ClaudeCode, 10)
+            .await
+            .expect("bulk aliases should load"),
+        vec![(alias, None)],
+        "restart hydration reads this batched column directly, so an absent \
+         canonical is the only signal that marks the alias ambiguous"
     );
 }
 
