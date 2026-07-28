@@ -413,7 +413,7 @@ async fn alias_resolution(
 }
 
 #[tokio::test]
-async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
+async fn discovery_aliases_survive_restart_and_supersede_older_evidence() {
     let database = TestDatabase::new("discovery-aliases");
     let store = WatchdogStore::open(database.path())
         .await
@@ -486,8 +486,10 @@ async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
         reopened
             .discovery_aliases(RuntimeKind::ClaudeCode, 10)
             .await
-            .expect("ambiguous aliases should load"),
-        vec![(alias, None)]
+            .expect("superseded aliases should load"),
+        vec![(alias, Some(canonical_2))],
+        "a later correlation replaces the guess it supersedes instead of \
+         accumulating a conflicting row"
     );
     assert_eq!(
         alias_resolution(
@@ -496,7 +498,7 @@ async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
                 .expect("alias should validate"),
         )
         .await,
-        DiscoveryAliasResolution::Ambiguous
+        DiscoveryAliasResolution::Unique(canonical_2)
     );
     assert_eq!(
         alias_resolution(
@@ -515,8 +517,215 @@ async fn discovery_aliases_survive_restart_and_fail_closed_when_ambiguous() {
     );
 }
 
+/// Migration text applied in order, so the upgrade test exercises the shipped
+/// statements rather than a copy of them.
+const MIGRATIONS_THROUGH_0008: [&str; 8] = [
+    include_str!("../../../migrations/0001_initial.sql"),
+    include_str!("../../../migrations/0002_restart_record_json.sql"),
+    include_str!("../../../migrations/0003_session_metadata.sql"),
+    include_str!("../../../migrations/0004_registered_watch_paths.sql"),
+    include_str!("../../../migrations/0005_observation_queue_rejections.sql"),
+    include_str!("../../../migrations/0006_adapter_health_version_richness.sql"),
+    include_str!("../../../migrations/0007_inbox_delivery_ceiling.sql"),
+    include_str!("../../../migrations/0008_discovery_aliases.sql"),
+];
+
+const DISCOVERY_ALIAS_SUPERSESSION: &str =
+    include_str!("../../../migrations/0009_discovery_alias_supersession.sql");
+
 #[tokio::test]
-async fn bulk_alias_hydration_matches_exact_identity_conflicts() {
+async fn upgrading_a_dirty_alias_table_keeps_only_current_resolvable_evidence() {
+    let database = TestDatabase::new("discovery-alias-upgrade");
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true)
+            .foreign_keys(false),
+    )
+    .await
+    .expect("legacy database should open");
+    for migration in MIGRATIONS_THROUGH_0008 {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("legacy migration should apply");
+    }
+    for (session_id, kind, root) in [
+        ("canonical-a", "main", "canonical-a"),
+        ("canonical-b", "main", "canonical-b"),
+        ("child-target", "child", "canonical-a"),
+        ("rerooted-main", "main", "canonical-a"),
+    ] {
+        sqlx::query(
+            "INSERT INTO sessions (session_id, kind, root_session_id, runtime, native_id, \
+             created_at_ms, updated_at_ms) VALUES (?, ?, ?, 'claude_code', ?, 1, 1)",
+        )
+        .bind(session_id)
+        .bind(kind)
+        .bind(root)
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect("session fixture should insert");
+    }
+    // Foreign keys stay off for these inserts, reproducing the manual surgery
+    // that leaves live databases holding orphaned alias rows.
+    for (native_id, canonical, observed_at) in [
+        ("superseded", "canonical-a", 1_000),
+        ("superseded", "canonical-b", 3_000),
+        ("tied", "canonical-a", 4_000),
+        ("tied", "canonical-b", 4_000),
+        ("orphaned", "deleted-session", 5_000),
+        ("mistargeted", "child-target", 5_000),
+        ("rerooted", "rerooted-main", 5_000),
+        ("current", "canonical-a", 2_000),
+    ] {
+        sqlx::query(
+            "INSERT INTO discovery_aliases (alias_runtime, alias_native_id, \
+             canonical_session_id, observed_at_ms) VALUES ('claude_code', ?, ?, ?)",
+        )
+        .bind(native_id)
+        .bind(canonical)
+        .bind(observed_at)
+        .execute(&pool)
+        .await
+        .expect("legacy alias fixture should insert");
+    }
+
+    sqlx::raw_sql(DISCOVERY_ALIAS_SUPERSESSION)
+        .execute(&pool)
+        .await
+        .expect("supersession migration should apply to dirty data");
+
+    let surviving: Vec<(String, String)> = sqlx::query_as(
+        "SELECT alias_native_id, canonical_session_id FROM discovery_aliases \
+         ORDER BY alias_native_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("surviving aliases should read");
+    assert_eq!(
+        surviving,
+        vec![
+            ("current".to_owned(), "canonical-a".to_owned()),
+            ("superseded".to_owned(), "canonical-b".to_owned()),
+            ("tied".to_owned(), "canonical-b".to_owned()),
+        ],
+        "the newest resolvable guess survives; superseded, orphaned, non-main, and \
+         non-root targets are discarded"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO discovery_aliases (alias_runtime, alias_native_id, \
+             canonical_session_id, observed_at_ms) \
+             VALUES ('claude_code', 'current', 'canonical-b', 6000)",
+        )
+        .execute(&pool)
+        .await
+        .is_err(),
+        "the upgraded schema makes a second row for one alias key impossible"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn newer_discovery_alias_evidence_is_not_demoted_by_a_later_older_observation() {
+    let database = TestDatabase::new("discovery-alias-monotonic");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("database should open");
+    store
+        .apply_observation(&fixture_for("newer-canonical", "newer-canonical", 1, 1))
+        .await
+        .expect("newer canonical session should persist");
+    store
+        .apply_observation(&fixture_for("older-canonical", "older-canonical", 2, 1))
+        .await
+        .expect("older canonical session should persist");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "monotonic-wrapper")
+        .expect("alias should validate");
+    let newer = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "newer-canonical")
+            .expect("canonical should validate"),
+    );
+    let older = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "older-canonical")
+            .expect("canonical should validate"),
+    );
+
+    store
+        .save_discovery_alias(&alias, newer, WallTimeMs::new(4_000))
+        .await
+        .expect("newer alias evidence should persist");
+    store
+        .save_discovery_alias(&alias, older, WallTimeMs::new(2_000))
+        .await
+        .expect("older alias evidence should be accepted without demoting");
+
+    assert_eq!(
+        alias_resolution(&store, &alias).await,
+        DiscoveryAliasResolution::Unique(newer),
+        "a late-landing older observation must not replace newer correlation evidence"
+    );
+}
+
+#[tokio::test]
+async fn a_leased_discovery_alias_can_be_forgotten_without_touching_other_keys() {
+    let database = TestDatabase::new("discovery-alias-forget");
+    let store = WatchdogStore::open(database.path())
+        .await
+        .expect("database should open");
+    store
+        .apply_observation(&fixture_for("forget-canonical", "forget-canonical", 1, 1))
+        .await
+        .expect("canonical session should persist");
+    let canonical = SessionId::from_native(
+        &NativeSessionKey::new(RuntimeKind::ClaudeCode, "forget-canonical")
+            .expect("canonical should validate"),
+    );
+    let stale = NativeSessionKey::new(RuntimeKind::ClaudeCode, "stale-wrapper")
+        .expect("alias should validate");
+    let retained = NativeSessionKey::new(RuntimeKind::ClaudeCode, "retained-wrapper")
+        .expect("alias should validate");
+    for alias in [&stale, &retained] {
+        store
+            .save_discovery_alias(alias, canonical, WallTimeMs::new(2_000))
+            .await
+            .expect("alias should persist");
+    }
+
+    let lease = store
+        .lease_discovery_alias(&stale)
+        .await
+        .expect("alias lease should be acquired");
+    assert!(
+        store
+            .forget_discovery_alias(&lease, &stale)
+            .await
+            .expect("forgetting a leased alias should commit"),
+        "the first removal reports the discarded row"
+    );
+    assert!(
+        !store
+            .forget_discovery_alias(&lease, &stale)
+            .await
+            .expect("forgetting an absent alias should commit"),
+        "removal is idempotent"
+    );
+    drop(lease);
+
+    assert_eq!(
+        alias_resolution(&store, &stale).await,
+        DiscoveryAliasResolution::Absent
+    );
+    assert_eq!(
+        alias_resolution(&store, &retained).await,
+        DiscoveryAliasResolution::Unique(canonical)
+    );
+}
+
+#[tokio::test]
+async fn exact_identity_outranks_inferred_discovery_alias() {
     let database = TestDatabase::new("discovery-alias-exact-conflict");
     let store = WatchdogStore::open(database.path())
         .await
@@ -540,18 +749,21 @@ async fn bulk_alias_hydration_matches_exact_identity_conflicts() {
         .await
         .expect("conflicting alias evidence should persist");
 
+    let own_identity = SessionId::from_native(&alias);
     assert_eq!(
         alias_resolution(&store, &alias).await,
-        DiscoveryAliasResolution::Ambiguous
+        DiscoveryAliasResolution::Unique(own_identity),
+        "a session's own first-party identity outranks a third-party correlation \
+         that points elsewhere"
     );
     assert_eq!(
         store
             .discovery_aliases(RuntimeKind::ClaudeCode, 10)
             .await
             .expect("bulk aliases should load"),
-        vec![(alias, None)],
-        "restart hydration reads this batched column directly, so an absent \
-         canonical is the only signal that marks the alias ambiguous"
+        vec![(alias, Some(own_identity))],
+        "restart hydration reads this batched column directly, so it must apply \
+         the same precedence and keep the alias resolvable"
     );
 }
 
@@ -568,12 +780,33 @@ async fn manual_wipe_removes_watchdog_data_without_touching_adjacent_files() {
         .apply_observation(&fixture("observation-1", 8, 1))
         .await
         .expect("transaction should commit");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "wiped-wrapper")
+        .expect("alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            SessionId::from_native(
+                &NativeSessionKey::new(RuntimeKind::ClaudeCode, "session-1")
+                    .expect("canonical should validate"),
+            ),
+            WallTimeMs::new(2_000),
+        )
+        .await
+        .expect("alias should persist");
 
     store
         .wipe_watchdog_data()
         .await
         .expect("wipe should commit");
 
+    assert!(
+        store
+            .discovery_aliases(RuntimeKind::ClaudeCode, 10)
+            .await
+            .expect("aliases should load")
+            .is_empty(),
+        "wiping sessions must not leave aliases pointing at deleted sessions"
+    );
     assert_eq!(
         store.counts().await.expect("counts should load"),
         StoreCounts {

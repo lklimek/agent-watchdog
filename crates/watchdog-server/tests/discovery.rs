@@ -18,9 +18,10 @@ use watchdog_domain::{
 use watchdog_process::LinuxProcessSampler;
 use watchdog_server::{
     AgentApi, ClaudeDiscovery, CodexDiscovery, CompanionDiscovery, DashboardQuery,
-    DashboardService, DiscoveredSession, DiscoveryAliasRegistry, TransportKey, WorktreePathMapping,
+    DashboardService, DiscoveredSession, DiscoveryAliasRegistry, RegisterSession, TransportKey,
+    WorktreePathMapping,
 };
-use watchdog_store::WatchdogStore;
+use watchdog_store::{DiscoveryAliasResolution, WatchdogStore};
 use watchdog_testkit::FakeClock;
 
 struct ChildProcessGuard(std::process::Child);
@@ -928,6 +929,119 @@ async fn ambiguous_claude_team_lead_cwd_does_not_guess_an_alias() {
             .iter()
             .any(|main| main.native.native_id() == "current-transcript")
     );
+}
+
+#[tokio::test]
+async fn a_self_registered_transcript_stops_accumulating_team_lead_guesses() {
+    let fixture = tempfile::tempdir().expect("fixture root should exist");
+    let projects = fixture.path().join("projects");
+    let project = projects.join("-host-main");
+    let teams = fixture.path().join("teams");
+    let worktrees = fixture.path().join("worktrees");
+    fs::create_dir_all(&project).expect("project directory should exist");
+    fs::create_dir_all(worktrees.join("main")).expect("worktree should exist");
+    fs::write(
+        project.join("current-transcript.jsonl"),
+        b"{\"type\":\"assistant\",\"sessionId\":\"current-transcript\",\"cwd\":\"/host/main\"}\n",
+    )
+    .expect("transcript should write");
+    let team = teams.join("session-main");
+    fs::create_dir_all(&team).expect("team directory should exist");
+    let write_lead = |lead: &str| {
+        fs::write(
+            team.join("config.json"),
+            serde_json::to_vec(&json!({
+                "leadSessionId": lead,
+                "members": [{"agentType":"team-lead","name":"lead","cwd":"/host/main"}]
+            }))
+            .expect("team config should serialize"),
+        )
+        .expect("team config should write");
+    };
+    write_lead("retained-one");
+
+    let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+        .await
+        .expect("store should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(current_time_ms()),
+        10_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock.clone())
+        .await
+        .expect("API should initialize");
+    let transcript = NativeSessionKey::new(RuntimeKind::ClaudeCode, "current-transcript")
+        .expect("transcript identity should validate");
+    api.register_session(
+        &TransportKey::new("transcript-transport").expect("transport should validate"),
+        RegisterSession {
+            runtime: transcript.runtime(),
+            native_id: transcript.native_id().to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "register-transcript-main".to_owned(),
+        },
+    )
+    .await
+    .expect("the transcript's own process should register itself");
+    let runtime_mappings = [
+        WorktreePathMapping::new("/runtime/projects", projects.clone())
+            .expect("project mapping should be valid"),
+        WorktreePathMapping::new("/runtime/teams", teams.clone())
+            .expect("team mapping should be valid"),
+    ];
+    let worktree_mapping =
+        WorktreePathMapping::new("/host", worktrees).expect("worktree mapping should be valid");
+
+    ClaudeDiscovery::new(api.clone(), store.clone(), clock.clone())
+        .reconcile(
+            &[projects.clone(), teams.clone()],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+    api.mark_restarted()
+        .await
+        .expect("restart boundary should persist");
+    write_lead("retained-two");
+    ClaudeDiscovery::new(api, store.clone(), clock)
+        .reconcile(
+            &[projects, teams],
+            &runtime_mappings,
+            std::slice::from_ref(&worktree_mapping),
+        )
+        .await;
+
+    assert_eq!(
+        discovery_alias_targets(&fixture.path().join("watchdog.db"), "current-transcript")
+            .await
+            .len(),
+        1,
+        "a transcript keeps one current correlation instead of accumulating a row per scan"
+    );
+    assert_eq!(
+        store
+            .discovery_alias(&transcript)
+            .await
+            .expect("alias resolution should load"),
+        DiscoveryAliasResolution::Unique(SessionId::from_native(&transcript)),
+        "one native ID keeps exactly one resolvable candidate across restarts"
+    );
+}
+
+async fn discovery_alias_targets(path: &Path, native_id: &str) -> Vec<String> {
+    let pool = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(path))
+        .await
+        .expect("watchdog database should reopen");
+    let targets = sqlx::query_scalar(
+        "SELECT canonical_session_id FROM discovery_aliases WHERE alias_native_id = ?",
+    )
+    .bind(native_id)
+    .fetch_all(&pool)
+    .await
+    .expect("alias rows should read");
+    pool.close().await;
+    targets
 }
 
 #[tokio::test]

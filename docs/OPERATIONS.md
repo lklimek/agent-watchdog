@@ -278,6 +278,16 @@ versions other than those tested. Compatibility problems degrade health instead
 of causing silent startup refusal; per-session `UPGRADE` warnings require a
 confirmed detected/tested SemVer major/minor mismatch.
 
+Schema migrations run at startup, so discovery-alias cleanup needs no manual
+SQL: the supersession migration keeps only the newest resolvable correlation per
+runtime-native key and discards rows whose target is missing, is not a main
+session, or is not its own root. A database that accumulated conflicting rows
+therefore heals on the first restart after the upgrade. Registrations that had
+been failing with `MCP registration conflicts with the stored session identity`
+succeed again; a discarded stale alias is logged once as
+`mcp.discovery_alias_discarded`, and an alias that legitimately redirects a
+registration is logged as `mcp.registration_redirected`.
+
 On Linux, verified process trees are sampled immediately before each timer
 evaluation. The latest trustworthy CPU delta per session replaces the previous
 sample instead of creating a five-second history. Parent MCP events include

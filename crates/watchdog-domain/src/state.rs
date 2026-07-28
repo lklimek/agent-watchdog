@@ -98,4 +98,13 @@ impl DetailedState {
     pub const fn termination_timer_runs(self) -> bool {
         matches!(self, Self::Stalled)
     }
+
+    /// Return whether the session already established its final outcome.
+    ///
+    /// `Disappeared` is excluded: its outcome stayed unknown, so the session may
+    /// still be reunited with a runtime that reappears under a new native ID.
+    #[must_use]
+    pub const fn outcome_established(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
 }

@@ -583,18 +583,11 @@ fn active_elapsed(snapshot: &SessionSnapshot, now: TimePoint) -> u64 {
 /// Apply hierarchy safety rules without allowing child stalls to alter the main state.
 #[must_use]
 pub fn aggregate_main_state(main: DetailedState, children: &[DetailedState]) -> DetailedState {
-    if matches!(
-        main,
-        DetailedState::Completed | DetailedState::Failed | DetailedState::Cancelled
-    ) && children.iter().any(|child| {
-        !matches!(
-            child,
-            DetailedState::Completed
-                | DetailedState::Failed
-                | DetailedState::Cancelled
-                | DetailedState::Disappeared
-        )
-    }) {
+    if main.outcome_established()
+        && children
+            .iter()
+            .any(|child| !child.outcome_established() && *child != DetailedState::Disappeared)
+    {
         DetailedState::Unknown
     } else {
         main
