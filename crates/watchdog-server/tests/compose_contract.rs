@@ -27,6 +27,10 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
         !app.contains("nocopy: true"),
         "the image must initialize named-volume permissions for the configured UID"
     );
+    assert!(
+        !app.contains("WATCHDOG_BASIC_"),
+        "browser credentials belong to the proxy alone; a second copy drifts out of sync"
+    );
 
     let dockerfile = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -74,7 +78,10 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
             "Compose must not create misspelled host paths"
         );
     }
+}
 
+#[test]
+fn supported_routing_policy_authenticates_browser_routes_at_the_proxy_alone() {
     let dynamic = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../config/traefik-dynamic.yaml"
@@ -102,6 +109,34 @@ fn supported_compose_profile_keeps_host_access_narrow_and_containers_hardened() 
         .expect("web route should follow Codex hook route");
     assert!(codex_hook_route.contains("watchdog-trusted"));
     assert!(!codex_hook_route.contains("watchdog-basic-auth"));
+
+    let web_route = dynamic
+        .split("watchdog-web:")
+        .nth(1)
+        .expect("web route should exist")
+        .split("\n  middlewares:")
+        .next()
+        .expect("middleware definitions should follow the routes");
+    assert!(
+        web_route.contains("watchdog-trusted"),
+        "the browser route keeps the source allowlist"
+    );
+    assert!(
+        web_route.contains("watchdog-basic-auth"),
+        "the proxy is the only layer challenging browser credentials"
+    );
+    let basic_auth = dynamic
+        .split("watchdog-basic-auth:\n")
+        .nth(1)
+        .expect("basic-auth middleware should be defined")
+        .split("watchdog-trusted:")
+        .next()
+        .expect("further middleware should follow");
+    assert!(basic_auth.contains("usersFile: /run/secrets/watchdog-users"));
+    assert!(
+        basic_auth.contains("removeHeader: true"),
+        "the credential must not reach a backend that never validates it"
+    );
 }
 
 fn service_block<'a>(compose: &'a str, service: &str, next: &str) -> &'a str {

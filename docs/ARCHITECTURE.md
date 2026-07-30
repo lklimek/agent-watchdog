@@ -820,15 +820,17 @@ into model-visible input.
 
 ## 15. HTTP and web UI
 
-Routes are split by exposure and authentication:
+Routes are split by exposure and authentication. Browser routes are challenged
+by the proxy's Basic Auth middleware; the application enforces only the Bearer
+credential it owns:
 
 ```text
-GET  /health/live             minimal unauthenticated container liveness
-GET  /health                  authenticated detailed component health
-GET  /                        Basic Auth, fixed temporary redirect to /ui
-GET  /ui                      Basic Auth dashboard
-GET  /api/v1/sessions         Basic Auth read-only JSON snapshot
-GET  /api/v1/events           Basic Auth SSE
+GET  /health/live             container liveness, also reachable in-container
+GET  /health                  detailed component health, proxy Basic Auth
+GET  /                        proxy Basic Auth, fixed temporary redirect to /ui
+GET  /ui                      proxy Basic Auth dashboard
+GET  /api/v1/sessions         proxy Basic Auth read-only JSON snapshot
+GET  /api/v1/events           proxy Basic Auth SSE
 POST /mcp                     Bearer-authenticated MCP transport
 ```
 
@@ -841,7 +843,7 @@ snapshot, so the page remains useful if JavaScript or SSE fails. If an SSE clien
 `resync_required` event; the client reconnects for a fresh snapshot. There is no
 polling fallback.
 
-Basic/Bearer values are length bounded and compared in constant time. Responses
+Bearer values are length bounded and compared in constant time. Responses
 set CSP, `X-Content-Type-Options`, frame denial, referrer policy, and no-store for
 session data. Native titles and paths are escaped by Maud and never inserted with
 raw HTML.
@@ -877,8 +879,9 @@ for Home Assistant, so generic SSRF blocking would conflict with the product.
 ## 17. Configuration and reload
 
 Environment variables contain bootstrap settings and secrets: database path,
-listen address, Basic Auth credentials, Bearer token, optional GitHub token, and
-webhook secrets. Mounted TOML contains allowlisted roots, runtime locations,
+listen address, Bearer token, optional GitHub token, and webhook secrets.
+Browser credentials belong to the proxy's password file, never to the
+application environment. Mounted TOML contains allowlisted roots, runtime locations,
 exclusions, thresholds, signal grace periods, adapter enablement, GitHub policy,
 and `SIGKILL` opt-out.
 
@@ -896,7 +899,8 @@ The supported Compose project contains:
   persistent SQLite volume, concrete read-only runtime/worktree mounts, and no
   published port;
 - `traefik`: the only published listener, trusted-network IP allowlist, route
-  separation, Basic Auth middleware for UI/API, and Bearer forwarding to MCP;
+  separation, the sole Basic Auth middleware for UI/API, and Bearer forwarding
+  to MCP;
 - health checks and explicit dependency/restart policy.
 
 The application container must share the monitored user's numeric UID/GID so

@@ -257,7 +257,7 @@ main session. Inactive native team members appear as finished, not stalled.
 
 ### Authentication failure
 
-Use the browser’s Basic Auth challenge. Do not render session metadata in an unauthenticated error page.
+Use the browser’s Basic Auth challenge, issued by the reverse proxy. Do not render session metadata in an unauthenticated error page.
 
 ## 11. Human notifications
 

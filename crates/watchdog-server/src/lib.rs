@@ -27,10 +27,7 @@ pub use agent_api::{
     McpSessionOccupancy, RegisterSession, RegisteredWatchPathView, RepositoryMetadata,
     SessionTreeView, SessionView, TimerReconciliationReport, TransportKey, WaitingKind,
 };
-pub use auth::{
-    BasicAuthError, BasicAuthenticator, BearerAuthError, BearerAuthenticator,
-    MAX_AUTHORIZATION_BYTES,
-};
+pub use auth::{BearerAuthError, BearerAuthenticator, MAX_AUTHORIZATION_BYTES};
 pub use clock::SystemClock;
 pub use dashboard::{
     DashboardCard, DashboardError, DashboardOutboxDispatcher, DashboardOutboxError, DashboardQuery,

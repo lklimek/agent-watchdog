@@ -207,12 +207,12 @@ executable unless the test explicitly supplies a fake runtime classifier.
 | T-MCP-016 | One alias key receives conflicting correlations across scans and restarts, an older observation lands after a newer one, and a native ID that already owns a stored session also carries an alias pointing elsewhere. | The key keeps exactly one current target: the newest correlation wins, the older observation does not demote it, and the exact stored identity outranks the alias in both single and bulk resolution. | FR-MCP-010, FR-MCP-012 |
 | T-MCP-017 | A main registration resolves an alias whose canonical target already completed, and separately one whose canonical target is a child session. | Both registrations complete under the caller's own identity, the mistargeted trees stay unchanged, and the discarded alias no longer resolves. | FR-MCP-012 |
 | T-MCP-018 | An existing database holds superseded, orphaned, non-main, and non-root alias rows when the supersession migration applies. | Only the newest resolvable row per key survives, deterministically for equal observation times, and a second row for one key becomes impossible. | FR-MCP-012 |
-| T-HTTP-001 | Missing/wrong/oversized Basic credential requests UI/API. | Browser challenge/failure contains no session metadata. | FR-UI-008, FR-SEC-001 |
+| T-HTTP-001 | The deployed routing policy is inspected for the UI/API entry point. | The proxy route carries the Basic Auth middleware and the source allowlist, the credential is not forwarded upstream, and the application service receives no browser credential. | FR-UI-008, FR-SEC-001 |
 | T-HTTP-002 | API attempts a state mutation. | No route exists or method is rejected. | FR-API-001 |
 | T-HTTP-003 | Native title contains HTML/script. | Rendered page escapes it; CSP blocks execution. | FR-SEC-003 |
 | T-HTTP-004 | SSE client lags broadcast capacity. | It receives `resync_required`, reconnects, and converges. | FR-UI-007 |
 | T-HTTP-005 | Runtime warning and state coexist. | JSON distinguishes state from warning badge. | FR-API-003 |
-| T-HTTP-006 | Client requests the HTTP root with and without valid Basic Auth. | Unauthenticated access is challenged; authenticated access receives a fixed temporary redirect to `/ui`. | FR-UI-010 |
+| T-HTTP-006 | Client requests the HTTP root. | The request receives a fixed temporary redirect to `/ui` with no-store caching. | FR-UI-010 |
 
 ### 5.8 Dashboard and accessibility
 

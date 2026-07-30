@@ -6,23 +6,20 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tower::ServiceExt as _;
 use watchdog_domain::{TimePoint, WallTimeMs};
 use watchdog_runtime::{ComponentId, ComponentStatus};
-use watchdog_server::{BasicAuthenticator, HealthService, health_router};
+use watchdog_server::{HealthService, health_router};
 use watchdog_testkit::FakeClock;
 
 #[tokio::test]
-async fn liveness_is_minimal_while_detailed_health_is_authenticated() {
+async fn liveness_is_minimal_while_detailed_health_reports_components() {
     let health = HealthService::new(Arc::new(FakeClock::new(TimePoint::new(
         WallTimeMs::new(100),
         100,
     ))));
-    let router = health_router(
-        health,
-        BasicAuthenticator::new("operator", "password").expect("valid auth"),
-    );
+    health.record(ComponentId::Store, ComponentStatus::Healthy, None);
+    let router = health_router(health);
 
     let live = router
         .clone()
@@ -41,7 +38,7 @@ async fn liveness_is_minimal_while_detailed_health_is_authenticated() {
         "ok"
     );
 
-    let unauthorized = router
+    let detailed = router
         .oneshot(
             Request::get("/health")
                 .body(Body::empty())
@@ -49,7 +46,11 @@ async fn liveness_is_minimal_while_detailed_health_is_authenticated() {
         )
         .await
         .expect("response");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(detailed.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(detailed.into_body(), 16_384)
+        .await
+        .expect("body");
+    assert!(String::from_utf8_lossy(&body).contains("\"store\""));
 }
 
 #[tokio::test]
@@ -61,27 +62,22 @@ async fn critical_failure_fails_readiness_but_isolated_adapter_failure_is_degrad
         ComponentStatus::Failed,
         Some("Adapter schema changed"),
     );
-    let router = health_router(
-        health.clone(),
-        BasicAuthenticator::new("operator", "password").expect("valid auth"),
-    );
-    assert_eq!(authorized(&router).await, StatusCode::OK);
+    let router = health_router(health.clone());
+    assert_eq!(status(&router).await, StatusCode::OK);
 
     health.record(
         ComponentId::Store,
         ComponentStatus::Failed,
         Some("Database unavailable"),
     );
-    assert_eq!(authorized(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status(&router).await, StatusCode::SERVICE_UNAVAILABLE);
 }
 
-async fn authorized(router: &axum::Router) -> StatusCode {
-    let authorization = format!("Basic {}", STANDARD.encode("operator:password"));
+async fn status(router: &axum::Router) -> StatusCode {
     router
         .clone()
         .oneshot(
             Request::get("/health")
-                .header(axum::http::header::AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("request"),
         )

@@ -18,8 +18,6 @@ use watchdog_runtime::{
     ComponentHealth, ComponentId, ComponentStatus, HealthRegistry, HealthScope,
 };
 
-use crate::BasicAuthenticator;
-
 const MAX_HEALTH_MESSAGE_BYTES: usize = 1_024;
 
 /// Operator-facing overall or component health level.
@@ -257,34 +255,15 @@ impl HealthService {
     }
 }
 
-/// Build minimal public liveness and authenticated detailed health routes.
-pub fn health_router(service: HealthService, authenticator: BasicAuthenticator) -> Router {
-    let detailed = Router::new()
-        .route("/health", get(health))
-        .with_state(service)
-        .layer(middleware::from_fn(
-            move |request: Request<Body>, next: Next| {
-                let authenticator = authenticator.clone();
-                async move {
-                    let authorized = request
-                        .headers()
-                        .get(header::AUTHORIZATION)
-                        .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
-                    if !authorized {
-                        tracing::warn!(
-                            event = "auth.rejected",
-                            route = "/health",
-                            "Health endpoint basic credential rejected"
-                        );
-                        return StatusCode::UNAUTHORIZED.into_response();
-                    }
-                    next.run(request).await
-                }
-            },
-        ));
+/// Build container liveness and detailed component health routes.
+///
+/// Both routes rely on the reverse proxy for authentication; the application
+/// container publishes no port of its own.
+pub fn health_router(service: HealthService) -> Router {
     Router::new()
         .route("/health/live", get(liveness))
-        .merge(detailed)
+        .route("/health", get(health))
+        .with_state(service)
         .layer(middleware::from_fn(no_store))
 }
 

@@ -7,7 +7,6 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt as _;
 use tokio::time::{Duration, timeout};
 use tower::ServiceExt as _;
@@ -18,8 +17,8 @@ use watchdog_domain::{
     TimePoint, WallTimeMs,
 };
 use watchdog_server::{
-    AgentApi, BasicAuthenticator, DashboardOutboxDispatcher, DashboardQuery, DashboardScope,
-    DashboardService, DashboardSort, DiscoveredSession, dashboard_router,
+    AgentApi, DashboardOutboxDispatcher, DashboardQuery, DashboardScope, DashboardService,
+    DashboardSort, DiscoveredSession, dashboard_router,
 };
 use watchdog_store::{
     AdapterHealthRecord, AdapterHealthStatus, ApplyObservation, OutboxDestination,
@@ -209,10 +208,7 @@ impl DashboardFixture {
     }
 
     fn router(&self) -> Router {
-        dashboard_router(
-            self.service.clone(),
-            BasicAuthenticator::new("watchdog", "secret").expect("auth should be valid"),
-        )
+        dashboard_router(self.service.clone())
     }
 }
 
@@ -263,12 +259,11 @@ async fn active_projection_excludes_unreconciled_retained_mains() {
 }
 
 #[tokio::test]
-async fn authenticated_root_redirects_to_dashboard() {
+async fn root_redirects_to_dashboard() {
     let fixture = DashboardFixture::new().await;
-    let router = fixture.router();
 
-    let unauthorized = router
-        .clone()
+    let response = fixture
+        .router()
         .oneshot(
             Request::builder()
                 .uri("/")
@@ -277,22 +272,9 @@ async fn authenticated_root_redirects_to_dashboard() {
         )
         .await
         .expect("router should respond");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
-    let authorized = router
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .header(header::AUTHORIZATION, authorization)
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("router should respond");
-    assert_eq!(authorized.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(authorized.headers()[header::LOCATION], "/ui");
-    assert_eq!(authorized.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(response.headers()[header::LOCATION], "/ui");
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 }
 
 #[tokio::test]
@@ -347,7 +329,7 @@ async fn projection_filters_sorts_and_aggregates_main_session_cards() {
 }
 
 #[tokio::test]
-async fn dashboard_authentication_escaping_headers_and_read_only_routes_fail_closed() {
+async fn dashboard_escaping_headers_and_read_only_routes_fail_closed() {
     let fixture = DashboardFixture::new().await;
     fixture
         .seed(SessionSeed {
@@ -362,7 +344,7 @@ async fn dashboard_authentication_escaping_headers_and_read_only_routes_fail_clo
         .await;
     let router = fixture.router();
 
-    let unauthorized = router
+    let page = router
         .clone()
         .oneshot(
             Request::builder()
@@ -372,41 +354,12 @@ async fn dashboard_authentication_escaping_headers_and_read_only_routes_fail_clo
         )
         .await
         .expect("router should respond");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        unauthorized.headers()[header::WWW_AUTHENTICATE],
-        "Basic realm=\"Agent Watchdog\", charset=\"UTF-8\""
-    );
-    assert_eq!(unauthorized.headers()[header::CACHE_CONTROL], "no-store");
-    assert_eq!(
-        unauthorized.headers()[header::X_CONTENT_TYPE_OPTIONS],
-        "nosniff"
-    );
-    let unauthorized_body = to_bytes(unauthorized.into_body(), 16_384)
-        .await
-        .expect("body should be bounded");
-    assert!(!String::from_utf8_lossy(&unauthorized_body).contains("hostile-main"));
-
-    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
-    let authorized = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/ui")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("router should respond");
-    assert_eq!(authorized.status(), StatusCode::OK);
-    assert!(
-        authorized
-            .headers()
-            .contains_key(header::CONTENT_SECURITY_POLICY)
-    );
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(page.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     let body = String::from_utf8(
-        to_bytes(authorized.into_body(), 1_048_576)
+        to_bytes(page.into_body(), 1_048_576)
             .await
             .expect("body should be bounded")
             .to_vec(),
@@ -420,7 +373,6 @@ async fn dashboard_authentication_escaping_headers_and_read_only_routes_fail_clo
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/sessions")
-                .header(header::AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -452,13 +404,11 @@ async fn page_warnings_name_each_degraded_runtime() {
             .await
             .expect("health should persist");
     }
-    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
     let response = fixture
         .router()
         .oneshot(
             Request::builder()
                 .uri("/ui")
-                .header(header::AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -479,13 +429,11 @@ async fn page_warnings_name_each_degraded_runtime() {
 #[tokio::test]
 async fn lagging_sse_client_is_told_to_resynchronize() {
     let fixture = DashboardFixture::new().await;
-    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
     let response = fixture
         .router()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/events")
-                .header(header::AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -519,13 +467,11 @@ async fn lagging_sse_client_is_told_to_resynchronize() {
 #[tokio::test]
 async fn durable_sse_outbox_publishes_current_snapshot_and_acknowledges_delivery() {
     let fixture = DashboardFixture::new().await;
-    let authorization = format!("Basic {}", STANDARD.encode("watchdog:secret"));
     let response = fixture
         .router()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/events")
-                .header(header::AUTHORIZATION, authorization)
                 .body(Body::empty())
                 .expect("request should build"),
         )
