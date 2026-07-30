@@ -966,6 +966,10 @@ impl AgentApi {
     /// registration onto the already-persisted canonical session. Callers must
     /// therefore use the returned [`SessionView`]'s identity rather than one
     /// re-derived from the native key they supplied.
+    ///
+    /// An alias that can no longer adopt a live caller is discarded and the
+    /// caller registers under its own asserted identity, so stale correlation
+    /// evidence degrades into a separate tree instead of a permanent failure.
     async fn register_session_with_provenance(
         &self,
         transport: &TransportKey,
@@ -983,14 +987,44 @@ impl AgentApi {
             // single-tenant bearer boundary.
             SessionKind::Main => {
                 let alias_lease = self.inner.store.lease_discovery_alias(&native).await?;
-                let canonical = match alias_lease.resolution() {
+                let resolved = match alias_lease.resolution() {
                     DiscoveryAliasResolution::Absent => None,
                     DiscoveryAliasResolution::Unique(canonical) => Some(canonical),
                     DiscoveryAliasResolution::Ambiguous => {
                         return Err(AgentApiError::SessionIdentityConflict);
                     }
                 };
+                let canonical = match resolved {
+                    Some(canonical)
+                        if canonical != session_id
+                            && !self.alias_target_accepts_registration(canonical).await? =>
+                    {
+                        self.inner
+                            .store
+                            .forget_discovery_alias(&alias_lease, &native)
+                            .await?;
+                        tracing::warn!(
+                            event = "mcp.discovery_alias_discarded",
+                            runtime = native.runtime().as_str(),
+                            native_id = native.native_id(),
+                            canonical = %canonical,
+                            "Discarded a discovery alias whose canonical main session cannot \
+                             accept a live registration; the caller keeps its own identity"
+                        );
+                        None
+                    }
+                    resolved => resolved,
+                };
                 if let Some(canonical) = canonical {
+                    if canonical != session_id {
+                        tracing::info!(
+                            event = "mcp.registration_redirected",
+                            runtime = native.runtime().as_str(),
+                            native_id = native.native_id(),
+                            canonical = %canonical,
+                            "Registration resolved onto an already-discovered canonical main"
+                        );
+                    }
                     let record = self
                         .bind_main_record(transport, canonical)
                         .await
@@ -1070,6 +1104,34 @@ impl AgentApi {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Return whether an alias may still redirect a live registration onto its
+    /// canonical target.
+    ///
+    /// A target that is absent, is not a root main session, or already
+    /// established its outcome cannot adopt a live caller: the reducer never
+    /// revives a finished session, so redirecting would answer with a foreign
+    /// finished identity instead of the caller's own live one.
+    async fn alias_target_accepts_registration(
+        &self,
+        canonical: SessionId,
+    ) -> Result<bool, AgentApiError> {
+        let Some(record) = self.inner.store.session_by_id(canonical).await? else {
+            return Ok(false);
+        };
+        let SessionIdentity::Main(main) = record.session else {
+            return Ok(false);
+        };
+        if main != record.root {
+            return Ok(false);
+        }
+        Ok(self
+            .inner
+            .store
+            .snapshot(record.session)
+            .await?
+            .is_some_and(|snapshot| !snapshot.state().outcome_established()))
     }
 
     /// Load an already-persisted main session and bind the transport to it.

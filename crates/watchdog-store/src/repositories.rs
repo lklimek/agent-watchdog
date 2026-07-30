@@ -348,10 +348,12 @@ impl WatchdogStore {
         row.map(|row| decode_session_row(&row, None)).transpose()
     }
 
-    /// Retain one observed runtime-native alias for a canonical session.
+    /// Retain the current observed runtime-native alias for a canonical session.
     ///
-    /// Multiple canonical targets are retained so callers can fail closed on
-    /// ambiguous evidence instead of allowing a later scan to overwrite it.
+    /// One alias key keeps exactly one canonical target: a correlation is a
+    /// time-scoped inference, so a newer observation supersedes the guess it
+    /// replaces instead of accumulating a conflicting row. An observation older
+    /// than the stored one is discarded rather than demoting current evidence.
     ///
     /// # Errors
     ///
@@ -369,8 +371,11 @@ impl WatchdogStore {
              (alias_runtime, alias_native_id, canonical_session_id, observed_at_ms) \
              SELECT ?, ?, session_id, ? FROM sessions \
              WHERE session_id = ? AND runtime = ? \
-             ON CONFLICT(alias_runtime, alias_native_id, canonical_session_id) DO UPDATE SET \
-             observed_at_ms = excluded.observed_at_ms",
+             ON CONFLICT(alias_runtime, alias_native_id) DO UPDATE SET \
+             canonical_session_id = CASE \
+             WHEN excluded.observed_at_ms >= discovery_aliases.observed_at_ms \
+             THEN excluded.canonical_session_id ELSE discovery_aliases.canonical_session_id END, \
+             observed_at_ms = MAX(excluded.observed_at_ms, discovery_aliases.observed_at_ms)",
         )
         .bind(alias.runtime().as_str())
         .bind(alias.native_id())
@@ -387,6 +392,9 @@ impl WatchdogStore {
 
     /// Load bounded durable alias evidence for one runtime.
     ///
+    /// Applies the same exact-identity precedence as single resolution, so
+    /// restart hydration and registration agree on every alias key.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] for an invalid limit, corrupt identity, or
@@ -400,24 +408,32 @@ impl WatchdogStore {
         let _guard = self.discovery_alias_lock.lock().await;
         let rows = sqlx::query(
             "WITH alias_keys(alias_native_id) AS (\
-                 SELECT DISTINCT alias_native_id FROM discovery_aliases WHERE alias_runtime = ?\
+                 SELECT DISTINCT alias_native_id FROM discovery_aliases \
+                 WHERE alias_runtime = ? ORDER BY alias_native_id LIMIT ?\
              ), candidates(alias_native_id, canonical_session_id) AS (\
-                 SELECT alias_native_id, canonical_session_id FROM discovery_aliases \
-                 WHERE alias_runtime = ? \
-                 UNION \
                  SELECT alias_keys.alias_native_id, sessions.session_id \
                  FROM alias_keys JOIN sessions \
-                 ON sessions.runtime = ? AND sessions.native_id = alias_keys.alias_native_id\
+                 ON sessions.runtime = ? AND sessions.native_id = alias_keys.alias_native_id \
+                 UNION \
+                 SELECT alias_keys.alias_native_id, discovery_aliases.canonical_session_id \
+                 FROM alias_keys JOIN discovery_aliases \
+                 ON discovery_aliases.alias_runtime = ? \
+                 AND discovery_aliases.alias_native_id = alias_keys.alias_native_id \
+                 WHERE NOT EXISTS (\
+                     SELECT 1 FROM sessions WHERE sessions.runtime = ? \
+                     AND sessions.native_id = alias_keys.alias_native_id\
+                 )\
              ) \
              SELECT alias_native_id, \
              CASE WHEN COUNT(*) = 1 THEN MIN(canonical_session_id) ELSE NULL END \
              AS canonical_session_id FROM candidates GROUP BY alias_native_id \
-             ORDER BY alias_native_id LIMIT ?",
+             ORDER BY alias_native_id",
         )
         .bind(runtime.as_str())
-        .bind(runtime.as_str())
-        .bind(runtime.as_str())
         .bind(i64::from(limit))
+        .bind(runtime.as_str())
+        .bind(runtime.as_str())
+        .bind(runtime.as_str())
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -435,6 +451,11 @@ impl WatchdogStore {
     }
 
     /// Resolve one durable runtime-native alias without choosing among conflicts.
+    ///
+    /// A session stored under the exact runtime-native identity outranks any
+    /// inferred alias: first-party self-assertion is stronger evidence than a
+    /// correlation guessed elsewhere, and letting the guess win would leave the
+    /// session unable to re-register itself.
     ///
     /// # Errors
     ///
@@ -465,16 +486,42 @@ impl WatchdogStore {
         })
     }
 
+    /// Discard one alias key while its resolution lease is held.
+    ///
+    /// The lease is the caller's proof that the store-global alias lock is
+    /// already held, so this removal must not take it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` persistence fails.
+    pub async fn forget_discovery_alias(
+        &self,
+        _lease: &crate::DiscoveryAliasLease,
+        alias: &NativeSessionKey,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM discovery_aliases WHERE alias_runtime = ? AND alias_native_id = ?",
+        )
+        .bind(alias.runtime().as_str())
+        .bind(alias.native_id())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn discovery_alias_unlocked(
         &self,
         alias: &NativeSessionKey,
     ) -> Result<DiscoveryAliasResolution, StoreError> {
         let row = sqlx::query(
-            "WITH candidates(canonical_session_id) AS (\
+            "WITH exact(canonical_session_id) AS (\
+                 SELECT session_id FROM sessions WHERE runtime = ? AND native_id = ?\
+             ), candidates(canonical_session_id) AS (\
+                 SELECT canonical_session_id FROM exact \
+                 UNION \
                  SELECT canonical_session_id FROM discovery_aliases \
                  WHERE alias_runtime = ? AND alias_native_id = ? \
-                 UNION \
-                 SELECT session_id FROM sessions WHERE runtime = ? AND native_id = ?\
+                 AND NOT EXISTS (SELECT 1 FROM exact)\
              ) \
              SELECT COUNT(*) AS target_count, MIN(canonical_session_id) AS canonical_session_id \
              FROM candidates",

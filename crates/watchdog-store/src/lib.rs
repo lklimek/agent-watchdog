@@ -38,7 +38,9 @@ pub enum DiscoveryAliasResolution {
     Absent,
     /// Exactly one canonical session has been observed.
     Unique(watchdog_domain::SessionId),
-    /// Conflicting canonical targets have been observed.
+    /// Conflicting canonical targets have been observed. Supersession and
+    /// exact-identity precedence keep this unreachable through this crate's own
+    /// writers; it stays as a fail-closed answer for evidence written otherwise.
     Ambiguous,
 }
 
@@ -627,6 +629,7 @@ impl WatchdogStore {
             "DELETE FROM observations",
             "DELETE FROM session_relations",
             "DELETE FROM adapter_health",
+            "DELETE FROM discovery_aliases",
             "DELETE FROM sessions",
             "DELETE FROM sqlite_sequence WHERE name IN ('activity_samples', 'outbox', 'notification_attempts')",
         ] {

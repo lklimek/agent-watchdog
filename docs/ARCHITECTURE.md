@@ -755,7 +755,20 @@ before persisting a new session. This lets wrapper or transcript identities
 bind the already discovered canonical main without creating a parallel tree.
 Single and bulk alias resolution use the same exact-session candidates, and
 resolution is leased against concurrent in-process discovery updates until
-the alias resolves and its transport binding commits. The native ID is
+the alias resolves and its transport binding commits.
+
+A correlation is a time-scoped inference, so one alias key keeps exactly one
+canonical target: a newer observation supersedes the guess it replaces, and a
+session stored under the exact runtime-native identity outranks any alias
+pointing elsewhere. Without that precedence a stale third-party guess leaves a
+session permanently unable to re-register itself, and hydrating the resulting
+conflict as ambiguity makes discovery re-guess and persist another target on
+every scan. An alias whose target is absent, is not a root main, or already
+established its outcome is discarded during registration and the caller keeps
+its own asserted identity: the reducer never revives a finished session, so
+redirecting there would answer a live caller with a foreign finished identity.
+Stale correlation evidence therefore degrades into a separate tree instead of a
+permanent failure. The native ID is
 self-asserted, and rmcp permits a client-chosen ID during session restoration;
 alias-binding safety therefore assumes the documented single-tenant deployment
 with one shared Bearer credential. A multi-tenant deployment must authenticate

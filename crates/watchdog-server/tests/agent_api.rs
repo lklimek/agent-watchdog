@@ -446,6 +446,171 @@ async fn mcp_main_registration_resolves_discovery_alias_before_child_retry() {
 }
 
 #[tokio::test]
+async fn main_registration_self_heals_when_its_alias_target_finished() {
+    let (api, store, clock) = api_fixture().await;
+    let canonical = api
+        .discover_session(DiscoveredSession {
+            runtime: RuntimeKind::ClaudeCode,
+            native_id: "finished-canonical".to_owned(),
+            kind: SessionKind::Main,
+            parent: None,
+            event_key: "discover-finished-canonical".to_owned(),
+            adapter_version: "test".to_owned(),
+            evidence_source: "test:finished-canonical".to_owned(),
+            title: None,
+            startup_directory: None,
+        })
+        .await
+        .expect("canonical main should be discovered");
+    let canonical_native = NativeSessionKey::new(RuntimeKind::ClaudeCode, "finished-canonical")
+        .expect("canonical identity should validate");
+    api.ingest_native_observation(
+        ObservationEnvelope::new(
+            ObservationId::from_native(RuntimeKind::ClaudeCode, "test", "finish-canonical")
+                .expect("observation identity should validate"),
+            canonical_native,
+            clock.now(),
+            ObservationSource::new(
+                AdapterIdentity::new(RuntimeKind::ClaudeCode, "2.1.212")
+                    .expect("adapter should be valid"),
+                "hook:stop",
+                EvidenceTrust::Authoritative,
+                None,
+            )
+            .expect("source should be valid"),
+            ObservationPayload::NativeState(DetailedState::Completed),
+        )
+        .expect("observation should be valid"),
+    )
+    .await
+    .expect("canonical main should finish");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "live-wrapper-main")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(
+            &alias,
+            canonical.session.session_id(),
+            clock.now().wall_time(),
+        )
+        .await
+        .expect("stale alias should persist");
+    let before = store
+        .snapshot(canonical.session)
+        .await
+        .expect("canonical snapshot should load")
+        .expect("canonical snapshot should exist");
+
+    let transport = TransportKey::new("live-wrapper-transport").expect("transport should validate");
+    let registered = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: alias.runtime(),
+                native_id: alias.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "register-live-wrapper".to_owned(),
+            },
+        )
+        .await
+        .expect("a live caller must not be redirected onto a finished session");
+
+    assert_eq!(
+        registered.native_id,
+        alias.native_id(),
+        "registration keeps the caller's own identity when the alias target already finished"
+    );
+    assert_eq!(
+        registered.root.session_id(),
+        SessionId::from_native(&alias),
+        "the self-healed registration owns its own tree"
+    );
+    assert_ne!(registered.snapshot.state(), DetailedState::Completed);
+    assert_eq!(
+        store
+            .snapshot(canonical.session)
+            .await
+            .expect("canonical snapshot should reload")
+            .expect("canonical snapshot should remain"),
+        before,
+        "self-healing must not mutate the finished tree"
+    );
+    assert!(
+        !store
+            .discovery_aliases(RuntimeKind::ClaudeCode, 10)
+            .await
+            .expect("aliases should load")
+            .iter()
+            .any(|(key, _)| *key == alias),
+        "the stale alias is discarded so the next registration resolves directly"
+    );
+}
+
+#[tokio::test]
+async fn main_registration_self_heals_when_its_alias_target_is_not_a_main_session() {
+    let (api, store, clock) = api_fixture().await;
+    let transport = TransportKey::new("canonical-transport").expect("transport should validate");
+    let canonical_main = register_main(&api, &transport, "child-alias-main", "register-main").await;
+    let child = api
+        .register_session(
+            &transport,
+            RegisterSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: "aliased-child-job".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(canonical_main),
+                event_key: "register-aliased-child".to_owned(),
+            },
+        )
+        .await
+        .expect("child should register");
+    let alias = NativeSessionKey::new(RuntimeKind::ClaudeCode, "child-aliased-wrapper")
+        .expect("wrapper alias should validate");
+    store
+        .save_discovery_alias(&alias, child.session.session_id(), clock.now().wall_time())
+        .await
+        .expect("corrupt alias should persist");
+
+    let wrapper_transport =
+        TransportKey::new("child-aliased-transport").expect("transport should validate");
+    let registered = api
+        .register_session(
+            &wrapper_transport,
+            RegisterSession {
+                runtime: alias.runtime(),
+                native_id: alias.native_id().to_owned(),
+                kind: SessionKind::Main,
+                parent: None,
+                event_key: "register-child-aliased-wrapper".to_owned(),
+            },
+        )
+        .await
+        .expect("an alias pointing at a non-main session must not brick registration");
+
+    assert_eq!(registered.native_id, alias.native_id());
+    assert_eq!(registered.root.session_id(), SessionId::from_native(&alias));
+    assert_eq!(
+        store
+            .session_by_id(child.session.session_id())
+            .await
+            .expect("child lookup should succeed")
+            .expect("child should remain")
+            .root,
+        child.root,
+        "self-healing must not re-root the mistargeted session"
+    );
+    assert!(
+        !store
+            .discovery_aliases(RuntimeKind::ClaudeCode, 10)
+            .await
+            .expect("aliases should load")
+            .iter()
+            .any(|(key, _)| *key == alias),
+        "the corrupt alias is discarded"
+    );
+}
+
+#[tokio::test]
 async fn child_registration_progress_and_completion_are_idempotent_and_scoped() {
     let (api, _store, _clock) = api_fixture().await;
     let transport = TransportKey::new("transport-main").expect("transport should be valid");
