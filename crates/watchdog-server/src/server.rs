@@ -39,11 +39,11 @@ use crate::process_monitor::ProcessMonitor;
 use crate::termination::TerminationMonitor;
 use crate::watch_paths::WatchPathRegistry;
 use crate::{
-    AgentApi, BasicAuthenticator, BearerAuthenticator, ClaudeHookService, CodexHookService,
-    DashboardOutboxDispatcher, DashboardService, FilesystemActivityReconciler, GitHubEnricher,
-    HealthService, HumanNotifier, HumanOutboxDispatcher, McpLimits, NotificationEndpoints,
-    RepositoryMetadata, SystemClock, WebhookEndpoint, claude_hook_router, codex_hook_router,
-    dashboard_router, health_router, mcp_router,
+    AgentApi, BearerAuthenticator, ClaudeHookService, CodexHookService, DashboardOutboxDispatcher,
+    DashboardService, FilesystemActivityReconciler, GitHubEnricher, HealthService, HumanNotifier,
+    HumanOutboxDispatcher, McpLimits, NotificationEndpoints, RepositoryMetadata, SystemClock,
+    WebhookEndpoint, claude_hook_router, codex_hook_router, dashboard_router, health_router,
+    mcp_router,
 };
 #[cfg(target_os = "linux")]
 use crate::{
@@ -250,7 +250,6 @@ async fn run(bootstrap: BootstrapConfig) -> Result<(), ServerError> {
         dashboard,
         api.clone(),
         Arc::clone(&clock),
-        bootstrap.basic_auth.clone(),
         bootstrap.bearer_auth.clone(),
         current.mcp(),
     );
@@ -346,13 +345,12 @@ fn application_router(
     dashboard: DashboardService,
     api: AgentApi,
     clock: Arc<SystemClock>,
-    basic_auth: BasicAuthenticator,
     bearer_auth: BearerAuthenticator,
     mcp: McpLimits,
 ) -> Router {
     Router::new()
-        .merge(health_router(health, basic_auth.clone()))
-        .merge(dashboard_router(dashboard, basic_auth))
+        .merge(health_router(health))
+        .merge(dashboard_router(dashboard))
         .merge(claude_hook_router(
             ClaudeHookService::new(api.clone(), Arc::clone(&clock) as Arc<_>),
             bearer_auth.clone(),
@@ -1602,7 +1600,6 @@ struct BootstrapConfig {
     config_path: PathBuf,
     database_path: PathBuf,
     listen_address: SocketAddr,
-    basic_auth: BasicAuthenticator,
     bearer_auth: BearerAuthenticator,
     github_token: Option<SecretText>,
     notification_endpoints: NotificationEndpoints,
@@ -1628,11 +1625,7 @@ impl BootstrapConfig {
         let listen_address = required(&mut get, "WATCHDOG_LISTEN_ADDRESS")?
             .parse()
             .map_err(|_| ServerError::InvalidEnvironment("WATCHDOG_LISTEN_ADDRESS"))?;
-        let username = required(&mut get, "WATCHDOG_BASIC_USERNAME")?;
-        let password = required(&mut get, "WATCHDOG_BASIC_PASSWORD")?;
         let bearer = required(&mut get, "WATCHDOG_BEARER_TOKEN")?;
-        let basic_auth = BasicAuthenticator::new(&username, &password)
-            .map_err(|_| ServerError::InvalidEnvironment("WATCHDOG_BASIC_USERNAME/PASSWORD"))?;
         let bearer_auth = BearerAuthenticator::new(bearer)
             .map_err(|_| ServerError::InvalidEnvironment("WATCHDOG_BEARER_TOKEN"))?;
         let github_token = optional(&mut get, "WATCHDOG_GITHUB_TOKEN")?.map(SecretText::new);
@@ -1648,7 +1641,6 @@ impl BootstrapConfig {
             config_path,
             database_path,
             listen_address,
-            basic_auth,
             bearer_auth,
             github_token,
             notification_endpoints: NotificationEndpoints::new(home_assistant, webhook),
@@ -1779,7 +1771,6 @@ mod tests {
         thread,
     };
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use watchdog_domain::{RuntimeKind, TimePoint, WallTimeMs};
     use watchdog_runtime::{ComponentId, ComponentStatus};
     use watchdog_testkit::FakeClock;
@@ -1819,8 +1810,6 @@ mod tests {
                 "/var/lib/agent-watchdog/watchdog.db",
             ),
             ("WATCHDOG_LISTEN_ADDRESS", "0.0.0.0:8080"),
-            ("WATCHDOG_BASIC_USERNAME", "operator"),
-            ("WATCHDOG_BASIC_PASSWORD", "browser-secret"),
             ("WATCHDOG_BEARER_TOKEN", "agent-secret"),
             ("WATCHDOG_GITHUB_TOKEN", "github-secret"),
         ]);
@@ -1828,12 +1817,15 @@ mod tests {
             values.get(name).map(|value| OsString::from(*value))
         })
         .expect("valid environment");
-        values.insert("WATCHDOG_BASIC_PASSWORD", "changed-secret");
+        values.insert("WATCHDOG_BEARER_TOKEN", "changed-secret");
 
-        let header = format!("Basic {}", STANDARD.encode("operator:browser-secret"));
-        assert!(bootstrap.basic_auth.authorize(Some(header.as_bytes())));
+        assert!(
+            bootstrap
+                .bearer_auth
+                .authorize(Some(b"Bearer agent-secret"))
+        );
         let debug = format!("{bootstrap:?}");
-        for secret in ["browser-secret", "agent-secret", "github-secret"] {
+        for secret in ["agent-secret", "github-secret"] {
             assert!(!debug.contains(secret));
         }
     }
@@ -1848,8 +1840,6 @@ mod tests {
                 "/var/lib/agent-watchdog/watchdog.db",
             ),
             ("WATCHDOG_LISTEN_ADDRESS", "0.0.0.0:8080"),
-            ("WATCHDOG_BASIC_USERNAME", "operator"),
-            ("WATCHDOG_BASIC_PASSWORD", "password"),
             ("WATCHDOG_BEARER_TOKEN", secret),
         ]);
         let result = BootstrapConfig::from_getter(|name| {

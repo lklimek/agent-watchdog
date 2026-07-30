@@ -221,9 +221,9 @@ The v1 MCP tool set is:
 | FR-UI-005 | V1 cards are not expandable and the UI is read-only. | No acknowledge, deadline, cancellation, termination, or transcript action is present. |
 | FR-UI-006 | The dashboard is usable on a narrow mobile viewport. | No horizontal scrolling is required for the primary session facts and status counts. |
 | FR-UI-007 | SSE provides live updates. If disconnected, the UI shows the condition and continuously retries; it does not poll. | Stale data remains visible with a disconnected indicator until SSE recovers. |
-| FR-UI-008 | The UI uses shared Basic Auth and is exposed only through Traefik on a trusted LAN/VPN allowlist. | Direct server ports are not published in the supported Compose configuration. |
+| FR-UI-008 | The UI is exposed only through Traefik, which applies shared Basic Auth and a trusted LAN/VPN allowlist as the single authentication layer. | Direct server ports are not published in the supported Compose configuration, and the application holds no browser credential. |
 | FR-UI-009 | Human alerts are concise and identify the main-session title, startup directory, and issue. | Detailed PID/evidence is absent from browser/webhook messages. |
-| FR-UI-010 | The authenticated HTTP root redirects to the dashboard at `/ui`. | A valid Basic Auth request to `/` receives a fixed temporary redirect to `/ui`; unauthenticated requests remain challenged. |
+| FR-UI-010 | The HTTP root redirects to the dashboard at `/ui`. | A request to `/` receives a fixed temporary redirect to `/ui`; unauthenticated requests are challenged by the proxy before they reach it. |
 
 ### 8.7 Human notifications
 
@@ -264,7 +264,7 @@ The v1 MCP tool set is:
 | FR-OPS-005 | `/health` reports overall status and individual adapters/subsystems. | A broken Codex adapter can be distinguished from a healthy server and Claude adapter. |
 | FR-OPS-006 | Operational telemetry uses `tracing`, matching MemCan conventions. | Compose logs are structured and secrets/transcript contents are redacted. |
 | FR-OPS-007 | Prometheus metrics are deferred; logs and health are the v1 operational interface. | No metrics system is required for v1 acceptance. |
-| FR-SEC-001 | UI uses Basic Auth and MCP/API uses a shared Bearer token; comparison and logging must not leak credentials. | Raw passwords/tokens never appear in debug output or error responses. |
+| FR-SEC-001 | The proxy applies Basic Auth to the UI and the application verifies a shared Bearer token for MCP/API; comparison and logging must not leak credentials. | Raw passwords/tokens never appear in debug output or error responses. |
 | FR-SEC-002 | All paths received from runtime data or MCP are canonicalized and checked against allowlisted prefixes before access. | Symlink/path traversal cannot expand host access beyond mounted/configured roots. |
 | FR-SEC-003 | Transcript-derived content is untrusted, bounded, escaped in HTML, and excluded from shell construction. | Adversarial transcript text cannot execute commands or inject markup. |
 

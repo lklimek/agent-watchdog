@@ -13,8 +13,6 @@ use futures::{Stream, StreamExt as _, stream};
 use maud::Markup;
 use tokio::sync::broadcast;
 
-use crate::BasicAuthenticator;
-
 use super::{
     model::{
         DashboardError, DashboardQuery, DashboardScope, DashboardService, DashboardSnapshot,
@@ -26,8 +24,11 @@ use super::{
 const CSS: &str = include_str!("../../../../web/app.css");
 const JAVASCRIPT: &str = include_str!("../../../../web/dist/app.js");
 
-/// Build authenticated dashboard, read-only JSON, assets, and SSE routes.
-pub fn dashboard_router(service: DashboardService, authenticator: BasicAuthenticator) -> Router {
+/// Build dashboard, read-only JSON, assets, and SSE routes.
+///
+/// The routes rely on the reverse proxy for authentication; the application
+/// container publishes no port of its own.
+pub fn dashboard_router(service: DashboardService) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/ui", get(ui))
@@ -36,12 +37,6 @@ pub fn dashboard_router(service: DashboardService, authenticator: BasicAuthentic
         .route("/api/v1/sessions", get(sessions))
         .route("/api/v1/events", get(events))
         .with_state(service)
-        .layer(middleware::from_fn(
-            move |request: Request<Body>, next: Next| {
-                let authenticator = authenticator.clone();
-                async move { basic_auth(request, next, &authenticator).await }
-            },
-        ))
         .layer(middleware::from_fn(security_headers))
 }
 
@@ -107,33 +102,6 @@ async fn javascript() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         JAVASCRIPT,
     )
-}
-
-async fn basic_auth(
-    request: Request<Body>,
-    next: Next,
-    authenticator: &BasicAuthenticator,
-) -> Response {
-    let authorized = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .is_some_and(|value| authenticator.authorize(Some(value.as_bytes())));
-    if !authorized {
-        tracing::warn!(
-            event = "auth.rejected",
-            route = request.uri().path(),
-            "Dashboard basic credential rejected"
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Basic realm=\"Agent Watchdog\", charset=\"UTF-8\""),
-            )],
-        )
-            .into_response();
-    }
-    next.run(request).await
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {

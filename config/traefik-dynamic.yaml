@@ -37,7 +37,7 @@ http:
   middlewares:
     watchdog-basic-auth:
       basicAuth:
-        removeHeader: false
+        removeHeader: true
         usersFile: /run/secrets/watchdog-users
     watchdog-trusted:
       ipAllowList:

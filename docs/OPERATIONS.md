@@ -47,23 +47,28 @@ live interactive mains from retained transcripts. A malformed or incomplete
 registry degrades Claude discovery and suppresses absence inference; it never
 causes a mass terminal transition.
 
-Use distinct, long random values for `WATCHDOG_BASIC_PASSWORD` and
-`WATCHDOG_BEARER_TOKEN`. Create the Traefik password file with the same Basic
-username and password configured in `.env`, then restrict it to the monitored
-user:
+Use a long random value for `WATCHDOG_BEARER_TOKEN`, the MCP and hook
+credential.
 
-Use `htpasswd` from Apache's utilities to generate a BCrypt entry. It prompts
-for the password and prints the complete username/hash line:
+Browser credentials live only in the Traefik password file referenced by
+`WATCHDOG_TRAEFIK_USERS_FILE`; the application itself never holds a dashboard
+username or password. Use `htpasswd` from Apache's utilities to generate a
+BCrypt entry. It prompts for the password and prints the complete
+username/hash line:
 
 ```text
-htpasswd -nB <WATCHDOG_BASIC_USERNAME>
+htpasswd -nB <dashboard-username>
 ```
 
-Write that one printed line to `config/traefik-users` and run:
+Write that one printed line to `config/traefik-users`, restrict it to the
+monitored user, and restart the `traefik` service to apply it:
 
 ```text
 chmod 0600 config/traefik-users
 ```
+
+The file accepts one `user:hash` line per operator. Changing a credential means
+editing this file only — there is no second copy to keep in sync.
 
 Set `WATCHDOG_TRUSTED_CIDRS` to a comma-separated allowlist of the actual
 operator LAN/VPN networks. Avoid broad private-network defaults when a narrower
@@ -319,8 +324,9 @@ are outside v1 scope.
 - Traefik returns `403`: the request source is outside
   `WATCHDOG_TRUSTED_CIDRS`; narrow and correct the allowlist rather than
   disabling it.
-- Traefik returns `401`: the password file and application Basic credentials
-  must describe the same username/password. MCP uses the separate Bearer token.
+- Traefik returns `401`: the browser credential does not match any `user:hash`
+  line in the password file. Regenerate the line with `htpasswd -nB` and restart
+  the `traefik` service. MCP uses the separate Bearer token.
 - One adapter is `degraded`: inspect only that adapter's bounded health message
   and its exact mounted roots. Other runtimes should remain available.
 - `notifications` is `degraded`: a durable human-channel outbox record could not

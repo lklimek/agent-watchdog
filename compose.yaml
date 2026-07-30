@@ -27,8 +27,6 @@ services:
       - "8080"
     environment:
       RUST_LOG: ${RUST_LOG:-watchdog_server=info,watchdog_runtime=info,watchdog_store=info}
-      WATCHDOG_BASIC_PASSWORD: ${WATCHDOG_BASIC_PASSWORD:?Set WATCHDOG_BASIC_PASSWORD}
-      WATCHDOG_BASIC_USERNAME: ${WATCHDOG_BASIC_USERNAME:?Set WATCHDOG_BASIC_USERNAME}
       WATCHDOG_BEARER_TOKEN: ${WATCHDOG_BEARER_TOKEN:?Set WATCHDOG_BEARER_TOKEN}
       WATCHDOG_CONFIG_PATH: /etc/agent-watchdog/watchdog.toml
       WATCHDOG_DATABASE_PATH: /var/lib/agent-watchdog/watchdog.db
