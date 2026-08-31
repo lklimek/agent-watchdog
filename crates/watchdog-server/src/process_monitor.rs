@@ -106,6 +106,10 @@ impl ProcessMonitor {
         }
     }
 
+    /// Sample every verified session tree once and ingest the deltas.
+    ///
+    /// Procfs enumeration runs on the blocking pool because it opens and reads
+    /// one file per live process, which would otherwise hold an async worker.
     pub(crate) async fn reconcile(&self) -> Result<ProcessMonitorReport, ProcessMonitorError> {
         let mut sessions = self
             .store
@@ -140,9 +144,9 @@ impl ProcessMonitor {
         if roots.is_empty() {
             return Ok(report);
         }
-        let trees = self
-            .sampler
-            .sample_trees(&roots)
+        let sampler = Arc::clone(&self.sampler);
+        let trees = tokio::task::spawn_blocking(move || sampler.sample_trees(&roots))
+            .await?
             .map_err(|()| ProcessMonitorError::Sampler)?;
         for (session, identity) in monitored {
             let Some(Ok(current)) = trees.get(&identity.pid()) else {
@@ -280,6 +284,8 @@ fn process_observation(
 pub(crate) enum ProcessMonitorError {
     #[error("Linux process sampler initialization failed")]
     Sampler,
+    #[error("Linux process sampling did not complete")]
+    SamplerTask(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Domain(#[from] watchdog_domain::DomainInputError),
     #[error(transparent)]
@@ -292,7 +298,7 @@ pub(crate) enum ProcessMonitorError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
     use watchdog_domain::{
         NativeSessionKey, ProcessId, RuntimeKind, SessionKind, TimePoint, WallTimeMs,
@@ -326,10 +332,49 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn all_four_cpu_deltas_record_actionable_session_progress() {
-        let fixture = tempfile::tempdir().expect("fixture root");
-        let store = WatchdogStore::open(&fixture.path().join("watchdog.db"))
+    /// Wall-clock gate release delay for the executor-starvation probe.
+    const GATE_RELEASE_DELAY: Duration = Duration::from_millis(50);
+    /// Upper bound the gated sampler waits before declaring the runtime starved.
+    const GATE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Sampler that only returns once a runtime timer releases its gate.
+    #[derive(Debug)]
+    struct GatedSampler {
+        gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        snapshot: ProcessTreeSnapshot,
+    }
+
+    impl ProcessTreeSampler for GatedSampler {
+        fn sample_trees(
+            &self,
+            _roots: &[ProcessIdentity],
+        ) -> Result<BTreeMap<ProcessId, Result<ProcessTreeSnapshot, ()>>, ()> {
+            let gate = self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or(())?;
+            gate.recv_timeout(GATE_TIMEOUT).map_err(|_| ())?;
+            Ok(BTreeMap::from([(
+                self.snapshot.root().pid(),
+                Ok(self.snapshot.clone()),
+            )]))
+        }
+    }
+
+    struct MonitoredSession {
+        _root: tempfile::TempDir,
+        store: WatchdogStore,
+        clock: Arc<FakeClock>,
+        api: AgentApi,
+        session: watchdog_domain::SessionIdentity,
+        process: ProcessIdentity,
+    }
+
+    async fn monitored_session() -> MonitoredSession {
+        let root = tempfile::tempdir().expect("fixture root");
+        let store = WatchdogStore::open(&root.path().join("watchdog.db"))
             .await
             .expect("store should open");
         let clock = Arc::new(FakeClock::new(TimePoint::new(
@@ -368,14 +413,67 @@ mod tests {
         ))
         .await
         .expect("process identity should apply");
+        MonitoredSession {
+            _root: root,
+            store,
+            clock,
+            api,
+            session: session.session,
+            process,
+        }
+    }
 
+    /// Procfs sampling must not hold an async worker thread: the gate is released
+    /// only by a runtime timer, which cannot fire while a worker thread blocks.
+    #[tokio::test]
+    async fn process_sampling_leaves_the_async_executor_free() {
+        let fixture = monitored_session().await;
+        let (release, gate) = std::sync::mpsc::channel();
+        let sampler = Arc::new(GatedSampler {
+            gate: Mutex::new(Some(gate)),
+            snapshot: tree(fixture.process.clone(), CpuCounters::new(1, 1, 1, 1)),
+        });
+        let monitor = ProcessMonitor::with_sampler(
+            fixture.api.clone(),
+            fixture.store.clone(),
+            fixture.clock.clone(),
+            sampler,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(GATE_RELEASE_DELAY).await;
+            let _ = release.send(());
+        });
+
+        let report = monitor
+            .reconcile()
+            .await
+            .expect("sampling must not starve the runtime timer that releases its gate");
+
+        assert_eq!(report.monitored_sessions(), 1);
+        assert_eq!(report.warning_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn all_four_cpu_deltas_record_actionable_session_progress() {
+        let fixture = monitored_session().await;
+        let (store, clock, session) = (
+            fixture.store.clone(),
+            fixture.clock.clone(),
+            fixture.session,
+        );
+        let process = fixture.process.clone();
         let sampler = Arc::new(FakeSampler {
             snapshots: Mutex::new(VecDeque::from([
                 tree(process.clone(), CpuCounters::new(1, 1, 1, 1)),
                 tree(process, CpuCounters::new(2, 2, 2, 2)),
             ])),
         });
-        let monitor = ProcessMonitor::with_sampler(api, store.clone(), clock.clone(), sampler);
+        let monitor = ProcessMonitor::with_sampler(
+            fixture.api.clone(),
+            store.clone(),
+            clock.clone(),
+            sampler,
+        );
         let baseline = monitor.reconcile().await.expect("baseline should sample");
         assert_eq!(baseline.monitored_sessions(), 1);
         assert_eq!(baseline.progressed_sessions(), 0);
@@ -385,7 +483,7 @@ mod tests {
         assert_eq!(progress.progressed_sessions(), 1);
         assert_eq!(progress.warning_count(), 0);
         let stored = store
-            .snapshot(session.session)
+            .snapshot(session)
             .await
             .expect("snapshot should query")
             .expect("snapshot should exist");
@@ -397,7 +495,7 @@ mod tests {
             Some("All four CPU times grew versus the previous process snapshot")
         );
         let activity = store
-            .recent_activity(session.session, 10)
+            .recent_activity(session, 10)
             .await
             .expect("process diagnostics should query");
         assert!(activity.iter().any(|sample| matches!(
