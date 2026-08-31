@@ -715,6 +715,15 @@ The MCP endpoint uses Streamable HTTP and shared Bearer authentication. At
 initialization/registration, a transport is bound to one main-session scope.
 Every query/mutation resolves the supplied session ID within that root tree.
 
+A main registration binds its own root; a child registration binds the root of
+the parent session ID it names. An agent spawned as its own process therefore
+registers itself over its own transport instead of depending on the coordinator
+to hold the tree's only bound connection. The parent's high-entropy session ID
+is the authorization currency, the same one that binds an autodiscovered main.
+A transport already bound to another root is still refused as cross-tree
+access, and a child registration that fails afterwards releases the binding it
+took, so a rejected call grants no scope.
+
 The rmcp transport ID is surfaced by a Watchdog `SessionManager` wrapper as a
 typed request extension. The application binds that opaque ID exactly once;
 rebinding and cross-tree targets fail server-side. Because that ID is also the

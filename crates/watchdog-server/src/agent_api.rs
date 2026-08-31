@@ -808,9 +808,6 @@ impl AgentApi {
             }
         };
         let transport = discovery_transport(root)?;
-        if request.kind == SessionKind::Child {
-            self.inner.scopes.bind_once(transport.clone(), root)?;
-        }
         let provenance = RegistrationProvenance::Native {
             adapter_version: request.adapter_version,
             evidence_source: request.evidence_source,
@@ -942,7 +939,11 @@ impl AgentApi {
         self.view_for_record(&record).await
     }
 
-    /// Register/enrich a session and bind a main registration's transport once.
+    /// Register/enrich a session and bind the caller's transport to its tree.
+    ///
+    /// A main registration binds its own root; a child registration binds the
+    /// root of the parent it names, so a spawned agent can register itself over
+    /// its own transport.
     ///
     /// # Errors
     ///
@@ -957,7 +958,7 @@ impl AgentApi {
             .await
     }
 
-    /// Register or enrich one session, binding a main registration's transport.
+    /// Register or enrich one session and bind the caller's transport once.
     ///
     /// # Trust invariant
     ///
@@ -1054,7 +1055,7 @@ impl AgentApi {
             }
             SessionKind::Child => {
                 let parent_id = request.parent.ok_or(AgentApiError::MissingParent)?;
-                let parent = self.resolve_scoped(transport, parent_id).await?;
+                let parent = self.resolve_child_parent(transport, parent_id).await?;
                 let record = StoredSessionRecord {
                     session: SessionIdentity::Child(ChildSessionId::from(session_id)),
                     root: parent.root,
@@ -1062,6 +1063,7 @@ impl AgentApi {
                 };
                 self.reject_conflicting_identity(session_id, &record)
                     .await?;
+                let bound = ScopeGuard::bind(&self.inner.scopes, transport, parent.root)?;
                 self.commit_registration(
                     &record,
                     &request.event_key,
@@ -1070,6 +1072,7 @@ impl AgentApi {
                     Some(&parent),
                 )
                 .await?;
+                bound.commit();
                 record
             }
         };
@@ -1799,6 +1802,30 @@ impl AgentApi {
             .entry(record.session.session_id())
             .or_insert_with(|| Arc::clone(&lane))
             .clone())
+    }
+
+    /// Resolve the parent named by a child registration.
+    ///
+    /// A child arrives on its own transport, which has never registered a main
+    /// of its own, so the parent is resolved by ID rather than through the
+    /// caller's scope: the parent's high-entropy session ID is the same
+    /// authorization currency [`AgentApi::bind_discovered_main`] accepts. A
+    /// caller already bound elsewhere still cannot reach across trees.
+    async fn resolve_child_parent(
+        &self,
+        transport: &TransportKey,
+        parent_id: SessionId,
+    ) -> Result<StoredSessionRecord, AgentApiError> {
+        let parent = self
+            .inner
+            .store
+            .session_by_id(parent_id)
+            .await?
+            .ok_or(AgentApiError::SessionNotFound)?;
+        match self.inner.scopes.root(transport) {
+            Ok(root) if root != parent.root => Err(AgentApiError::CrossTreeAccess),
+            _ => Ok(parent),
+        }
     }
 
     async fn resolve_scoped(

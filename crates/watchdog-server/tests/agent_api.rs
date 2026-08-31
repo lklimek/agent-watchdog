@@ -272,6 +272,165 @@ async fn transport_binds_once_and_cross_tree_access_fails() {
 }
 
 #[tokio::test]
+async fn a_spawned_agent_registers_itself_as_a_child_on_its_own_transport() {
+    let (api, _store, _clock) = api_fixture().await;
+    let coordinator =
+        TransportKey::new("self-register-coordinator").expect("transport should be valid");
+    let spawned = TransportKey::new("self-register-spawned").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &coordinator,
+        "self-register-main",
+        "register-self-main",
+    )
+    .await;
+
+    let child = api
+        .register_session(
+            &spawned,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "self-register-child".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(main),
+                event_key: "register-self-child".to_owned(),
+            },
+        )
+        .await
+        .expect("a spawned agent should register itself against its parent session id");
+
+    assert_eq!(child.root, MainSessionId::from(main));
+    let observed = api
+        .get_session(&spawned, child.session.session_id())
+        .await
+        .expect("child self-registration should bind the child's own transport");
+    assert_eq!(observed.session, child.session);
+    assert!(
+        api.get_session(&coordinator, child.session.session_id())
+            .await
+            .is_ok(),
+        "the coordinator keeps its own scope over the child it spawned"
+    );
+}
+
+#[tokio::test]
+async fn a_coordinator_registered_child_binds_its_own_transport_by_re_registering() {
+    let (api, _store, _clock) = api_fixture().await;
+    let coordinator = TransportKey::new("rebind-coordinator").expect("transport should be valid");
+    let spawned = TransportKey::new("rebind-spawned").expect("transport should be valid");
+    let main = register_main(&api, &coordinator, "rebind-main", "register-rebind-main").await;
+    let child = register_child(
+        &api,
+        &coordinator,
+        main,
+        "rebind-child",
+        "register-rebind-child",
+    )
+    .await;
+
+    let re_registered = api
+        .register_session(
+            &spawned,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "rebind-child".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(main),
+                event_key: "re-register-rebind-child".to_owned(),
+            },
+        )
+        .await
+        .expect("an already registered child should re-register from its own transport");
+
+    assert_eq!(re_registered.session.session_id(), child);
+    assert!(
+        api.get_session(&spawned, child).await.is_ok(),
+        "re-registration should bind the child's own transport"
+    );
+}
+
+#[tokio::test]
+async fn a_bound_transport_cannot_register_a_child_into_another_tree() {
+    let (api, store, _clock) = api_fixture().await;
+    let transport_a = TransportKey::new("child-cross-tree-a").expect("transport should be valid");
+    let transport_b = TransportKey::new("child-cross-tree-b").expect("transport should be valid");
+    let main_a = register_main(&api, &transport_a, "child-cross-a", "register-cross-a").await;
+    register_main(&api, &transport_b, "child-cross-b", "register-cross-b").await;
+    let native = NativeSessionKey::new(RuntimeKind::CodexCompanion, "child-cross-target")
+        .expect("child identity should validate");
+
+    let rejected = api
+        .register_session(
+            &transport_b,
+            RegisterSession {
+                runtime: native.runtime(),
+                native_id: native.native_id().to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(main_a),
+                event_key: "register-cross-child".to_owned(),
+            },
+        )
+        .await;
+
+    assert!(matches!(rejected, Err(AgentApiError::CrossTreeAccess)));
+    assert!(
+        store
+            .session_by_id(SessionId::from_native(&native))
+            .await
+            .expect("child lookup should succeed")
+            .is_none(),
+        "a rejected cross-tree child must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_child_registration_leaves_its_transport_unbound() {
+    let (api, _store, _clock) = api_fixture().await;
+    let coordinator = TransportKey::new("conflict-coordinator").expect("transport should be valid");
+    let claimant = TransportKey::new("conflict-claimant").expect("transport should be valid");
+    let spawned = TransportKey::new("conflict-spawned").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &coordinator,
+        "conflict-main",
+        "register-conflict-main",
+    )
+    .await;
+    register_main(
+        &api,
+        &claimant,
+        "conflict-native",
+        "register-conflict-claimed",
+    )
+    .await;
+
+    let rejected = api
+        .register_session(
+            &spawned,
+            RegisterSession {
+                runtime: RuntimeKind::ClaudeCode,
+                native_id: "conflict-native".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(main),
+                event_key: "register-conflict-child".to_owned(),
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        rejected,
+        Err(AgentApiError::SessionIdentityConflict)
+    ));
+    assert!(
+        matches!(
+            api.get_session(&spawned, main).await,
+            Err(AgentApiError::TransportNotBound)
+        ),
+        "a rejected child registration must not grant scope over the parent tree"
+    );
+}
+
+#[tokio::test]
 async fn rejected_main_rebinds_do_not_mutate_other_trees() {
     let (api, store, clock) = api_fixture().await;
     let transport = TransportKey::new("bound-transport").expect("transport should validate");

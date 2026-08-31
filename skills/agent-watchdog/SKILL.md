@@ -56,9 +56,12 @@ For each real delegation:
    `register_watch_path` with the child Watchdog UUID, the existing path, and
    another fresh `event_key`.
 
-Register nested children against their actual in-tree parent. Registering a
-child does not replace `register_delegation`: the latter records the exact
-relationship and expected check-in.
+Register nested children against their actual in-tree parent. A child that
+runs as its own process with its own MCP connection can register itself the
+same way: `kind=child` plus the parent `session_id` it was handed binds that
+connection to the parent's tree, so it needs no main registration of its own.
+Registering a child does not replace `register_delegation`: the latter records
+the exact relationship and expected check-in.
 
 ## Report lifecycle changes
 
