@@ -346,7 +346,14 @@ impl TimerReconciliationReport {
 
 #[derive(Debug, Default)]
 struct ScopeRegistry {
-    roots: RwLock<HashMap<TransportKey, MainSessionId>>,
+    roots: RwLock<HashMap<TransportKey, ScopeBinding>>,
+}
+
+#[derive(Debug)]
+struct ScopeBinding {
+    root: MainSessionId,
+    pending_registrations: usize,
+    committed: bool,
 }
 
 #[derive(Debug)]
@@ -399,10 +406,8 @@ struct SessionLane {
     admission: Mutex<SessionAdmission<PendingObservation>>,
 }
 
-/// Outcome of an atomic `ScopeRegistry::bind_once` call, distinguishing a
-/// fresh insert (which a caller must roll back on later failure) from an
-/// idempotent match onto a binding that already existed (which a caller must
-/// never roll back, since it did not create it).
+/// Outcome of an atomic scope bind, distinguishing a fresh insert from an
+/// idempotent match onto a binding that already existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindOutcome {
     FreshBind,
@@ -410,12 +415,37 @@ enum BindOutcome {
 }
 
 impl ScopeRegistry {
-    /// Bind `transport` to `root`, or confirm it is already bound to `root`.
-    ///
-    /// The check-and-insert happens under a single write-lock acquisition so
-    /// the caller can tell a fresh bind apart from an already-matching one
-    /// without a separate, racy read beforehand (see `ScopeGuard::bind`).
-    fn bind_once(
+    /// Bind `transport` permanently to an already-persisted `root`.
+    fn bind_committed(
+        &self,
+        transport: TransportKey,
+        root: MainSessionId,
+    ) -> Result<(), AgentApiError> {
+        let mut roots = self
+            .roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match roots.get_mut(&transport) {
+            Some(bound) if bound.root == root => {
+                bound.committed = true;
+                Ok(())
+            }
+            Some(_) => Err(AgentApiError::TransportAlreadyBound),
+            None => {
+                roots.insert(
+                    transport,
+                    ScopeBinding {
+                        root,
+                        pending_registrations: 0,
+                        committed: true,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn begin_registration(
         &self,
         transport: TransportKey,
         root: MainSessionId,
@@ -424,13 +454,57 @@ impl ScopeRegistry {
             .roots
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match roots.get(&transport) {
-            Some(bound) if *bound == root => Ok(BindOutcome::AlreadyBound),
+        match roots.get_mut(&transport) {
+            Some(bound) if bound.root == root => {
+                bound.pending_registrations += 1;
+                Ok(BindOutcome::AlreadyBound)
+            }
             Some(_) => Err(AgentApiError::TransportAlreadyBound),
             None => {
-                roots.insert(transport, root);
+                roots.insert(
+                    transport,
+                    ScopeBinding {
+                        root,
+                        pending_registrations: 1,
+                        committed: false,
+                    },
+                );
                 Ok(BindOutcome::FreshBind)
             }
+        }
+    }
+
+    fn commit_registration(&self, transport: &TransportKey, root: MainSessionId) {
+        let mut roots = self
+            .roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bound) = roots.get_mut(transport)
+            && bound.root == root
+        {
+            if bound.pending_registrations > 0 {
+                bound.pending_registrations -= 1;
+            }
+            bound.committed = true;
+        }
+    }
+
+    fn rollback_registration(&self, transport: &TransportKey, root: MainSessionId) {
+        let mut roots = self
+            .roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = roots.get_mut(transport).is_some_and(|bound| {
+            if bound.root != root {
+                return false;
+            }
+            if bound.pending_registrations > 0 {
+                bound.pending_registrations -= 1;
+            }
+            bound.pending_registrations == 0 && !bound.committed
+        });
+        if remove {
+            roots.remove(transport);
         }
     }
 
@@ -439,7 +513,7 @@ impl ScopeRegistry {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(transport)
-            .copied()
+            .map(|bound| bound.root)
             .ok_or(AgentApiError::TransportNotBound)
     }
 
@@ -451,47 +525,46 @@ impl ScopeRegistry {
     }
 }
 
-/// A transport binding that must be undone unless the registration commits.
-///
-/// `ScopeRegistry` has no rollback and is otherwise released only on transport
-/// close, so a bind left behind by a failed registration would pin the scope to
-/// a session that was never persisted for the whole idle TTL.
+/// A pending transport binding that resolves on registration commit or rollback.
 struct ScopeGuard<'a> {
     scopes: &'a ScopeRegistry,
     transport: &'a TransportKey,
-    release_on_drop: bool,
+    root: MainSessionId,
+    pending: bool,
 }
 
 impl<'a> ScopeGuard<'a> {
+    /// Begin one pending registration for a transport and root.
+    ///
+    /// Same-root callers increment one pending count under the registry lock.
+    /// Commit latches the binding before resolving its pending slot; rollback
+    /// removes it only when no caller remains pending and none committed.
+    /// Therefore neither a pending peer nor any committed peer can be unbound,
+    /// regardless of whether the other callers commit or roll back first.
     fn bind(
         scopes: &'a ScopeRegistry,
         transport: &'a TransportKey,
         root: MainSessionId,
     ) -> Result<Self, AgentApiError> {
-        // A transport already bound to this root was bound by an earlier
-        // registration that did commit; releasing it on our failure would
-        // revoke a scope this call never established. `bind_once` decides
-        // "fresh bind" vs. "already bound" atomically under one lock, so two
-        // concurrent binds for the same unbound transport+root can never both
-        // conclude they created it: exactly one gets `FreshBind` (and owns
-        // rollback), the other gets `AlreadyBound` (and must not roll back).
-        let outcome = scopes.bind_once(transport.clone(), root)?;
+        scopes.begin_registration(transport.clone(), root)?;
         Ok(Self {
             scopes,
             transport,
-            release_on_drop: outcome == BindOutcome::FreshBind,
+            root,
+            pending: true,
         })
     }
 
     fn commit(mut self) {
-        self.release_on_drop = false;
+        self.scopes.commit_registration(self.transport, self.root);
+        self.pending = false;
     }
 }
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
-        if self.release_on_drop {
-            self.scopes.release(self.transport);
+        if self.pending {
+            self.scopes.rollback_registration(self.transport, self.root);
         }
     }
 }
@@ -506,13 +579,10 @@ mod scope_guard_tests {
     use super::{BindOutcome, MainSessionId, ScopeGuard, ScopeRegistry, TransportKey};
 
     /// Two registrations racing to bind the same currently-unbound transport
-    /// onto the same root must never both believe they performed the fresh
-    /// bind: exactly one gets `FreshBind` (and owns rollback), the other gets
-    /// `AlreadyBound` (and must never roll back). Regression test for the
-    /// TOCTOU race where a separate pre-check read (outside `bind_once`'s
-    /// lock) let both racers compute "not yet bound" and both arm rollback,
-    /// so the loser's later `Drop` could release a binding the winner had
-    /// already committed.
+    /// onto the same root must never both believe they inserted the binding:
+    /// exactly one gets `FreshBind` and the other gets `AlreadyBound`.
+    /// Regression test for the TOCTOU race where a separate pre-check read let
+    /// both racers compute "not yet bound" before either inserted the binding.
     #[test]
     fn concurrent_binds_of_the_same_unbound_transport_and_root_yield_exactly_one_fresh_bind() {
         let scopes = Arc::new(ScopeRegistry::default());
@@ -526,7 +596,7 @@ mod scope_guard_tests {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                scopes.bind_once(transport, root)
+                scopes.begin_registration(transport, root)
             })
         };
         let first = run_racer();
@@ -548,19 +618,18 @@ mod scope_guard_tests {
             .count();
         assert_eq!(
             fresh_binds, 1,
-            "exactly one racer must own the fresh bind (and thus rollback)"
+            "exactly one racer must create the pending binding"
         );
         assert_eq!(
             already_bound, 1,
-            "exactly one racer must observe an already-committed matching bind"
+            "exactly one racer must observe the matching pending binding"
         );
     }
 
-    /// Exercises `ScopeGuard::bind` itself (not just `bind_once`) for the
+    /// Exercises `ScopeGuard::bind` itself (not just `begin_registration`) for the
     /// scenario the race produces: a "rebind" onto an already-committed
-    /// matching root must not arm rollback, so dropping that guard without
-    /// `commit()` (as happens when a downstream registration step fails)
-    /// leaves the original, successfully-committed binding intact.
+    /// matching root must resolve its pending slot without removing the
+    /// successfully-committed binding if downstream registration fails.
     #[test]
     fn a_guard_for_an_already_bound_matching_root_does_not_release_on_drop() {
         let scopes = ScopeRegistry::default();
@@ -589,6 +658,80 @@ mod scope_guard_tests {
                 .expect("transport should remain bound"),
             root,
             "a guard that only observed an already-committed binding must not release it"
+        );
+    }
+
+    /// Registration A creates the pending binding, then waits. Registration B
+    /// joins the same binding and commits before A rolls back. B's successful
+    /// commit must prevent A's later drop from removing the shared binding.
+    #[test]
+    fn a_fresh_guard_rollback_after_a_matching_guard_commits_keeps_the_binding() {
+        let scopes = Arc::new(ScopeRegistry::default());
+        let transport = TransportKey::new("adopted-transport").expect("transport should validate");
+        let root = MainSessionId::from(SessionId::from_uuid(Uuid::nil()));
+        let fresh_bound = Arc::new(Barrier::new(2));
+        let matching_committed = Arc::new(Barrier::new(2));
+
+        let first = {
+            let scopes = Arc::clone(&scopes);
+            let transport = transport.clone();
+            let fresh_bound = Arc::clone(&fresh_bound);
+            let matching_committed = Arc::clone(&matching_committed);
+            std::thread::spawn(move || {
+                let fresh =
+                    ScopeGuard::bind(&scopes, &transport, root).expect("first bind should succeed");
+                fresh_bound.wait();
+                matching_committed.wait();
+                drop(fresh);
+            })
+        };
+        let second = {
+            let scopes = Arc::clone(&scopes);
+            let transport = transport.clone();
+            std::thread::spawn(move || {
+                fresh_bound.wait();
+                let matching = ScopeGuard::bind(&scopes, &transport, root)
+                    .expect("matching bind should succeed");
+                matching.commit();
+                matching_committed.wait();
+            })
+        };
+
+        first.join().expect("first registration should not panic");
+        second.join().expect("second registration should not panic");
+
+        assert_eq!(
+            scopes
+                .root(&transport)
+                .expect("committed matching registration must keep the binding"),
+            root
+        );
+    }
+
+    #[test]
+    fn a_rollback_keeps_the_binding_until_the_last_pending_registration_resolves() {
+        let scopes = ScopeRegistry::default();
+        let transport = TransportKey::new("pending-transport").expect("transport should validate");
+        let root = MainSessionId::from(SessionId::from_uuid(Uuid::nil()));
+        let first = ScopeGuard::bind(&scopes, &transport, root).expect("first bind should succeed");
+        let second =
+            ScopeGuard::bind(&scopes, &transport, root).expect("matching bind should succeed");
+
+        drop(first);
+        assert_eq!(
+            scopes
+                .root(&transport)
+                .expect("pending peer must keep the binding"),
+            root
+        );
+
+        drop(second);
+        assert!(
+            matches!(
+                scopes.root(&transport),
+                Err(super::AgentApiError::TransportNotBound)
+            ),
+            "the last rollback must remove a binding that nobody committed"
         );
     }
 }
@@ -1301,7 +1444,7 @@ impl AgentApi {
         }
         self.inner
             .scopes
-            .bind_once(transport.clone(), record.root)?;
+            .bind_committed(transport.clone(), record.root)?;
         Ok(record)
     }
 

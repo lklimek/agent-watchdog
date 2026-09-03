@@ -535,7 +535,7 @@ impl WatchdogMcpService {
     }
 
     #[tool(
-        description = "Register or enrich a session. Register kind=main first to bind this transport to one immutable session tree; kind=child names an existing parent session_id and binds this transport to that parent's tree, so an agent spawned in its own process can register itself. Supported runtimes: claude_code, codex_cli, codex_companion"
+        description = "Register or enrich a session. Use kind=main to start and bind this transport to a new immutable session tree; kind=child names an existing parent_session_id and binds this transport directly to that parent's tree, including from a fresh transport. Supported runtimes: claude_code, codex_cli, codex_companion"
     )]
     async fn register_session(
         &self,
