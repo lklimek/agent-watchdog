@@ -1,6 +1,9 @@
 //! Codex app-server and read-only state fallback contracts.
 
-use std::{error::Error as _, fs};
+use std::error::Error as _;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use watchdog_codex::{
@@ -455,6 +458,7 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
 }
 
 #[tokio::test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn held_sqlite_database_identity_survives_path_replacement_with_live_wal() {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
     let path = directory.path().join("state_5.sqlite");
