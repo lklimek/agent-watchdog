@@ -399,7 +399,7 @@ async fn initialization_enables_required_sqlite_pragmas_and_schema() {
     assert_eq!(health.journal_mode, "wal");
     assert!(health.foreign_keys);
     assert!(health.schema_version >= 1);
-    assert_eq!(health.application_table_count, 17);
+    assert_eq!(health.application_table_count, 18);
 }
 
 async fn alias_resolution(
@@ -532,6 +532,49 @@ const MIGRATIONS_THROUGH_0008: [&str; 8] = [
 
 const DISCOVERY_ALIAS_SUPERSESSION: &str =
     include_str!("../../../migrations/0009_discovery_alias_supersession.sql");
+const RELATION_EVENTS: &str = include_str!("../../../migrations/0010_relation_events.sql");
+
+#[tokio::test]
+async fn relation_event_migration_backfills_existing_relation_fingerprints() {
+    let database = TestDatabase::new("relation-event-upgrade");
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true)
+            .foreign_keys(false),
+    )
+    .await
+    .expect("legacy database should open");
+    sqlx::raw_sql(MIGRATIONS_THROUGH_0008[0])
+        .execute(&pool)
+        .await
+        .expect("initial schema should apply");
+    let relation_json = br#"{"provenance":{"fingerprint":"mcp:register_delegation:event-1"}}"#;
+    sqlx::query(
+        "INSERT INTO session_relations \
+         (child_session_id, parent_session_id, root_session_id, selected, provenance_json, \
+          valid_from_ms, valid_until_ms) VALUES ('child', 'parent', 'root', 1, ?, 1, NULL)",
+    )
+    .bind(relation_json.as_slice())
+    .execute(&pool)
+    .await
+    .expect("legacy relation should insert");
+
+    sqlx::raw_sql(RELATION_EVENTS)
+        .execute(&pool)
+        .await
+        .expect("relation event migration should apply");
+
+    let backfilled: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT event_fingerprint, relation_json FROM relation_events \
+         WHERE child_session_id = 'child'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy relation event should be backfilled");
+    assert_eq!(backfilled.0, "mcp:register_delegation:event-1");
+    assert_eq!(backfilled.1, relation_json);
+}
 
 #[tokio::test]
 async fn upgrading_a_dirty_alias_table_keeps_only_current_resolvable_evidence() {

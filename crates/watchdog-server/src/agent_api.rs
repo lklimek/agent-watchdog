@@ -2399,7 +2399,11 @@ impl AgentApi {
                 valid_from: now.wall_time(),
                 valid_until: None,
             })
-            .await?;
+            .await
+            .map_err(|error| match error {
+                StoreError::RelationIdentityConflict => AgentApiError::RelationEventConflict,
+                other => AgentApiError::Store(other),
+            })?;
         Ok(())
     }
 }
@@ -2458,7 +2462,7 @@ fn registration_source(
         } => (
             adapter_version.as_str(),
             if relation {
-                format!("{evidence_source}:relation")
+                format!("{evidence_source}:relation:{event_key}")
             } else {
                 evidence_source.clone()
             },
@@ -2661,6 +2665,9 @@ pub enum AgentApiError {
     /// Existing stable identity disagrees with registration.
     #[error("MCP registration conflicts with the stored session identity")]
     SessionIdentityConflict,
+    /// One relation event key was reused for a different hierarchy assertion.
+    #[error("MCP relation event was reused with different content")]
+    RelationEventConflict,
     /// Child registration omitted its parent.
     #[error("MCP child registration requires an existing parent")]
     MissingParent,

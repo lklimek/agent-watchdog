@@ -466,6 +466,133 @@ async fn an_exact_registration_retry_repairs_a_relation_after_partial_persistenc
 }
 
 #[tokio::test]
+async fn a_delayed_exact_registration_retry_does_not_restore_an_older_parent() {
+    let (api, store, clock) = api_fixture().await;
+    let coordinator =
+        TransportKey::new("delayed-retry-coordinator").expect("transport should be valid");
+    let alternate_parent_transport =
+        TransportKey::new("delayed-retry-parent").expect("transport should be valid");
+    let child_transport =
+        TransportKey::new("delayed-retry-child").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &coordinator,
+        "delayed-retry-main",
+        "register-delayed-retry-main",
+    )
+    .await;
+    let alternate_parent = register_child(
+        &api,
+        &alternate_parent_transport,
+        main,
+        "delayed-retry-alternate-parent",
+        "register-delayed-retry-alternate-parent",
+    )
+    .await;
+    let original = RegisterSession {
+        runtime: RuntimeKind::CodexCompanion,
+        native_id: "delayed-retry-target".to_owned(),
+        kind: SessionKind::Child,
+        parent: Some(main),
+        event_key: "register-delayed-retry-target-original".to_owned(),
+    };
+    let child = api
+        .register_session(&child_transport, original.clone())
+        .await
+        .expect("the original parent should register")
+        .session
+        .session_id();
+    clock.advance(DurationMs::new(1_000));
+    api.register_session(
+        &child_transport,
+        RegisterSession {
+            runtime: RuntimeKind::CodexCompanion,
+            native_id: "delayed-retry-target".to_owned(),
+            kind: SessionKind::Child,
+            parent: Some(alternate_parent),
+            event_key: "register-delayed-retry-target-new-parent".to_owned(),
+        },
+    )
+    .await
+    .expect("a newer event should select the new parent");
+    clock.advance(DurationMs::new(1_000));
+
+    api.register_session(&child_transport, original)
+        .await
+        .expect("an exact retry of the older event should be an idempotent success");
+
+    let selected = store
+        .relations_for_root(MainSessionId::from(main), 10)
+        .await
+        .expect("relations should load")
+        .into_iter()
+        .find(|relation| relation.selected && relation.child.session_id() == child)
+        .expect("the child should retain one selected parent");
+    assert_eq!(selected.parent.session_id(), alternate_parent);
+}
+
+#[tokio::test]
+async fn a_registration_event_cannot_be_reused_for_a_different_parent() {
+    let (api, store, _clock) = api_fixture().await;
+    let coordinator =
+        TransportKey::new("event-reuse-coordinator").expect("transport should be valid");
+    let alternate_parent_transport =
+        TransportKey::new("event-reuse-parent").expect("transport should be valid");
+    let child_transport =
+        TransportKey::new("event-reuse-child").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &coordinator,
+        "event-reuse-main",
+        "register-event-reuse-main",
+    )
+    .await;
+    let alternate_parent = register_child(
+        &api,
+        &alternate_parent_transport,
+        main,
+        "event-reuse-alternate-parent",
+        "register-event-reuse-alternate-parent",
+    )
+    .await;
+    let event_key = "register-event-reuse-target";
+    let child = register_child(
+        &api,
+        &child_transport,
+        main,
+        "event-reuse-target",
+        event_key,
+    )
+    .await;
+
+    let conflicting = api
+        .register_session(
+            &child_transport,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "event-reuse-target".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(alternate_parent),
+                event_key: event_key.to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        conflicting,
+        Err(AgentApiError::RelationEventConflict)
+    ));
+
+    let selected = store
+        .relations_for_root(MainSessionId::from(main), 10)
+        .await
+        .expect("relations should load")
+        .into_iter()
+        .find(|relation| relation.selected && relation.child.session_id() == child)
+        .expect("the child should retain one selected parent");
+    assert_eq!(selected.parent.session_id(), main);
+}
+
+#[tokio::test]
 async fn a_coordinator_registered_child_binds_its_own_transport_by_re_registering() {
     let (api, _store, _clock) = api_fixture().await;
     let coordinator = TransportKey::new("rebind-coordinator").expect("transport should be valid");
@@ -1250,7 +1377,10 @@ async fn assert_native_discovery_provenance(
         .find(|relation| relation.child.session_id() == child.session.session_id())
         .expect("native child relation should persist");
     assert_eq!(selected.provenance.adapter().version(), "0.144.5");
-    assert_eq!(selected.provenance.fingerprint(), "codex:state-db:relation");
+    assert_eq!(
+        selected.provenance.fingerprint(),
+        "codex:state-db:relation:codex-state:discovered-child"
+    );
 }
 
 #[tokio::test]
