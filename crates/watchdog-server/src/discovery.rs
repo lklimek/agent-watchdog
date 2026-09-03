@@ -29,6 +29,8 @@ use crate::{AgentApi, DiscoveredSession, GitHubEnricher, RepositoryMetadata, Wor
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCAN_ENTRIES: usize = 2_048;
 const MAX_SCAN_PATH_BYTES: usize = 2 * 1_024 * 1_024;
+// Thirty-two reads cap raw batches at 32 MiB for configs or 64 MiB for summaries.
+const MAX_DISCOVERY_FILE_BATCH_ENTRIES: usize = 32;
 const CLAUDE_BOOTSTRAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const CLAUDE_TRANSCRIPT_PARSER_VERSION: u32 = 1;
 const MAX_CLAUDE_BOOTSTRAP_BATCHES: usize = 1;
@@ -717,29 +719,33 @@ impl ClaudeDiscovery {
         let now_ms = self.clock.now().wall_time().value();
         let mut aliases = ClaudeTeamTranscriptAliases::default();
         let mut teams = Vec::new();
-        let team_scans = Arc::clone(&scans);
-        let (configs, config_warnings) = off_thread_or_warn(&mut report, move || {
-            collect_team_configs(&team_scans, now_ms)
-        })
-        .await;
-        for _ in 0..config_warnings {
-            report.warn();
-        }
-        for bytes in configs {
-            let Ok(team) = watchdog_claude::parse_team_config(&bytes) else {
-                report.warn();
-                continue;
-            };
-            aliases.extend(&team);
-            self.reconcile_team(
-                &team,
-                worktree_mappings,
-                &mut report,
-                &mut mains,
-                &mut children,
-            )
+        let mut config_cursor = Some(DiscoveryBatchCursor::default());
+        while let Some(cursor) = config_cursor {
+            let team_scans = Arc::clone(&scans);
+            let batch = off_thread_or_warn(&mut report, move || {
+                collect_team_configs(&team_scans, now_ms, cursor)
+            })
             .await;
-            teams.push(team);
+            for _ in 0..batch.warning_count {
+                report.warn();
+            }
+            config_cursor = batch.next_cursor;
+            for bytes in batch.entries {
+                let Ok(team) = watchdog_claude::parse_team_config(&bytes) else {
+                    report.warn();
+                    continue;
+                };
+                aliases.extend(&team);
+                self.reconcile_team(
+                    &team,
+                    worktree_mappings,
+                    &mut report,
+                    &mut mains,
+                    &mut children,
+                )
+                .await;
+                teams.push(team);
+            }
         }
         self.reconcile_team_tasks(Arc::clone(&scans), teams, &mut report)
             .await;
@@ -2155,29 +2161,83 @@ async fn verified_live_process(
         .ok()
 }
 
-/// Read every Companion workspace summary found under the scanned roots.
-fn collect_companion_summaries(
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiscoveryBatchCursor {
+    root_index: usize,
+    directory_index: usize,
+}
+
+struct DiscoveryBatch<T> {
+    entries: Vec<T>,
+    warning_count: u32,
+    next_cursor: Option<DiscoveryBatchCursor>,
+}
+
+impl<T> Default for DiscoveryBatch<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            warning_count: 0,
+            next_cursor: None,
+        }
+    }
+}
+
+fn collect_scan_batch<T>(
     scans: &[(CapabilityRoot, watchdog_runtime::ScanResult)],
-) -> (Vec<(CapabilityRoot, PathBuf, Vec<u8>)>, u32) {
-    let mut summaries = Vec::new();
-    let mut warnings = 0_u32;
-    for (root, scan) in scans {
-        let candidates =
-            std::iter::once(root.path().to_owned()).chain(scan.directories().iter().cloned());
-        for directory in candidates {
+    cursor: DiscoveryBatchCursor,
+    mut read: impl FnMut(&CapabilityRoot, &Path) -> Result<Option<T>, ()>,
+) -> DiscoveryBatch<T> {
+    let mut batch = DiscoveryBatch {
+        entries: Vec::with_capacity(MAX_DISCOVERY_FILE_BATCH_ENTRIES),
+        ..DiscoveryBatch::default()
+    };
+    let mut visited = 0;
+    for (root_index, (root, scan)) in scans.iter().enumerate().skip(cursor.root_index) {
+        let first_directory = if root_index == cursor.root_index {
+            cursor.directory_index
+        } else {
+            0
+        };
+        let directory_count = scan.directories().len().saturating_add(1);
+        for directory_index in first_directory..directory_count {
+            if visited == MAX_DISCOVERY_FILE_BATCH_ENTRIES {
+                batch.next_cursor = Some(DiscoveryBatchCursor {
+                    root_index,
+                    directory_index,
+                });
+                return batch;
+            }
+            visited += 1;
+            let directory = if directory_index == 0 {
+                root.path()
+            } else {
+                &scan.directories()[directory_index - 1]
+            };
             let Ok(relative) = directory.strip_prefix(root.path()) else {
-                warnings = warnings.saturating_add(1);
+                batch.warning_count = batch.warning_count.saturating_add(1);
                 continue;
             };
-            let summary_path = relative.join("state.json");
-            match read_bounded_file(root, &summary_path, watchdog_companion::MAX_SUMMARY_BYTES) {
-                Ok(Some(bytes)) => summaries.push((root.clone(), relative.to_path_buf(), bytes)),
+            match read(root, relative) {
+                Ok(Some(entry)) => batch.entries.push(entry),
                 Ok(None) => {}
-                Err(()) => warnings = warnings.saturating_add(1),
+                Err(()) => batch.warning_count = batch.warning_count.saturating_add(1),
             }
         }
     }
-    (summaries, warnings)
+    batch
+}
+
+/// Read one bounded batch of Companion workspace summaries from the scanned roots.
+fn collect_companion_summaries(
+    scans: &[(CapabilityRoot, watchdog_runtime::ScanResult)],
+    cursor: DiscoveryBatchCursor,
+) -> DiscoveryBatch<(CapabilityRoot, PathBuf, Vec<u8>)> {
+    collect_scan_batch(scans, cursor, |root, relative| {
+        let summary_path = relative.join("state.json");
+        read_bounded_file(root, &summary_path, watchdog_companion::MAX_SUMMARY_BYTES)
+            .map(|bytes| bytes.map(|bytes| (root.clone(), relative.to_path_buf(), bytes)))
+    })
 }
 
 /// Aggregate every team task file into its owning member session.
@@ -2250,34 +2310,18 @@ fn collect_team_task_aggregates(
     (aggregates, warnings)
 }
 
-/// Read every recent team config found under the scanned Claude roots.
+/// Read one bounded batch of recent team configs from the scanned Claude roots.
 fn collect_team_configs(
     scans: &[(CapabilityRoot, watchdog_runtime::ScanResult)],
     now_ms: i64,
-) -> (Vec<Vec<u8>>, u32) {
-    let mut configs = Vec::new();
-    let mut warnings = 0_u32;
-    for (root, scan) in scans {
-        let candidates =
-            std::iter::once(root.path().to_owned()).chain(scan.directories().iter().cloned());
-        for directory in candidates {
-            let Ok(relative) = directory.strip_prefix(root.path()) else {
-                warnings = warnings.saturating_add(1);
-                continue;
-            };
-            let config = relative.join("config.json");
-            match read_bounded_config(root, &config) {
-                Ok(Some(bytes)) => {
-                    if recent_capability_file(root, &config, now_ms, CLAUDE_BOOTSTRAP_WINDOW_MS) {
-                        configs.push(bytes);
-                    }
-                }
-                Ok(None) => {}
-                Err(()) => warnings = warnings.saturating_add(1),
-            }
-        }
-    }
-    (configs, warnings)
+    cursor: DiscoveryBatchCursor,
+) -> DiscoveryBatch<Vec<u8>> {
+    collect_scan_batch(scans, cursor, |root, relative| {
+        let config = relative.join("config.json");
+        let bytes = read_bounded_config(root, &config)?;
+        Ok(bytes
+            .filter(|_| recent_capability_file(root, &config, now_ms, CLAUDE_BOOTSTRAP_WINDOW_MS)))
+    })
 }
 
 /// Select the scanned transcripts modified inside the Claude bootstrap window.
@@ -2382,58 +2426,65 @@ impl CompanionDiscovery {
             return report;
         };
         report.absorb_scan_failures(&opened);
-        let (summaries, summary_warnings) = off_thread_or_warn(&mut report, move || {
-            collect_companion_summaries(&opened.scans)
-        })
-        .await;
-        for _ in 0..summary_warnings {
-            report.warn();
-        }
-        for (root, relative, bytes) in summaries {
-            let Ok(snapshot) = parser.parse_summary(&bytes) else {
+        let scans = Arc::new(opened.scans);
+        let mut summary_cursor = Some(DiscoveryBatchCursor::default());
+        while let Some(cursor) = summary_cursor {
+            let summary_scans = Arc::clone(&scans);
+            let batch = off_thread_or_warn(&mut report, move || {
+                collect_companion_summaries(&summary_scans, cursor)
+            })
+            .await;
+            for _ in 0..batch.warning_count {
                 report.warn();
-                continue;
-            };
-            for job in snapshot.jobs() {
-                let detail =
-                    read_companion_detail(&root, &relative, &parser, job, &mut report).await;
-                let Ok(reconciled) = parser.reconcile(Some(job), detail.as_ref()) else {
+            }
+            summary_cursor = batch.next_cursor;
+            for (root, relative, bytes) in batch.entries {
+                let Ok(snapshot) = parser.parse_summary(&bytes) else {
                     report.warn();
                     continue;
                 };
-                match self
-                    .should_reconcile_companion_job(&root, &relative, reconciled.job())
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(()) => {
+                for job in snapshot.jobs() {
+                    let detail =
+                        read_companion_detail(&root, &relative, &parser, job, &mut report).await;
+                    let Ok(reconciled) = parser.reconcile(Some(job), detail.as_ref()) else {
                         report.warn();
                         continue;
+                    };
+                    match self
+                        .should_reconcile_companion_job(&root, &relative, reconciled.job())
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(()) => {
+                            report.warn();
+                            continue;
+                        }
                     }
-                }
-                if reconciled.consistency() == watchdog_companion::CompanionConsistency::Conflicted
-                {
-                    report.warn();
-                }
-                let reconciled_session = self
-                    .reconcile_companion_job(
-                        &parser,
-                        &reconciled,
-                        &mut report,
-                        &mut mains,
-                        &mut children,
-                    )
-                    .await;
-                if reconciled_session {
-                    self.reconcile_companion_log(
-                        &root,
-                        &relative,
-                        &parser,
-                        reconciled.job(),
-                        &mut report,
-                    )
-                    .await;
+                    if reconciled.consistency()
+                        == watchdog_companion::CompanionConsistency::Conflicted
+                    {
+                        report.warn();
+                    }
+                    let reconciled_session = self
+                        .reconcile_companion_job(
+                            &parser,
+                            &reconciled,
+                            &mut report,
+                            &mut mains,
+                            &mut children,
+                        )
+                        .await;
+                    if reconciled_session {
+                        self.reconcile_companion_log(
+                            &root,
+                            &relative,
+                            &parser,
+                            reconciled.job(),
+                            &mut report,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -4380,20 +4431,30 @@ fn validated_directory(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, os::unix::fs::symlink, path::Path, sync::Arc};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        os::unix::fs::symlink,
+        path::Path,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
 
     use watchdog_domain::{
         CompatibilityWarning, NativeSessionKey, RuntimeKind, SessionId, SessionKind, TimePoint,
         WallTimeMs, WarningKind,
     };
+    use watchdog_runtime::{CapabilityRoot, DirectoryScanner, ScanBudget, ScanResult};
     use watchdog_store::WatchdogStore;
     use watchdog_testkit::FakeClock;
 
     use super::{
         AgentApi, BoundedLru, CODEX_VERSION_UNKNOWN, CodexBootstrapTailError,
         CodexCorrelationLogCache, CodexDiscovery, DiscoveredSession, DiscoveryAliasRegistry,
-        MAX_CODEX_CORRELATION_LOG_CACHE, MainParentDiscovery, RuntimeDiscoveryReport,
-        WorktreePathMapping, companion_event_key, ensure_native_parent, minor_version_mismatch,
+        DiscoveryBatchCursor, MAX_CODEX_CORRELATION_LOG_CACHE, MAX_DISCOVERY_FILE_BATCH_ENTRIES,
+        MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES, MainParentDiscovery,
+        RuntimeDiscoveryReport, WorktreePathMapping, collect_companion_summaries,
+        collect_team_configs, companion_event_key, ensure_native_parent, minor_version_mismatch,
         off_thread,
     };
 
@@ -4418,6 +4479,76 @@ mod tests {
         let outcome = off_thread(|| -> bool { panic!("blocking discovery failure") }).await;
 
         assert_eq!(outcome, None);
+    }
+
+    fn scanned_fixture(
+        file_name: &str,
+        contents: &[u8],
+    ) -> (tempfile::TempDir, Vec<(CapabilityRoot, ScanResult)>) {
+        let fixture = tempfile::tempdir().expect("fixture root should exist");
+        fs::write(fixture.path().join(file_name), contents).expect("root fixture should exist");
+        for index in 0..MAX_DISCOVERY_FILE_BATCH_ENTRIES {
+            let directory = fixture.path().join(format!("workspace-{index:02}"));
+            fs::create_dir(&directory).expect("workspace fixture should exist");
+            fs::write(directory.join(file_name), contents).expect("nested fixture should exist");
+        }
+        let root = CapabilityRoot::new(fixture.path()).expect("fixture root should open");
+        let budget = ScanBudget::new(MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES)
+            .expect("static scan budget should be valid")
+            .with_max_elapsed(Duration::from_secs(5))
+            .expect("test scan duration should be valid");
+        let scan = DirectoryScanner::new(budget)
+            .scan(&root, Path::new("."))
+            .expect("fixture should scan");
+        assert_eq!(scan.uncertainty(), None);
+        (fixture, vec![(root, scan)])
+    }
+
+    #[test]
+    fn team_configs_are_collected_in_bounded_batches() {
+        let (_fixture, scans) = scanned_fixture("config.json", b"{}");
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should follow the Unix epoch")
+                .as_millis(),
+        )
+        .expect("current time should fit in milliseconds");
+        let mut cursor = Some(DiscoveryBatchCursor::default());
+        let mut batch_count = 0;
+        let mut config_count = 0;
+
+        while let Some(current) = cursor {
+            let batch = collect_team_configs(&scans, now_ms, current);
+            assert!(batch.entries.len() <= MAX_DISCOVERY_FILE_BATCH_ENTRIES);
+            assert_eq!(batch.warning_count, 0);
+            batch_count += 1;
+            config_count += batch.entries.len();
+            cursor = batch.next_cursor;
+        }
+
+        assert_eq!(batch_count, 2);
+        assert_eq!(config_count, MAX_DISCOVERY_FILE_BATCH_ENTRIES + 1);
+    }
+
+    #[test]
+    fn companion_summaries_are_collected_in_bounded_batches() {
+        let (_fixture, scans) = scanned_fixture("state.json", b"{}");
+        let mut cursor = Some(DiscoveryBatchCursor::default());
+        let mut batch_count = 0;
+        let mut summary_count = 0;
+
+        while let Some(current) = cursor {
+            let batch = collect_companion_summaries(&scans, current);
+            assert!(batch.entries.len() <= MAX_DISCOVERY_FILE_BATCH_ENTRIES);
+            assert_eq!(batch.warning_count, 0);
+            batch_count += 1;
+            summary_count += batch.entries.len();
+            cursor = batch.next_cursor;
+        }
+
+        assert_eq!(batch_count, 2);
+        assert_eq!(summary_count, MAX_DISCOVERY_FILE_BATCH_ENTRIES + 1);
     }
 
     fn session(runtime: RuntimeKind, native_id: &str) -> SessionId {
