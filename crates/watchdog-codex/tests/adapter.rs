@@ -1,8 +1,8 @@
 //! Codex app-server and read-only state fallback contracts.
 
-use std::error::Error as _;
+use std::{error::Error as _, fs};
 
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use watchdog_codex::{
     CodexAppServerParser, CodexHookParser, CodexParseError, CodexRolloutParser, CodexStateError,
     CodexStateReader, MAX_APP_SERVER_BYTES,
@@ -452,4 +452,76 @@ async fn current_sqlite_state_discovers_all_bounded_threads_and_spawn_edges_read
             .iter()
             .all(|thread| thread.recency_at().value() >= 10)
     );
+}
+
+#[tokio::test]
+async fn held_sqlite_database_identity_survives_path_replacement_with_live_wal() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("state_5.sqlite");
+    let held_path = directory.path().join("validated-state.sqlite");
+    let pool = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal),
+    )
+    .await
+    .expect("live fixture database should open");
+    sqlx::query("PRAGMA wal_autocheckpoint = 0")
+        .execute(&pool)
+        .await
+        .expect("automatic checkpoints should be disabled");
+    create_minimal_state(&pool, "validated-thread").await;
+
+    let held = std::fs::File::open(&path).expect("validated database should be held");
+    fs::rename(&path, &held_path).expect("validated database should move");
+    for suffix in ["-wal", "-shm"] {
+        fs::rename(
+            format!("{}{}", path.display(), suffix),
+            format!("{}{}", held_path.display(), suffix),
+        )
+        .expect("live SQLite sidecar should move with its database");
+    }
+
+    let attacker = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true),
+    )
+    .await
+    .expect("replacement database should open");
+    create_minimal_state(&attacker, "replacement-thread").await;
+    attacker.close().await;
+
+    let reader = CodexStateReader::open_file(held)
+        .await
+        .expect("held database should open with its live WAL");
+    let threads = reader
+        .discover_threads(10)
+        .await
+        .expect("held database should remain readable");
+
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].subject().native_id(), "validated-thread");
+    pool.close().await;
+}
+
+async fn create_minimal_state(pool: &sqlx::SqlitePool, id: &str) {
+    sqlx::query(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, git_branch TEXT, git_origin_url TEXT, cli_version TEXT NOT NULL DEFAULT '', agent_nickname TEXT, agent_role TEXT, recency_at_ms INTEGER NOT NULL DEFAULT 0)",
+    )
+    .execute(pool)
+    .await
+    .expect("threads schema should exist");
+    sqlx::query(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await
+    .expect("edge schema should exist");
+    sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, cli_version, recency_at_ms) VALUES (?, '/state/rollout.jsonl', 1, 1, 'cli', 'openai', '/work', 'Thread', '{}', 'default', '0.144.5', 1)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("thread fixture should insert");
 }

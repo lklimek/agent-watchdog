@@ -1,8 +1,13 @@
 use std::{
     fmt,
+    fs::File,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
+
+#[cfg(target_os = "linux")]
+use std::{collections::HashMap, os::linux::fs::MetadataExt as _, os::unix::io::AsRawFd as _};
 
 use sqlx::{
     Row, SqlitePool,
@@ -16,9 +21,19 @@ use watchdog_domain::{
 const MAX_THREADS: u32 = 1_000;
 
 /// Read-only current Codex local-state fallback.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CodexStateReader {
     pool: SqlitePool,
+    held_database: Option<Arc<File>>,
+}
+
+impl fmt::Debug for CodexStateReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexStateReader")
+            .field("holds_database_identity", &self.held_database.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CodexStateReader {
@@ -38,7 +53,41 @@ impl CodexStateReader {
             .connect_with(options)
             .await
             .map_err(|_| CodexStateError::Open)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            held_database: None,
+        })
+    }
+
+    /// Open the exact held Codex database file without trusting its pathname identity.
+    ///
+    /// `SQLite` still resolves the held file's live name so its WAL and journal siblings
+    /// retain their normal semantics. The connection is rejected unless the descriptor
+    /// `SQLite` actually opened has the same device and inode as `database`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodexStateError`] when the database cannot open read-only or `SQLite`
+    /// consumes a different filesystem object.
+    #[cfg(target_os = "linux")]
+    pub async fn open_file(database: File) -> Result<Self, CodexStateError> {
+        let expected = file_identity(&database)?;
+        let held_descriptor = database.as_raw_fd();
+        let before = descriptor_identities()?;
+        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{held_descriptor}"));
+        let mut reader = Self::open(&descriptor_path).await?;
+        let after = descriptor_identities()?;
+        let opened_expected_file = after.iter().any(|(descriptor, identity)| {
+            *descriptor != held_descriptor
+                && *identity == expected
+                && before.get(descriptor) != Some(identity)
+        });
+        if !opened_expected_file {
+            reader.pool.close().await;
+            return Err(CodexStateError::IdentityMismatch);
+        }
+        reader.held_database = Some(Arc::new(database));
+        Ok(reader)
     }
 
     /// Load a bounded recent thread set and exact spawn edges.
@@ -290,6 +339,9 @@ pub enum CodexStateError {
     /// Database could not be opened read-only.
     #[error("Codex state database could not be opened read-only")]
     Open,
+    /// `SQLite` reopened a different filesystem object than the held database.
+    #[error("Codex state database identity changed while opening")]
+    IdentityMismatch,
     /// Requested discovery bound is zero or above the service maximum.
     #[error("Codex thread discovery limit is invalid")]
     InvalidLimit,
@@ -299,6 +351,30 @@ pub enum CodexStateError {
     /// A selected native field violated a bounded domain contract.
     #[error("Codex state contains an invalid bounded field")]
     Domain(#[from] DomainInputError),
+}
+
+#[cfg(target_os = "linux")]
+fn file_identity(file: &File) -> Result<(u64, u64), CodexStateError> {
+    let metadata = file.metadata().map_err(|_| CodexStateError::Open)?;
+    Ok((metadata.st_dev(), metadata.st_ino()))
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_identities() -> Result<HashMap<i32, (u64, u64)>, CodexStateError> {
+    let mut identities = HashMap::new();
+    for entry in std::fs::read_dir("/proc/self/fd").map_err(|_| CodexStateError::Open)? {
+        let entry = entry.map_err(|_| CodexStateError::Open)?;
+        let Ok(descriptor) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(CodexStateError::Open),
+        };
+        identities.insert(descriptor, (metadata.st_dev(), metadata.st_ino()));
+    }
+    Ok(identities)
 }
 
 fn native_key(value: &str) -> Result<NativeSessionKey, CodexStateError> {

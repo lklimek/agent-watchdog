@@ -707,7 +707,7 @@ impl ClaudeDiscovery {
         };
         let scanner = DirectoryScanner::new(budget);
         let configured = claude_roots.to_vec();
-        let Some(opened) = off_thread(move || scan_roots(&configured, &scanner)).await else {
+        let Ok(opened) = off_thread(move || scan_roots(&configured, &scanner)).await else {
             report.warn();
             return report;
         };
@@ -871,7 +871,7 @@ impl ClaudeDiscovery {
                 report.warn();
                 return Err(());
             };
-            let Some(bytes) = read_live_registry_record(root, relative).await else {
+            let Ok(Some(bytes)) = read_live_registry_record(root, relative).await else {
                 report.warn();
                 return Err(());
             };
@@ -885,7 +885,7 @@ impl ClaudeDiscovery {
                 report.warn();
                 return Err(());
             }
-            let Some(process) = verified_live_process(live.pid()).await else {
+            let Ok(Some(process)) = verified_live_process(live.pid()).await else {
                 report.warn();
                 return Err(());
             };
@@ -1261,22 +1261,17 @@ impl ClaudeDiscovery {
             report.warn();
             return;
         };
-        let title = if existing
-            .as_ref()
-            .and_then(|metadata| metadata.title())
-            .is_some()
-        {
-            None
-        } else if candidate.kind == SessionKind::Child {
-            let title_root = root.clone();
-            let transcript = candidate.relative.clone();
-            off_thread(move || Self::subagent_title(&title_root, &transcript))
-                .await
-                .flatten()
-                .or_else(|| bootstrap.title.clone())
-        } else {
-            bootstrap.title.clone()
-        };
+        let title = Self::transcript_title(
+            root,
+            &candidate,
+            &bootstrap,
+            existing
+                .as_ref()
+                .and_then(|metadata| metadata.title())
+                .is_some(),
+            report,
+        )
+        .await;
         let startup_directory = if existing
             .as_ref()
             .and_then(|metadata| metadata.startup_directory())
@@ -1401,7 +1396,14 @@ impl ClaudeDiscovery {
         let error = watchdog_claude::ClaudeParseError::UnsupportedRecord;
         let detected_version = match bootstrap.detected_version.clone() {
             Some(detected) => Some(detected),
-            None => self.detect_transcript_version(root, candidate).await,
+            None => {
+                if let Ok(detected) = self.detect_transcript_version(root, candidate).await {
+                    detected
+                } else {
+                    report.warn();
+                    None
+                }
+            }
         };
         let Some(detected_version) = detected_version else {
             if warning_needs_version {
@@ -1467,7 +1469,7 @@ impl ClaudeDiscovery {
             let bootstrap_candidate = candidate.clone();
             off_thread(move || Self::bootstrap_transcript(&bootstrap_root, &bootstrap_candidate))
                 .await
-                .ok_or(())?
+                .map_err(|_| ())?
         } else {
             ClaudeTranscriptBootstrap::default()
         };
@@ -1588,7 +1590,7 @@ impl ClaudeDiscovery {
         &self,
         root: &CapabilityRoot,
         candidate: &ClaudeTranscriptCandidate,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, BlockingWorkError> {
         let key = candidate.path_key.as_str();
         if let Some(cached) = self
             .version_cache
@@ -1596,7 +1598,7 @@ impl ClaudeDiscovery {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_cloned(key)
         {
-            return cached;
+            return Ok(cached);
         }
         let version_root = root.clone();
         let transcript = candidate.relative.clone();
@@ -1607,7 +1609,7 @@ impl ClaudeDiscovery {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(key.to_owned(), detected.clone());
-        detected
+        Ok(detected)
     }
 
     fn scan_transcript_version(root: &CapabilityRoot, relative: &Path) -> Option<String> {
@@ -1684,6 +1686,30 @@ impl ClaudeDiscovery {
         }
     }
 
+    async fn transcript_title(
+        root: &CapabilityRoot,
+        candidate: &ClaudeTranscriptCandidate,
+        bootstrap: &ClaudeTranscriptBootstrap,
+        title_exists: bool,
+        report: &mut RuntimeDiscoveryReport,
+    ) -> Option<String> {
+        if title_exists {
+            return None;
+        }
+        if candidate.kind != SessionKind::Child {
+            return bootstrap.title.clone();
+        }
+        let title_root = root.clone();
+        let transcript = candidate.relative.clone();
+        if let Ok(title) = off_thread(move || Self::subagent_title(&title_root, &transcript)).await
+        {
+            title.or_else(|| bootstrap.title.clone())
+        } else {
+            report.warn();
+            bootstrap.title.clone()
+        }
+    }
+
     async fn reconcile_transcript_cursor(
         &self,
         root: &CapabilityRoot,
@@ -1703,7 +1729,7 @@ impl ClaudeDiscovery {
             })
             .await;
             match created {
-                Some(Ok(cursor)) => {
+                Ok(Ok(cursor)) => {
                     if let Err(error) = self
                         .persist_claude_cursor(&candidate.path_key, &cursor, None)
                         .await
@@ -1716,7 +1742,7 @@ impl ClaudeDiscovery {
                         report.warn();
                     }
                 }
-                Some(Err(_)) | None => report.warn(),
+                Ok(Err(_)) | Err(_) => report.warn(),
             }
             return;
         };
@@ -1743,7 +1769,7 @@ impl ClaudeDiscovery {
             let read_root = root.clone();
             let transcript = candidate.relative.clone();
             let current = cursor.clone();
-            let Some(Ok(outcome)) =
+            let Ok(Ok(outcome)) =
                 off_thread(move || reader.read(&read_root, &transcript, &current)).await
             else {
                 report.warn();
@@ -1762,7 +1788,7 @@ impl ClaudeDiscovery {
                 })
                 .await;
                 match recovered {
-                    Some(Ok(new_cursor)) => {
+                    Ok(Ok(new_cursor)) => {
                         if let Err(error) = self
                             .persist_claude_cursor(
                                 &candidate.path_key,
@@ -1778,7 +1804,7 @@ impl ClaudeDiscovery {
                             );
                         }
                     }
-                    Some(Err(_)) | None => report.warn(),
+                    Ok(Err(_)) | Err(_) => report.warn(),
                 }
                 return;
             };
@@ -2129,7 +2155,10 @@ fn claude_task_candidate(root: &CapabilityRoot, file: &Path) -> Option<(PathBuf,
 }
 
 /// Read one Claude live-session registry record off the async worker threads.
-async fn read_live_registry_record(root: &CapabilityRoot, relative: &Path) -> Option<Vec<u8>> {
+async fn read_live_registry_record(
+    root: &CapabilityRoot,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>, BlockingWorkError> {
     let registry_root = root.clone();
     let registry_file = relative.to_path_buf();
     off_thread(move || {
@@ -2139,26 +2168,28 @@ async fn read_live_registry_record(root: &CapabilityRoot, relative: &Path) -> Op
             watchdog_claude::MAX_HOOK_BYTES,
         )
     })
-    .await?
-    .ok()
-    .flatten()
+    .await
+    .map(|result| result.ok().flatten())
 }
 
 /// Freshly verify a live-session PID off the async worker threads.
 async fn verified_live_process(
     pid: watchdog_domain::ProcessId,
-) -> Option<watchdog_domain::ProcessIdentity> {
+) -> Result<Option<watchdog_domain::ProcessIdentity>, BlockingWorkError> {
     off_thread(move || watchdog_process::LinuxProcessSampler::new(1)?.read_identity(pid))
-        .await?
-        .inspect_err(|error| {
-            tracing::warn!(
-                event = "claude.live_process_verification_failed",
-                pid = pid.value(),
-                error = %error,
-                "Claude live-session PID could not be freshly verified"
-            );
+        .await
+        .map(|result| {
+            result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        event = "claude.live_process_verification_failed",
+                        pid = pid.value(),
+                        error = %error,
+                        "Claude live-session PID could not be freshly verified"
+                    );
+                })
+                .ok()
         })
-        .ok()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2421,7 +2452,7 @@ impl CompanionDiscovery {
         };
         let scanner = DirectoryScanner::new(budget);
         let configured = companion_roots.to_vec();
-        let Some(opened) = off_thread(move || scan_roots(&configured, &scanner)).await else {
+        let Ok(opened) = off_thread(move || scan_roots(&configured, &scanner)).await else {
             report.warn();
             return report;
         };
@@ -2532,7 +2563,7 @@ impl CompanionDiscovery {
             )
         })
         .await
-        .ok_or(())
+        .map_err(|_| ())
     }
 
     async fn reconcile_companion_job(
@@ -2621,7 +2652,7 @@ impl CompanionDiscovery {
         }
         clear_session_reconcile_failure(RuntimeKind::CodexCompanion, "child", child_id);
         #[cfg(target_os = "linux")]
-        self.ingest_companion_process(reconciled_job).await;
+        self.ingest_companion_process(reconciled_job, report).await;
         if children.insert(child_id) {
             report.child_sessions = report.child_sessions.saturating_add(1);
         }
@@ -2656,13 +2687,17 @@ impl CompanionDiscovery {
                 .unwrap_or_else(|_| unreachable!("static metadata-only cursor budget is valid")),
         );
         let log_root = root.clone();
-        let Some(Ok(current)) = off_thread(move || {
+        let current = match off_thread(move || {
             reader.cursor_at_end(&log_root, &relative, COMPANION_LOG_CURSOR_VERSION)
         })
         .await
-        else {
-            // Logs are optional and pruned by Companion. Absence is neutral.
-            return;
+        {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) => return,
+            Err(_) => {
+                report.warn();
+                return;
+            }
         };
         let Ok(saved) = self.store.file_cursor(&path_key).await else {
             report.warn();
@@ -2728,18 +2763,28 @@ impl CompanionDiscovery {
     }
 
     #[cfg(target_os = "linux")]
-    async fn ingest_companion_process(&self, job: &watchdog_companion::CompanionJob) {
+    async fn ingest_companion_process(
+        &self,
+        job: &watchdog_companion::CompanionJob,
+        report: &mut RuntimeDiscoveryReport,
+    ) {
         let Some(pid) = job.pid() else {
             return;
         };
         let Ok(pid) = ProcessId::new(pid) else {
             return;
         };
-        let Some(Ok(identity)) =
-            off_thread(move || watchdog_process::LinuxProcessSampler::new(1)?.read_identity(pid))
-                .await
-        else {
-            return;
+        let identity = match off_thread(move || {
+            watchdog_process::LinuxProcessSampler::new(1)?.read_identity(pid)
+        })
+        .await
+        {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(_)) => return,
+            Err(_) => {
+                report.warn();
+                return;
+            }
         };
         let event_key = format!(
             "{}:{}:{}",
@@ -2810,9 +2855,9 @@ async fn read_companion_detail(
     })
     .await;
     let bytes = match detail {
-        Some(Ok(Some(bytes))) => bytes,
-        Some(Ok(None)) => return None,
-        Some(Err(())) | None => {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(Ok(None)) => return None,
+        Ok(Err(())) | Err(_) => {
             report.warn();
             return None;
         }
@@ -2985,15 +3030,15 @@ impl CodexDiscovery {
         for configured_root in codex_roots {
             let configured = configured_root.clone();
             let resolved = off_thread(move || codex_state_database(&configured)).await;
-            let database_path = match resolved {
-                Some(Ok(Some(path))) => path,
-                Some(Ok(None)) => continue,
-                Some(Err(())) | None => {
+            let database = match resolved {
+                Ok(Ok(Some(database))) => database,
+                Ok(Ok(None)) => continue,
+                Ok(Err(())) | Err(_) => {
                     report.warn();
                     continue;
                 }
             };
-            let Ok(reader) = watchdog_codex::CodexStateReader::open(&database_path).await else {
+            let Ok(reader) = watchdog_codex::CodexStateReader::open_file(database).await else {
                 report.warn();
                 continue;
             };
@@ -3054,7 +3099,7 @@ impl CodexDiscovery {
         };
         let scanner = DirectoryScanner::new(budget).with_order(ScanOrder::Descending);
         let configured = codex_roots.to_vec();
-        let Some(opened) = off_thread(move || scan_roots(&configured, &scanner)).await else {
+        let Ok(opened) = off_thread(move || scan_roots(&configured, &scanner)).await else {
             report.warn();
             return sources;
         };
@@ -3100,9 +3145,9 @@ impl CodexDiscovery {
         let observed_at = self.clock.now();
         let parsed = off_thread(move || parse_codex_rollout_metadata(&source, observed_at)).await;
         let metadata = match parsed {
-            Some(Ok(Some(metadata))) => metadata,
-            Some(Ok(None)) => return None,
-            Some(Err(())) | None => {
+            Ok(Ok(Some(metadata))) => metadata,
+            Ok(Ok(None)) => return None,
+            Ok(Err(())) | Err(_) => {
                 report.warn();
                 return None;
             }
@@ -3209,7 +3254,7 @@ impl CodexDiscovery {
         let Some(evidence) =
             off_thread(move || parse_codex_rollout_tail(&source, &tail_subject, observed_at))
                 .await
-                .ok_or(CodexBootstrapTailError::TailRead)?
+                .map_err(|_| CodexBootstrapTailError::TailRead)?
                 .map_err(|()| CodexBootstrapTailError::TailRead)?
         else {
             return Ok(());
@@ -3296,7 +3341,7 @@ impl CodexDiscovery {
                 let mappings = worktree_mappings.to_vec();
                 off_thread(move || repository_for_native_directory(&native_directory, &mappings))
                     .await
-                    .flatten()
+                    .map_err(|_| ())?
             };
             candidates.push(ClaudeParentCandidate {
                 session: main.session.session_id(),
@@ -3377,7 +3422,7 @@ impl CodexDiscovery {
     ) {
         let native_path = thread.rollout_path().to_path_buf();
         let mappings = path_mappings.to_vec();
-        let Some(Some((root, relative, path_key))) =
+        let Ok(Some((root, relative, path_key))) =
             off_thread(move || projected_runtime_file(&native_path, &mappings)).await
         else {
             report.warn();
@@ -3427,7 +3472,7 @@ impl CodexDiscovery {
             })
             .await;
             match created {
-                Some(Ok(cursor)) => {
+                Ok(Ok(cursor)) => {
                     if let Err(error) = self.persist_codex_cursor(path_key, &cursor, None).await {
                         tracing::warn!(
                             event = "discovery.codex_cursor_initialize_failed",
@@ -3437,7 +3482,7 @@ impl CodexDiscovery {
                         report.warn();
                     }
                 }
-                Some(Err(_)) | None => report.warn(),
+                Ok(Err(_)) | Err(_) => report.warn(),
             }
             return;
         };
@@ -3484,7 +3529,7 @@ impl CodexDiscovery {
             let read_root = root.clone();
             let rollout = relative.to_path_buf();
             let current = cursor.clone();
-            let Some(Ok(outcome)) =
+            let Ok(Ok(outcome)) =
                 off_thread(move || reader.read(&read_root, &rollout, &current)).await
             else {
                 report.warn();
@@ -3499,7 +3544,7 @@ impl CodexDiscovery {
                 })
                 .await;
                 match recovered {
-                    Some(Ok(new_cursor)) => {
+                    Ok(Ok(new_cursor)) => {
                         if let Err(error) = self
                             .persist_codex_cursor(path_key, &new_cursor, last_observation_id)
                             .await
@@ -3511,7 +3556,7 @@ impl CodexDiscovery {
                             );
                         }
                     }
-                    Some(Err(_)) | None => report.warn(),
+                    Ok(Err(_)) | Err(_) => report.warn(),
                 }
                 return;
             };
@@ -3835,7 +3880,7 @@ impl CodexDiscovery {
 }
 
 /// Resolve the Codex state database inside a configured root without escaping it.
-fn codex_state_database(configured_root: &Path) -> Result<Option<PathBuf>, ()> {
+fn codex_state_database(configured_root: &Path) -> Result<Option<std::fs::File>, ()> {
     let root = CapabilityRoot::new(configured_root).map_err(|_| ())?;
     let database_relative = Path::new("state_5.sqlite");
     let database_path = root.path().join(database_relative);
@@ -3844,12 +3889,7 @@ fn codex_state_database(configured_root: &Path) -> Result<Option<PathBuf>, ()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     }
-    root.open_file(database_relative).map_err(|_| ())?;
-    let database_path = database_path.canonicalize().map_err(|_| ())?;
-    if !database_path.starts_with(root.path()) {
-        return Err(());
-    }
-    Ok(Some(database_path))
+    root.open_file(database_relative).map(Some).map_err(|_| ())
 }
 
 /// Select the scanned rollout files modified inside the Codex bootstrap window.
@@ -4323,32 +4363,39 @@ fn discovery_key(source: &str, session: SessionId) -> String {
 
 /// Run bounded blocking filesystem work off the async worker threads.
 ///
-/// Returns `None` when the blocking task panicked, which callers surface as a
-/// discovery warning instead of unwinding the shared discovery worker.
-async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+/// Returns a distinct error when the blocking task does not complete, which
+/// callers surface as a warning instead of treating it as optional absence.
+async fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, BlockingWorkError> {
     match tokio::task::spawn_blocking(work).await {
-        Ok(value) => Some(value),
+        Ok(value) => Ok(value),
         Err(error) => {
             tracing::error!(
                 event = "discovery.blocking_work_failed",
                 error = %error,
                 "Discovery filesystem work did not complete"
             );
-            None
+            Err(BlockingWorkError(error))
         }
     }
 }
 
-/// Run blocking discovery work, counting a panicked task as a warning.
+#[derive(Debug, Error)]
+#[error("Blocking discovery task did not complete")]
+struct BlockingWorkError(#[source] tokio::task::JoinError);
+
+/// Run blocking discovery work, counting an incomplete task as a warning.
 async fn off_thread_or_warn<T: Default + Send + 'static>(
     report: &mut RuntimeDiscoveryReport,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> T {
-    let Some(value) = off_thread(work).await else {
+    if let Ok(value) = off_thread(work).await {
+        value
+    } else {
         report.warn();
-        return T::default();
-    };
-    value
+        T::default()
+    }
 }
 
 /// Scanned roots and the failure counts their caller still has to report.
@@ -4455,7 +4502,7 @@ mod tests {
         MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES, MainParentDiscovery,
         RuntimeDiscoveryReport, WorktreePathMapping, collect_companion_summaries,
         collect_team_configs, companion_event_key, ensure_native_parent, minor_version_mismatch,
-        off_thread,
+        off_thread, off_thread_or_warn,
     };
 
     /// Discovery filesystem work must not hold an async worker: the gate is
@@ -4471,14 +4518,32 @@ mod tests {
         let released =
             off_thread(move || gate.recv_timeout(std::time::Duration::from_secs(2)).is_ok()).await;
 
-        assert_eq!(released, Some(true));
+        assert!(matches!(released, Ok(true)));
     }
 
     #[tokio::test]
     async fn a_panicking_blocking_task_degrades_instead_of_unwinding_discovery() {
         let outcome = off_thread(|| -> bool { panic!("blocking discovery failure") }).await;
 
-        assert_eq!(outcome, None);
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn blocking_failure_warns_but_optional_absence_remains_neutral() {
+        let mut report = RuntimeDiscoveryReport::default();
+
+        let absent = off_thread_or_warn(&mut report, || None::<bool>).await;
+
+        assert_eq!(absent, None);
+        assert_eq!(report.warning_count(), 0);
+
+        let failed = off_thread_or_warn(&mut report, || -> Option<bool> {
+            panic!("blocking discovery failure")
+        })
+        .await;
+
+        assert_eq!(failed, None);
+        assert_eq!(report.warning_count(), 1);
     }
 
     fn scanned_fixture(
