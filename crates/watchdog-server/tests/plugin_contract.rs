@@ -160,6 +160,15 @@ fn coordinator_skill_covers_the_safe_lifecycle_contract() {
             "coordinator skill should document `{term}`"
         );
     }
+    for role_instruction in [
+        "A coordinator starts or reconnects with `kind=main`",
+        "A child handed an in-tree `parent_session_id` starts or reconnects with `kind=child`",
+    ] {
+        assert!(
+            skill.contains(role_instruction),
+            "coordinator skill should distinguish role-specific registration: {role_instruction}"
+        );
+    }
 
     let frontmatter = skill
         .strip_prefix("---\n")

@@ -347,13 +347,21 @@ impl TimerReconciliationReport {
 #[derive(Debug, Default)]
 struct ScopeRegistry {
     roots: RwLock<HashMap<TransportKey, ScopeBinding>>,
+    next_generation: AtomicU64,
 }
 
 #[derive(Debug)]
 struct ScopeBinding {
     root: MainSessionId,
+    generation: u64,
     pending_registrations: usize,
     committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScopeReservation {
+    outcome: BindOutcome,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -415,6 +423,14 @@ enum BindOutcome {
 }
 
 impl ScopeRegistry {
+    fn next_generation(&self) -> Result<u64, AgentApiError> {
+        self.next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .map_err(|_| AgentApiError::TransportBindingCapacityExhausted)
+    }
+
     /// Bind `transport` permanently to an already-persisted `root`.
     fn bind_committed(
         &self,
@@ -432,10 +448,12 @@ impl ScopeRegistry {
             }
             Some(_) => Err(AgentApiError::TransportAlreadyBound),
             None => {
+                let generation = self.next_generation()?;
                 roots.insert(
                     transport,
                     ScopeBinding {
                         root,
+                        generation,
                         pending_registrations: 0,
                         committed: true,
                     },
@@ -449,53 +467,76 @@ impl ScopeRegistry {
         &self,
         transport: TransportKey,
         root: MainSessionId,
-    ) -> Result<BindOutcome, AgentApiError> {
+    ) -> Result<ScopeReservation, AgentApiError> {
         let mut roots = self
             .roots
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match roots.get_mut(&transport) {
             Some(bound) if bound.root == root => {
-                bound.pending_registrations += 1;
-                Ok(BindOutcome::AlreadyBound)
+                bound.pending_registrations = bound
+                    .pending_registrations
+                    .checked_add(1)
+                    .ok_or(AgentApiError::TransportBindingCapacityExhausted)?;
+                Ok(ScopeReservation {
+                    outcome: BindOutcome::AlreadyBound,
+                    generation: bound.generation,
+                })
             }
             Some(_) => Err(AgentApiError::TransportAlreadyBound),
             None => {
+                let generation = self.next_generation()?;
                 roots.insert(
                     transport,
                     ScopeBinding {
                         root,
+                        generation,
                         pending_registrations: 1,
                         committed: false,
                     },
                 );
-                Ok(BindOutcome::FreshBind)
+                Ok(ScopeReservation {
+                    outcome: BindOutcome::FreshBind,
+                    generation,
+                })
             }
         }
     }
 
-    fn commit_registration(&self, transport: &TransportKey, root: MainSessionId) {
+    fn commit_registration(
+        &self,
+        transport: &TransportKey,
+        root: MainSessionId,
+        generation: u64,
+    ) -> Result<(), AgentApiError> {
         let mut roots = self
             .roots
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(bound) = roots.get_mut(transport)
-            && bound.root == root
+        let Some(bound) = roots.get_mut(transport) else {
+            return Err(AgentApiError::TransportNotBound);
+        };
+        if bound.root != root || bound.generation != generation || bound.pending_registrations == 0
         {
-            if bound.pending_registrations > 0 {
-                bound.pending_registrations -= 1;
-            }
-            bound.committed = true;
+            return Err(AgentApiError::TransportNotBound);
         }
+        bound.pending_registrations -= 1;
+        bound.committed = true;
+        Ok(())
     }
 
-    fn rollback_registration(&self, transport: &TransportKey, root: MainSessionId) {
+    fn rollback_registration(
+        &self,
+        transport: &TransportKey,
+        root: MainSessionId,
+        generation: u64,
+    ) {
         let mut roots = self
             .roots
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let remove = roots.get_mut(transport).is_some_and(|bound| {
-            if bound.root != root {
+            if bound.root != root || bound.generation != generation {
                 return false;
             }
             if bound.pending_registrations > 0 {
@@ -513,7 +554,7 @@ impl ScopeRegistry {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(transport)
-            .map(|bound| bound.root)
+            .and_then(|bound| bound.committed.then_some(bound.root))
             .ok_or(AgentApiError::TransportNotBound)
     }
 
@@ -530,41 +571,44 @@ struct ScopeGuard<'a> {
     scopes: &'a ScopeRegistry,
     transport: &'a TransportKey,
     root: MainSessionId,
+    generation: u64,
     pending: bool,
 }
 
 impl<'a> ScopeGuard<'a> {
     /// Begin one pending registration for a transport and root.
     ///
-    /// Same-root callers increment one pending count under the registry lock.
-    /// Commit latches the binding before resolving its pending slot; rollback
-    /// removes it only when no caller remains pending and none committed.
-    /// Therefore neither a pending peer nor any committed peer can be unbound,
-    /// regardless of whether the other callers commit or roll back first.
+    /// Same-root callers share a generation but gain no scope until one commits.
+    /// Release invalidates that generation, so stale guards cannot alter its replacement.
     fn bind(
         scopes: &'a ScopeRegistry,
         transport: &'a TransportKey,
         root: MainSessionId,
     ) -> Result<Self, AgentApiError> {
-        scopes.begin_registration(transport.clone(), root)?;
+        let reservation = scopes.begin_registration(transport.clone(), root)?;
         Ok(Self {
             scopes,
             transport,
             root,
+            generation: reservation.generation,
             pending: true,
         })
     }
 
-    fn commit(mut self) {
-        self.scopes.commit_registration(self.transport, self.root);
+    fn commit(mut self) -> Result<(), AgentApiError> {
+        let result = self
+            .scopes
+            .commit_registration(self.transport, self.root, self.generation);
         self.pending = false;
+        result
     }
 }
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
         if self.pending {
-            self.scopes.rollback_registration(self.transport, self.root);
+            self.scopes
+                .rollback_registration(self.transport, self.root, self.generation);
         }
     }
 }
@@ -610,11 +654,11 @@ mod scope_guard_tests {
 
         let fresh_binds = outcomes
             .iter()
-            .filter(|outcome| **outcome == BindOutcome::FreshBind)
+            .filter(|reservation| reservation.outcome == BindOutcome::FreshBind)
             .count();
         let already_bound = outcomes
             .iter()
-            .filter(|outcome| **outcome == BindOutcome::AlreadyBound)
+            .filter(|reservation| reservation.outcome == BindOutcome::AlreadyBound)
             .count();
         assert_eq!(
             fresh_binds, 1,
@@ -638,7 +682,7 @@ mod scope_guard_tests {
 
         let winner =
             ScopeGuard::bind(&scopes, &transport, root).expect("fresh bind should succeed");
-        winner.commit();
+        winner.commit().expect("current guard should commit");
         assert_eq!(
             scopes.root(&transport).expect("transport should be bound"),
             root
@@ -692,7 +736,7 @@ mod scope_guard_tests {
                 fresh_bound.wait();
                 let matching = ScopeGuard::bind(&scopes, &transport, root)
                     .expect("matching bind should succeed");
-                matching.commit();
+                matching.commit().expect("current guard should commit");
                 matching_committed.wait();
             })
         };
@@ -718,11 +762,12 @@ mod scope_guard_tests {
             ScopeGuard::bind(&scopes, &transport, root).expect("matching bind should succeed");
 
         drop(first);
-        assert_eq!(
-            scopes
-                .root(&transport)
-                .expect("pending peer must keep the binding"),
-            root
+        assert!(
+            matches!(
+                scopes.root(&transport),
+                Err(super::AgentApiError::TransportNotBound)
+            ),
+            "a pending peer must keep the reservation without granting scope"
         );
 
         drop(second);
@@ -732,6 +777,87 @@ mod scope_guard_tests {
                 Err(super::AgentApiError::TransportNotBound)
             ),
             "the last rollback must remove a binding that nobody committed"
+        );
+    }
+
+    #[test]
+    fn a_pending_registration_does_not_authorize_scoped_calls_until_commit() {
+        let scopes = ScopeRegistry::default();
+        let transport =
+            TransportKey::new("pending-authorization").expect("transport should validate");
+        let root = MainSessionId::from(SessionId::from_uuid(Uuid::nil()));
+        let guard = ScopeGuard::bind(&scopes, &transport, root).expect("bind should reserve scope");
+
+        assert!(
+            matches!(
+                scopes.root(&transport),
+                Err(super::AgentApiError::TransportNotBound)
+            ),
+            "pending persistence must not authorize the transport"
+        );
+
+        guard.commit().expect("current guard should commit");
+        assert_eq!(
+            scopes
+                .root(&transport)
+                .expect("committed scope should resolve"),
+            root
+        );
+    }
+
+    #[test]
+    fn a_stale_commit_cannot_authorize_a_reused_transport_binding() {
+        let scopes = ScopeRegistry::default();
+        let transport =
+            TransportKey::new("reused-stale-commit").expect("transport should validate");
+        let root = MainSessionId::from(SessionId::from_uuid(Uuid::nil()));
+        let stale = ScopeGuard::bind(&scopes, &transport, root).expect("first bind should succeed");
+        scopes.release(&transport);
+        let replacement =
+            ScopeGuard::bind(&scopes, &transport, root).expect("replacement bind should succeed");
+
+        assert!(
+            matches!(stale.commit(), Err(super::AgentApiError::TransportNotBound)),
+            "a guard from the released transport lifetime must not commit its replacement"
+        );
+        assert!(
+            matches!(
+                scopes.root(&transport),
+                Err(super::AgentApiError::TransportNotBound)
+            ),
+            "the replacement must remain pending after a stale commit"
+        );
+        replacement
+            .commit()
+            .expect("the replacement guard should commit");
+        assert_eq!(
+            scopes
+                .root(&transport)
+                .expect("replacement should authorize"),
+            root
+        );
+    }
+
+    #[test]
+    fn a_stale_rollback_cannot_consume_a_reused_transport_pending_slot() {
+        let scopes = ScopeRegistry::default();
+        let transport =
+            TransportKey::new("reused-stale-rollback").expect("transport should validate");
+        let root = MainSessionId::from(SessionId::from_uuid(Uuid::nil()));
+        let stale = ScopeGuard::bind(&scopes, &transport, root).expect("first bind should succeed");
+        scopes.release(&transport);
+        let replacement =
+            ScopeGuard::bind(&scopes, &transport, root).expect("replacement bind should succeed");
+
+        drop(stale);
+        replacement
+            .commit()
+            .expect("stale rollback must leave the replacement slot intact");
+        assert_eq!(
+            scopes
+                .root(&transport)
+                .expect("replacement should authorize"),
+            root
         );
     }
 }
@@ -1329,7 +1455,7 @@ impl AgentApi {
                 drop(alias_lease);
                 self.commit_registration(&record, &request.event_key, now, &provenance, None)
                     .await?;
-                bound.commit();
+                bound.commit()?;
                 return self.view_for_record(&record).await;
             }
             SessionKind::Child => {
@@ -1351,7 +1477,7 @@ impl AgentApi {
                     Some(&parent),
                 )
                 .await?;
-                bound.commit();
+                bound.commit()?;
                 record
             }
         };
@@ -1386,10 +1512,8 @@ impl AgentApi {
             return Err(AgentApiError::ObservationQueueStopped);
         }
         let observation = registration_observation(record, event_key, now, provenance)?;
-        let result = self.apply_observation(record, observation).await?;
-        if let Some(parent) = parent
-            && result == ApplyResult::Applied
-        {
+        self.apply_observation(record, observation).await?;
+        if let Some(parent) = parent {
             self.save_relation(record, parent, event_key, now, provenance)
                 .await?;
         }
@@ -2525,6 +2649,9 @@ pub enum AgentApiError {
     /// A transport cannot change its bound main session.
     #[error("MCP transport is already bound to another main session")]
     TransportAlreadyBound,
+    /// Process-local transport binding generations or pending counts are exhausted.
+    #[error("MCP transport binding capacity is exhausted")]
+    TransportBindingCapacityExhausted,
     /// Target exists outside the transport's bound tree.
     #[error("MCP target is outside the bound main-session tree")]
     CrossTreeAccess,
@@ -2822,7 +2949,83 @@ mod registration_rollback_tests {
     use watchdog_store::WatchdogStore;
     use watchdog_testkit::FakeClock;
 
-    use super::{AgentApi, AgentApiError, RegisterSession, TransportKey};
+    use super::{
+        AgentApi, AgentApiError, MainSessionId, RegisterSession, ScopeGuard, TransportKey,
+    };
+
+    #[tokio::test]
+    async fn a_pending_scope_rejects_scoped_reads_and_mutations_until_commit() {
+        let directory = tempfile::tempdir().expect("fixture directory should exist");
+        let store = WatchdogStore::open(&directory.path().join("watchdog.db"))
+            .await
+            .expect("store should open");
+        let clock = Arc::new(FakeClock::new(TimePoint::new(WallTimeMs::new(0), 0)));
+        let api = AgentApi::new(store, clock)
+            .await
+            .expect("API should initialize");
+        let coordinator =
+            TransportKey::new("pending-api-coordinator").expect("transport should validate");
+        let pending_transport =
+            TransportKey::new("pending-api-client").expect("transport should validate");
+        let rolled_back_transport =
+            TransportKey::new("rolled-back-api-client").expect("transport should validate");
+        let main = api
+            .register_session(
+                &coordinator,
+                RegisterSession {
+                    runtime: RuntimeKind::ClaudeCode,
+                    native_id: "pending-api-main".to_owned(),
+                    kind: SessionKind::Main,
+                    parent: None,
+                    event_key: "register-pending-api-main".to_owned(),
+                },
+            )
+            .await
+            .expect("main should register")
+            .session
+            .session_id();
+        let root = MainSessionId::from(main);
+        let pending = ScopeGuard::bind(&api.inner.scopes, &pending_transport, root)
+            .expect("registration should reserve the transport");
+
+        assert!(matches!(
+            api.get_session(&pending_transport, main).await,
+            Err(AgentApiError::TransportNotBound)
+        ));
+        assert!(matches!(
+            api.report_progress(
+                &pending_transport,
+                main,
+                "pending-progress",
+                "must remain unauthorized".to_owned(),
+                None,
+            )
+            .await,
+            Err(AgentApiError::TransportNotBound)
+        ));
+
+        pending.commit().expect("current reservation should commit");
+        api.get_session(&pending_transport, main)
+            .await
+            .expect("a committed transport should authorize reads");
+        api.report_progress(
+            &pending_transport,
+            main,
+            "committed-progress",
+            "authorized after commit".to_owned(),
+            None,
+        )
+        .await
+        .expect("a committed transport should authorize mutations");
+
+        let rolled_back = ScopeGuard::bind(&api.inner.scopes, &rolled_back_transport, root)
+            .expect("registration should reserve the transport");
+        drop(rolled_back);
+        assert!(matches!(
+            api.get_session(&rolled_back_transport, main).await,
+            Err(AgentApiError::TransportNotBound)
+        ));
+    }
 
     /// A child registration that fails during `commit_registration` — strictly
     /// after its `ScopeGuard::bind` already succeeded — must roll the bind

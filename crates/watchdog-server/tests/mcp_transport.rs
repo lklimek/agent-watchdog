@@ -526,6 +526,44 @@ async fn http_mcp_route_requires_the_configured_bearer_token() {
 }
 
 #[tokio::test]
+async fn mcp_initialize_instructions_distinguish_coordinator_and_child_registration() {
+    let router = mcp_router(
+        test_api().await,
+        BearerAuthenticator::new("instruction-secret").expect("token should be valid"),
+        McpLimits::default(),
+    );
+    let response = mcp_request(
+        &router,
+        Some("instruction-secret"),
+        None,
+        &initialize_request(),
+    )
+    .await
+    .expect("router is infallible");
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("initialize response should be bounded");
+    let initialized = http_json_rpc_body(&body);
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .expect("initialize response should include instructions");
+
+    for required in [
+        "coordinator",
+        "kind=main",
+        "child",
+        "kind=child",
+        "parent_session_id",
+        "reconnect",
+    ] {
+        assert!(
+            instructions.contains(required),
+            "server instructions should explain role-aware registration using `{required}`: {instructions}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn mcp_binding_survives_transport_idle_periods() {
     let api = test_api().await;
     let manager = Arc::new(WatchdogSessionManager::new(

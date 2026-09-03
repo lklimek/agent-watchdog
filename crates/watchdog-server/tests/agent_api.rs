@@ -314,6 +314,158 @@ async fn a_spawned_agent_registers_itself_as_a_child_on_its_own_transport() {
 }
 
 #[tokio::test]
+async fn a_nested_child_registers_itself_against_its_actual_child_parent() {
+    let (api, store, _clock) = api_fixture().await;
+    let coordinator = TransportKey::new("nested-coordinator").expect("transport should be valid");
+    let child_transport = TransportKey::new("nested-child").expect("transport should be valid");
+    let grandchild_transport =
+        TransportKey::new("nested-grandchild").expect("transport should be valid");
+    let main = register_main(&api, &coordinator, "nested-main", "register-nested-main").await;
+    let child = register_child(
+        &api,
+        &child_transport,
+        main,
+        "nested-parent-child",
+        "register-nested-parent-child",
+    )
+    .await;
+
+    let grandchild = api
+        .register_session(
+            &grandchild_transport,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "nested-grandchild".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(child),
+                event_key: "register-nested-grandchild".to_owned(),
+            },
+        )
+        .await
+        .expect("a nested child should register against its actual child parent");
+
+    assert_eq!(grandchild.root, MainSessionId::from(main));
+    assert!(
+        api.get_session(&grandchild_transport, child).await.is_ok(),
+        "the nested child's transport should bind to the complete root tree"
+    );
+    let relations = store
+        .relations_for_root(MainSessionId::from(main), 10)
+        .await
+        .expect("relations should load");
+    assert!(relations.iter().any(|relation| {
+        relation.selected
+            && relation.child.session_id() == grandchild.session.session_id()
+            && relation.parent.session_id() == child
+            && relation.root == MainSessionId::from(main)
+    }));
+
+    let foreign_transport = TransportKey::new("nested-foreign").expect("transport should be valid");
+    register_main(
+        &api,
+        &foreign_transport,
+        "nested-foreign-main",
+        "register-nested-foreign-main",
+    )
+    .await;
+    let rejected = api
+        .register_session(
+            &foreign_transport,
+            RegisterSession {
+                runtime: RuntimeKind::CodexCompanion,
+                native_id: "nested-cross-tree-grandchild".to_owned(),
+                kind: SessionKind::Child,
+                parent: Some(child),
+                event_key: "register-nested-cross-tree-grandchild".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(rejected, Err(AgentApiError::CrossTreeAccess)));
+}
+
+#[tokio::test]
+async fn an_exact_registration_retry_repairs_a_relation_after_partial_persistence() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("watchdog.db");
+    let store = WatchdogStore::open(&path)
+        .await
+        .expect("database should open");
+    let clock = Arc::new(FakeClock::new(TimePoint::new(
+        WallTimeMs::new(10_000),
+        5_000,
+    )));
+    let api = AgentApi::new(store.clone(), clock)
+        .await
+        .expect("agent API should initialize");
+    let coordinator =
+        TransportKey::new("retry-repair-coordinator").expect("transport should be valid");
+    let child_transport =
+        TransportKey::new("retry-repair-child").expect("transport should be valid");
+    let main = register_main(
+        &api,
+        &coordinator,
+        "retry-repair-main",
+        "register-retry-repair-main",
+    )
+    .await;
+    let pool = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("fault injection connection should open");
+    sqlx::query(
+        "CREATE TRIGGER fail_relation_insert BEFORE INSERT ON session_relations \
+         BEGIN SELECT RAISE(FAIL, 'injected relation failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("fault injection trigger should install");
+    let request = RegisterSession {
+        runtime: RuntimeKind::CodexCompanion,
+        native_id: "retry-repair-child".to_owned(),
+        kind: SessionKind::Child,
+        parent: Some(main),
+        event_key: "register-retry-repair-child".to_owned(),
+    };
+
+    assert!(
+        matches!(
+            api.register_session(&child_transport, request.clone())
+                .await,
+            Err(AgentApiError::Store(watchdog_store::StoreError::Sqlx(_)))
+        ),
+        "the injected relation failure should surface after observation persistence"
+    );
+    assert!(
+        matches!(
+            api.get_session(&child_transport, main).await,
+            Err(AgentApiError::TransportNotBound)
+        ),
+        "a partial persistence failure must leave the child transport unauthorized"
+    );
+    sqlx::query("DROP TRIGGER fail_relation_insert")
+        .execute(&pool)
+        .await
+        .expect("fault injection trigger should be removed");
+
+    let retried = api
+        .register_session(&child_transport, request)
+        .await
+        .expect("the exact retry should repair the relation and bind the transport");
+    let relations = store
+        .relations_for_root(MainSessionId::from(main), 10)
+        .await
+        .expect("relations should load");
+    assert!(relations.iter().any(|relation| {
+        relation.selected
+            && relation.child.session_id() == retried.session.session_id()
+            && relation.parent.session_id() == main
+    }));
+}
+
+#[tokio::test]
 async fn a_coordinator_registered_child_binds_its_own_transport_by_re_registering() {
     let (api, _store, _clock) = api_fixture().await;
     let coordinator = TransportKey::new("rebind-coordinator").expect("transport should be valid");
