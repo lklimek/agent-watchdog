@@ -535,7 +535,7 @@ impl WatchdogMcpService {
     }
 
     #[tool(
-        description = "Register or enrich a session. Register kind=main first to bind this transport to one immutable session tree; kind=child requires an in-tree parent. Supported runtimes: claude_code, codex_cli, codex_companion"
+        description = "Register or enrich a session. Use kind=main to start and bind this transport to a new immutable session tree; kind=child names an existing parent_session_id and binds this transport directly to that parent's tree, including from a fresh transport. Supported runtimes: claude_code, codex_cli, codex_companion"
     )]
     async fn register_session(
         &self,
@@ -794,7 +794,7 @@ impl ServerHandler for WatchdogMcpService {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "Register the coordinating main session first to bind this transport to one tree. For every mutation, generate a fresh event_key and reuse it only when retrying the identical mutation. Treat list_events as a durable inbox: process the returned events, then pass that page's next_cursor as after to acknowledge them."
+            "Choose the first registration by role. A coordinator starts or reconnects by calling register_session with kind=main. A child handed an in-tree parent_session_id starts or reconnects by calling register_session with kind=child and that parent, without registering a main first. For every mutation, generate a fresh event_key and reuse it only when retrying the identical mutation. Treat list_events as a durable inbox: process the returned events, then pass that page's next_cursor as after to acknowledge them."
                 .to_owned(),
         );
         info
@@ -1061,6 +1061,7 @@ fn api_error(error: AgentApiError) -> rmcp::ErrorData {
         AgentApiError::Store(_)
         | AgentApiError::Coordinator(_)
         | AgentApiError::ReducerSnapshotUnavailable
+        | AgentApiError::TransportBindingCapacityExhausted
         | AgentApiError::WatchPathUnavailable => internal_error(),
         other => invalid_params(other.to_string()),
     }

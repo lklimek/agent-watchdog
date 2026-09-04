@@ -627,6 +627,7 @@ impl WatchdogStore {
             "DELETE FROM state_transitions",
             "DELETE FROM session_snapshots",
             "DELETE FROM observations",
+            "DELETE FROM relation_events",
             "DELETE FROM session_relations",
             "DELETE FROM adapter_health",
             "DELETE FROM discovery_aliases",
@@ -740,6 +741,9 @@ pub enum StoreError {
     /// One idempotency key was reused for materially different content.
     #[error("Observation identity was reused with different content")]
     ObservationIdentityConflict,
+    /// One relation event was reused for a different hierarchy assertion.
+    #[error("Relation event identity was reused with different content")]
+    RelationIdentityConflict,
     /// One watch-path event key was reused for materially different content.
     #[error("Watch-path event identity was reused with different content")]
     WatchPathIdentityConflict,

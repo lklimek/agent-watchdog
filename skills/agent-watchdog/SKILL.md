@@ -14,8 +14,10 @@ The server states the first three in its own MCP `instructions`, delivered on
 connect; they are repeated here only as the entry points this skill builds on.
 Where the two ever differ, the server's instructions are current.
 
-1. Call `register_session` for the coordinating main session before every other
-   Watchdog call on a new MCP transport.
+1. Choose the first `register_session` call by role. A coordinator starts or reconnects with `kind=main`.
+   A child handed an in-tree `parent_session_id` starts or reconnects with `kind=child`
+   and that parent, without registering a main first. Complete that registration
+   before every other Watchdog call on the new transport.
 2. Generate a fresh, globally unique `event_key` for every logical mutating
    call. Reuse a key only to retry that exact mutation with byte-for-byte
    equivalent meaning. Never reuse it for a later progress update or changed
@@ -56,9 +58,12 @@ For each real delegation:
    `register_watch_path` with the child Watchdog UUID, the existing path, and
    another fresh `event_key`.
 
-Register nested children against their actual in-tree parent. Registering a
-child does not replace `register_delegation`: the latter records the exact
-relationship and expected check-in.
+Register nested children against their actual in-tree parent. A child that
+runs as its own process with its own MCP connection can register itself the
+same way: `kind=child` plus the parent `session_id` it was handed binds that
+connection to the parent's tree, so it needs no main registration of its own.
+Registering a child does not replace `register_delegation`: the latter records
+the exact relationship and expected check-in.
 
 ## Report lifecycle changes
 
@@ -129,23 +134,26 @@ deadline maintenance. An empty page is normal.
 After an MCP reconnect, plugin reload, lost-binding error, or
 `MCP transport is not bound to a main session` response:
 
-1. Re-run `register_session` for the same main runtime and runtime-native ID
-   before any other Watchdog call. Re-registration is idempotent and safe and
-   should return the same stable Watchdog session.
+1. Re-run `register_session` for the same session role, runtime, and
+   runtime-native ID before any other Watchdog call. A coordinator uses
+   `kind=main`; a child uses `kind=child` with the same actual in-tree
+   `parent_session_id`. Re-registration is idempotent and should return the same
+   stable Watchdog session.
 2. Use a fresh `event_key` for this new rebind operation. Reuse the prior key
    only when retrying the exact request whose result is unknown.
 3. Re-read `get_session_tree` and `get_watchdog_health`.
 4. Reconcile children, relations, deadlines, and the durable event cursor
    against dispatch records and direct evidence before continuing.
 
-If child registration fails after reconnect, first confirm the main binding
-and the child's runtime/native identity. Do not churn IDs or blindly alternate
-keys around an identity conflict.
+If child registration fails after reconnect, confirm the named parent still
+exists in the intended tree and the child's runtime/native identity is exact.
+Do not register an unrelated main, churn IDs, or blindly alternate keys around
+an identity conflict.
 
 ### Why a binding disappears
 
 A transport binding ends in one of three ways, all recoverable by the same
-re-registration above:
+role-aware re-registration above:
 
 - **Idle expiry.** A transport with no traffic for the configured idle window
   (`[mcp] idle_ttl_seconds`, 48 hours by default) is closed and its scope

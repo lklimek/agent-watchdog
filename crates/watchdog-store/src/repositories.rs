@@ -724,12 +724,44 @@ impl WatchdogStore {
     pub async fn select_relation(&self, record: &RelationRecord) -> Result<bool, StoreError> {
         let payload = bounded_json(record, "session relation")?;
         let mut transaction = self.pool.begin().await?;
+        let child = record.child.session_id().to_string();
+        let event_fingerprint = record.provenance.fingerprint();
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO relation_events \
+             (child_session_id, event_fingerprint, relation_json) VALUES (?, ?, ?)",
+        )
+        .bind(&child)
+        .bind(event_fingerprint)
+        .bind(&payload)
+        .execute(&mut *transaction)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let existing_payload: Vec<u8> = sqlx::query_scalar(
+                "SELECT relation_json FROM relation_events \
+                 WHERE child_session_id = ? AND event_fingerprint = ?",
+            )
+            .bind(&child)
+            .bind(event_fingerprint)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let existing: RelationRecord = decode_json(&existing_payload)?;
+            if existing.child != record.child
+                || existing.parent != record.parent
+                || existing.root != record.root
+                || existing.basis != record.basis
+                || existing.provenance != record.provenance
+            {
+                return Err(StoreError::RelationIdentityConflict);
+            }
+            transaction.commit().await?;
+            return Ok(false);
+        }
         let current: Option<String> = sqlx::query_scalar(
             "SELECT parent_session_id FROM session_relations \
              WHERE child_session_id = ? AND selected = 1 AND valid_until_ms IS NULL \
              ORDER BY valid_from_ms DESC LIMIT 1",
         )
-        .bind(record.child.session_id().to_string())
+        .bind(&child)
         .fetch_optional(&mut *transaction)
         .await?;
         let selected_parent = record.parent.session_id().to_string();
@@ -742,7 +774,7 @@ impl WatchdogStore {
              WHERE child_session_id = ? AND selected = 1 AND valid_until_ms IS NULL",
         )
         .bind(record.valid_from.value())
-        .bind(record.child.session_id().to_string())
+        .bind(&child)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
