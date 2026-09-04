@@ -894,7 +894,7 @@ impl ClaudeDiscovery {
                 return Err(());
             }
             let startup_directory =
-                validated_directory(Some(live.cwd()), worktree_mappings, report);
+                validated_directory(Some(live.cwd()), worktree_mappings, report).await;
             let view = self
                 .api
                 .discover_session(DiscoveredSession {
@@ -1080,7 +1080,7 @@ impl ClaudeDiscovery {
         children: &mut BTreeSet<SessionId>,
     ) {
         let asserted_main = SessionId::from_native(team.lead());
-        let main_directory = validated_directory(team.lead_cwd(), worktree_mappings, report);
+        let main_directory = validated_directory(team.lead_cwd(), worktree_mappings, report).await;
         // Alias resolution can redirect the lead onto a canonical main, so every
         // member registers against the identity discovery returns.
         let main_id = match self
@@ -1122,7 +1122,8 @@ impl ClaudeDiscovery {
         }
         for member in team.members() {
             let child_id = SessionId::from_native(member.subject());
-            let child_directory = validated_directory(member.cwd(), worktree_mappings, report);
+            let child_directory =
+                validated_directory(member.cwd(), worktree_mappings, report).await;
             if let Err(error) = self
                 .api
                 .discover_session(DiscoveredSession {
@@ -1279,7 +1280,7 @@ impl ClaudeDiscovery {
         {
             None
         } else {
-            validated_directory(bootstrap.cwd.as_deref(), worktree_mappings, report)
+            validated_directory(bootstrap.cwd.as_deref(), worktree_mappings, report).await
         };
         let Ok(view) = self
             .api
@@ -3191,7 +3192,8 @@ impl CodexDiscovery {
             parent = Some(inferred_parent);
         }
         let session_id = SessionId::from_native(metadata.subject());
-        let startup_directory = validated_directory(metadata.cwd(), worktree_mappings, report);
+        let startup_directory =
+            validated_directory(metadata.cwd(), worktree_mappings, report).await;
         let Ok(view) = self
             .api
             .discover_session(DiscoveredSession {
@@ -3757,7 +3759,8 @@ impl CodexDiscovery {
         {
             return;
         }
-        let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
+        let startup_directory =
+            validated_directory(Some(thread.cwd()), worktree_mappings, report).await;
         let Ok(view) = self
             .api
             .discover_session(DiscoveredSession {
@@ -3832,7 +3835,8 @@ impl CodexDiscovery {
             }
         };
         let child_id = SessionId::from_native(thread.subject());
-        let startup_directory = validated_directory(Some(thread.cwd()), worktree_mappings, report);
+        let startup_directory =
+            validated_directory(Some(thread.cwd()), worktree_mappings, report).await;
         let title = thread
             .agent_nickname()
             .or_else(|| thread.agent_role())
@@ -4455,12 +4459,27 @@ fn read_bounded_file(
     Ok(Some(bytes))
 }
 
-fn validated_directory(
+async fn validated_directory(
     candidate: Option<&Path>,
     mappings: &[WorktreePathMapping],
     report: &mut RuntimeDiscoveryReport,
 ) -> Option<String> {
-    let candidate = candidate?;
+    let candidate = candidate?.to_path_buf();
+    let mappings = mappings.to_vec();
+    if let Ok(Some(directory)) =
+        off_thread(move || validated_directory_blocking(&candidate, &mappings)).await
+    {
+        Some(directory)
+    } else {
+        report.warn();
+        None
+    }
+}
+
+fn validated_directory_blocking(
+    candidate: &Path,
+    mappings: &[WorktreePathMapping],
+) -> Option<String> {
     mappings
         .iter()
         .filter_map(|mapping| {
@@ -4470,10 +4489,6 @@ fn validated_directory(
         })
         .max_by_key(|(specificity, _)| *specificity)
         .map(|(_, path)| path)
-        .or_else(|| {
-            report.warn();
-            None
-        })
 }
 
 #[cfg(test)]
@@ -4502,7 +4517,7 @@ mod tests {
         MAX_SCAN_DEPTH, MAX_SCAN_ENTRIES, MAX_SCAN_PATH_BYTES, MainParentDiscovery,
         RuntimeDiscoveryReport, WorktreePathMapping, collect_companion_summaries,
         collect_team_configs, companion_event_key, ensure_native_parent, minor_version_mismatch,
-        off_thread, off_thread_or_warn,
+        off_thread, off_thread_or_warn, validated_directory,
     };
 
     /// Discovery filesystem work must not hold an async worker: the gate is
@@ -4543,6 +4558,35 @@ mod tests {
         .await;
 
         assert_eq!(failed, None);
+        assert_eq!(report.warning_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn directory_validation_preserves_results_and_warning_semantics() {
+        let fixture = tempfile::tempdir().expect("fixture root should exist");
+        let mounted = fixture.path().join("mounted");
+        fs::create_dir_all(mounted.join("project")).expect("mapped project should exist");
+        let mapping = WorktreePathMapping::new("/host/repositories", mounted)
+            .expect("mapping should be valid");
+        let mappings = [mapping];
+        let mut report = RuntimeDiscoveryReport::default();
+
+        let validated = validated_directory(
+            Some(Path::new("/host/repositories/project")),
+            &mappings,
+            &mut report,
+        )
+        .await;
+        let absent = validated_directory(None, &mappings, &mut report).await;
+
+        assert_eq!(validated.as_deref(), Some("/host/repositories/project"));
+        assert_eq!(absent, None);
+        assert_eq!(report.warning_count(), 0);
+
+        let invalid =
+            validated_directory(Some(Path::new("/unmapped/project")), &mappings, &mut report).await;
+
+        assert_eq!(invalid, None);
         assert_eq!(report.warning_count(), 1);
     }
 

@@ -9,6 +9,8 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{
     collections::HashMap,
+    fs::Metadata,
+    io,
     os::{
         fd::AsRawFd as _,
         unix::fs::{FileExt as _, MetadataExt as _},
@@ -97,23 +99,28 @@ impl CodexStateReader {
     /// consumes a different filesystem object.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub async fn open_file(database: File) -> Result<Self, CodexStateError> {
-        let held_descriptor = database.as_raw_fd();
-        let expected = DescriptorState {
-            identity: file_identity(&database)?,
-            path: descriptor_target(&descriptor_path(held_descriptor))?,
-            sqlite_database: true,
-        };
-        let before = descriptor_states()?;
+        let (database, held_descriptor, expected) = blocking_state_work(move || {
+            let held_descriptor = database.as_raw_fd();
+            let expected = DescriptorState {
+                identity: file_identity(&database)?,
+                path: descriptor_target(&descriptor_path(held_descriptor))
+                    .map_err(|_| CodexStateError::Open)?,
+                sqlite_database: true,
+            };
+            Ok((database, held_descriptor, expected))
+        })
+        .await?;
+        let before = blocking_state_work(descriptor_states).await?;
         let reader = Self::open(&expected.path).await?;
-        let after_open = descriptor_states()?;
+        let after_open = blocking_state_work(descriptor_states).await?;
         let threads = reader.discover_threads(MAX_THREADS).await?;
         let unarchived = reader.discover_unarchived_threads(MAX_THREADS).await?;
-        let after_query = descriptor_states()?;
+        let after_query = blocking_state_work(descriptor_states).await?;
         let StateSource::Pool(pool) = reader.source else {
             return Err(CodexStateError::Open);
         };
         pool.close().await;
-        let after_close = descriptor_states()?;
+        let after_close = blocking_state_work(descriptor_states).await?;
         if !connection_database_matches(
             &before,
             &after_open,
@@ -473,6 +480,15 @@ fn file_identity(file: &File) -> Result<FileIdentity, CodexStateError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn blocking_state_work<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, CodexStateError> + Send + 'static,
+) -> Result<T, CodexStateError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| CodexStateError::Open)?
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn descriptor_states() -> Result<HashMap<i32, DescriptorState>, CodexStateError> {
     let mut states = HashMap::new();
     for entry in std::fs::read_dir(descriptor_directory()).map_err(|_| CodexStateError::Open)? {
@@ -488,21 +504,31 @@ fn descriptor_states() -> Result<HashMap<i32, DescriptorState>, CodexStateError>
         if !metadata.is_file() {
             continue;
         }
-        let path = descriptor_target(&entry.path())?;
-        let sqlite_database = descriptor_has_sqlite_header(&entry.path());
-        states.insert(
-            descriptor,
-            DescriptorState {
-                identity: FileIdentity {
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
-                },
-                path,
-                sqlite_database,
-            },
-        );
+        if let Some(state) = descriptor_state(&entry.path(), &metadata)? {
+            states.insert(descriptor, state);
+        }
     }
     Ok(states)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor_state(
+    descriptor_path: &Path,
+    metadata: &Metadata,
+) -> Result<Option<DescriptorState>, CodexStateError> {
+    let path = match descriptor_target(descriptor_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CodexStateError::Open),
+    };
+    Ok(Some(DescriptorState {
+        identity: FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        path,
+        sqlite_database: descriptor_has_sqlite_header(descriptor_path),
+    }))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -572,14 +598,14 @@ fn descriptor_path(descriptor: i32) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn descriptor_target(path: &Path) -> Result<PathBuf, CodexStateError> {
-    std::fs::read_link(path).map_err(|_| CodexStateError::Open)
+fn descriptor_target(path: &Path) -> io::Result<PathBuf> {
+    std::fs::read_link(path)
 }
 
 #[cfg(target_os = "macos")]
-fn descriptor_target(path: &Path) -> Result<PathBuf, CodexStateError> {
-    let descriptor = File::open(path).map_err(|_| CodexStateError::Open)?;
-    let path = rustix::fs::getpath(descriptor).map_err(|_| CodexStateError::Open)?;
+fn descriptor_target(path: &Path) -> io::Result<PathBuf> {
+    let descriptor = File::open(path)?;
+    let path = rustix::fs::getpath(descriptor).map_err(io::Error::from)?;
     Ok(PathBuf::from(OsString::from_vec(path.into_bytes())))
 }
 
@@ -599,9 +625,39 @@ fn optional_text<const N: usize>(
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{collections::HashMap, fs, os::unix::fs::symlink, path::PathBuf, thread};
 
-    use super::{DescriptorState, FileIdentity, connection_database_matches};
+    use super::{
+        DescriptorState, FileIdentity, blocking_state_work, connection_database_matches,
+        descriptor_state,
+    };
+
+    #[tokio::test]
+    async fn descriptor_snapshot_work_runs_off_the_async_worker() {
+        let caller = thread::current().id();
+
+        let worker = blocking_state_work(|| Ok(thread::current().id()))
+            .await
+            .expect("blocking work should complete");
+
+        assert_ne!(worker, caller);
+    }
+
+    #[test]
+    fn descriptor_disappearing_after_metadata_is_skipped() {
+        let fixture = tempfile::tempdir().expect("fixture should exist");
+        let target = fixture.path().join("target.sqlite");
+        let descriptor = fixture.path().join("descriptor");
+        fs::write(&target, b"SQLite format 3\0").expect("target should exist");
+        symlink(&target, &descriptor).expect("descriptor link should exist");
+        let metadata = fs::metadata(&descriptor).expect("descriptor metadata should exist");
+        fs::remove_file(&descriptor).expect("descriptor should disappear");
+
+        let state = descriptor_state(&descriptor, &metadata)
+            .expect("a concurrently closed descriptor should not fail the snapshot");
+
+        assert_eq!(state, None);
+    }
 
     #[test]
     fn descriptor_proof_rejects_a_concurrent_open_of_the_held_inode() {
