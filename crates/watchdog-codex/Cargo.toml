@@ -11,12 +11,15 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 watchdog-domain.workspace = true
 watchdog-runtime.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true
