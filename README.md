@@ -1,3 +1,9 @@
+# DEPRECATED AND ARCHIVED
+
+This project did not work as designed, and modern LLMs and CLIs handle it well enough.
+Some tuning is a part of the Claudius skillset; see https://github.com/lklimek/claudius
+for more details.
+
 # Agent Watchdog
 
 Agent Watchdog monitors subagents in multi-agent orchestration sessions so a
